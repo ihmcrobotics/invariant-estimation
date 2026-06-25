@@ -20,7 +20,8 @@ Design references: `jointKF/CLAUDE.md` §2 (mass matrix in process noise), §3b/
 from typing import Protocol, runtime_checkable
 
 from jax import Array
-
+##NOTE: this should be calling IsaacSim/Mujoco primitives for this Python version,
+        ## while for the main Java estimator this would call Euclid via SCS2.
 
 @runtime_checkable
 class RobotModel(Protocol):
@@ -30,21 +31,30 @@ class RobotModel(Protocol):
     configuration `q`.  Implementations must return JAX arrays so callers stay
     jit/vmap-friendly.
 
-    Currently required
-    ------------------
+    Required
+    --------
     mass_matrix(q) -> (n, n)
         Composite-rigid-body inertia `M(q)`, symmetric positive-definite.
         Consumed by `jointKF.noise.acceleration_cov_mass` to shape the process
         noise `Q_a = σ_τ² M(q)⁻²` (CLAUDE.md §2).
 
-    Planned (added when `jointKF/measurement.py` lands)
-    ---------------------------------------------------
-    relative_jacobian(q, pair) -> angular relative-FK Jacobian `J^{b,a}_b(q)` for
-        an IMU pair, and the path selection matrix `S_ab` (CLAUDE.md §3b).  These
-        will extend this Protocol; keep additions here so `noise.py` and
-        `measurement.py` share one seam.
+    relative_gyro_jacobian(q) -> (m, 3, n)
+        Stacked angular relative-FK Jacobians for the IMU pairs, already in full
+        joint space (selection `S_ab` applied).  Consumed by
+        `jointKF.measurement.build_H` (CLAUDE.md §3b).
     """
 
     def mass_matrix(self, q: Array) -> Array:
         """Composite-rigid-body inertia `M(q)`, shape (n, n), symmetric PD."""
-        ...
+        raise NotImplementedError
+
+    def relative_gyro_jacobian(self, q: Array) -> Array:
+        r"""Stacked angular relative-FK Jacobians, shape (m, 3, n).
+
+        Row block `k` is `J^k_q̇(q) = J^{b_k,a_k}_{b_k}(q) · S_{ab,k}`, expressed
+        in full joint space (the path selection `S_ab` is already applied, so the
+        non-path joints contribute zero columns).  Maps `q̇` to each IMU pair's
+        relative angular velocity (CLAUDE.md §3b).  `m` = number of IMU pairs.
+        """
+
+        raise NotImplementedError

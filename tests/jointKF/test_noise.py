@@ -173,5 +173,8 @@ def test_robot_seam_imports_without_simulator():
         def mass_matrix(self, q):
             return jnp.eye(q.shape[0])
 
+        def relative_gyro_jacobian(self, q):
+            return jnp.zeros((1, 3, q.shape[0]))
+
     # runtime_checkable Protocol: a duck-typed provider satisfies it.
     assert isinstance(Dummy(), robot.RobotModel)
