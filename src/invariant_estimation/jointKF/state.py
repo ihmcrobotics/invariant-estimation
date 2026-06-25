@@ -129,6 +129,29 @@ class JointKFState(NamedTuple):
         return jnp.concatenate([self.q_hat, self.q_dot_hat, self.b_omega])
 
 
+def split_x(x: Array, n_joints: int) -> tuple[Array, Array, Array]:
+    """Inverse of `JointKFState.x`: split [q ; q_dot ; b_omega] into its parts.
+
+    Reconstructs the three state segments from a stacked vector, so the filter
+    steps (predict / update) that operate on `x` can rebuild a JointKFState
+    without duplicating the slice arithmetic.  `b_omega` is the remainder, so
+    `n_pairs` is not needed.
+
+    Parameters
+    ----------
+    x : Array, shape (2n+3m,)
+        Stacked state vector.
+    n_joints : int
+        Number of joints n.
+
+    Returns
+    -------
+    (q_hat, q_dot_hat, b_omega) : tuple of Array, shapes (n,), (n,), (3m,)
+    """
+    n = n_joints
+    return x[:n], x[n:2 * n], x[2 * n:]
+
+
 # ---------------------------------------------------------------------------
 # Parameters
 # ---------------------------------------------------------------------------

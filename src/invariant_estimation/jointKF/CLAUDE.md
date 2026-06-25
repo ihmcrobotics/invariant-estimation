@@ -14,8 +14,8 @@ ContactNet appear only at the boundary.
 | `state.py`        | ✅ done (+tests) | `JointKFState` (q̂, q̇̂, b_ω, P), `JointKFParams`, `init_state`, `default_params`. State is `x = [q ; q̇ ; b_ω] ∈ R^{2n+3m}`. |
 | `../robot.py`     | ✅ seam (adapter TODO) | `RobotModel` Protocol (`mass_matrix(q)` now; relative Jacobian + `S_ab` later). IsaacLab adapter implementing it is TODO. No simulator import. |
 | `noise.py`        | ✅ done (+tests) | `build_F`, `build_Q_d` / `build_process_noise` (diagonal or `σ_τ² M⁻²`), `build_R`. Takes `M` as a raw array (`M=None` → diagonal early-dev `Q_a`). |
-| `predict.py`      | ⏳ next | `x⁻ = F x`, `P⁻ = F P Fᵀ + Q_d`. Calls `noise.build_F` + `noise.build_process_noise(..., M=robot.mass_matrix(q̂) or None)`. |
-| `update.py`       | ⏳ todo | EKF update with **Joseph form** covariance update (§4). |
+| `predict.py`      | ✅ done (+tests) | `predict(state, params, M=None)`: `x⁻ = F x`, `P⁻ = F P Fᵀ + Q_d` (symmetrized). Raw-array `M`; `split_x` helper added to `state.py`. |
+| `update.py`       | ⏳ next | EKF update with **Joseph form** covariance update (§4). Reuses `noise.build_R` + `state.split_x`; needs `H`/`z` from `measurement.py`. |
 | `measurement.py`  | ⏳ todo | Stacked `z`, `H` (encoder + IMU blocks). Isolates the EKF nonlinearity `J^{b,a}_b(q̂)`. Extends `robot.py` with the relative Jacobian + `S_ab`. |
 | `filter.py`       | ⏳ todo | Thin `predict → update` orchestrator; target for `jax.lax.scan`. |
 
