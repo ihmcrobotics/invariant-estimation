@@ -17,9 +17,16 @@ ContactNet appear only at the boundary.
 | `predict.py`      | ✅ done (+tests) | `predict(state, params, M=None)`: `x⁻ = F x`, `P⁻ = F P Fᵀ + Q_d` (symmetrized). Raw-array `M`; `split_x` helper added to `state.py`. |
 | `measurement.py`  | ✅ done (+tests) | `relative_gyro_measurement` (vmap differencing), `build_z`, `build_H`, `build_measurement`. Isolates the EKF nonlinearity; takes raw `J_omega (m,3,n)` from `robot.relative_gyro_jacobian`. |
 | `update.py`       | ✅ done (+tests) | `update(state, z, H, R) -> (state⁺, UpdateInfo{ν, S})`. **Joseph form**; Cholesky gain solve. Reuses `noise.build_R` + `state.split_x`. |
-| `filter.py`       | ⏳ next | Thin orchestrator: resolve `robot → M`/`J_omega`, run `predict → update`, stack `UpdateInfo` over `jax.lax.scan`. |
+| `filter.py`       | ✅ done (+tests) | `SensorInputs`; `step(state, params, sensors, robot=None)` (predict→update, resolves `robot → M`/`J_omega`); `run(...)` scans a trajectory, returns `(final, states, infos)`. |
 
-Tests live in `tests/jointKF/test_<name>.py`. Run: `uv run pytest tests/jointKF -q`.
+**Package is feature-complete.** Remaining work is external: the IsaacLab adapter
+implementing `RobotModel`, and the InEKF/ContactNet consumers of the outputs.
+
+**Precision:** the whole package runs in **float64** — `invariant_estimation/__init__.py`
+sets `jax_enable_x64=True` at import (process-global; affects any importer).
+
+Tests live in `tests/jointKF/test_<name>.py` (159 passing). Run:
+`uv run pytest tests/jointKF -q`.
 
 ## Standing conventions
 

@@ -125,8 +125,13 @@ class JointKFState(NamedTuple):
 
     @property
     def x(self) -> Array:
-        """Stacked state vector [q ; q_dot ; b_omega], shape (2n+3m,)."""
-        return jnp.concatenate([self.q_hat, self.q_dot_hat, self.b_omega])
+        """Stacked state vector [q ; q_dot ; b_omega], shape (..., 2n+3m).
+
+        Concatenates on the last axis, so this also works on a batched/stacked
+        state (e.g. a `jax.lax.scan` trajectory with a leading time axis), not
+        only a single 1-D state.
+        """
+        return jnp.concatenate([self.q_hat, self.q_dot_hat, self.b_omega], axis=-1)
 
 
 def split_x(x: Array, n_joints: int) -> tuple[Array, Array, Array]:
