@@ -16,8 +16,8 @@ ContactNet appear only at the boundary.
 | `noise.py`        | ✅ done (+tests) | `build_F`, `build_Q_d` / `build_process_noise` (diagonal or `σ_τ² M⁻²`), `build_R`. Takes `M` as a raw array (`M=None` → diagonal early-dev `Q_a`). |
 | `predict.py`      | ✅ done (+tests) | `predict(state, params, M=None)`: `x⁻ = F x`, `P⁻ = F P Fᵀ + Q_d` (symmetrized). Raw-array `M`; `split_x` helper added to `state.py`. |
 | `measurement.py`  | ✅ done (+tests) | `relative_gyro_measurement` (vmap differencing), `build_z`, `build_H`, `build_measurement`. Isolates the EKF nonlinearity; takes raw `J_omega (m,3,n)` from `robot.relative_gyro_jacobian`. |
-| `update.py`       | ⏳ next | EKF update with **Joseph form** covariance update (§4). Reuses `noise.build_R` + `state.split_x`; consumes `z`/`H` from `measurement.py`. |
-| `filter.py`       | ⏳ todo | Thin `predict → update` orchestrator; target for `jax.lax.scan`. |
+| `update.py`       | ✅ done (+tests) | `update(state, z, H, R) -> (state⁺, UpdateInfo{ν, S})`. **Joseph form**; Cholesky gain solve. Reuses `noise.build_R` + `state.split_x`. |
+| `filter.py`       | ⏳ next | Thin orchestrator: resolve `robot → M`/`J_omega`, run `predict → update`, stack `UpdateInfo` over `jax.lax.scan`. |
 
 Tests live in `tests/jointKF/test_<name>.py`. Run: `uv run pytest tests/jointKF -q`.
 
