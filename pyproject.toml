@@ -29,6 +29,9 @@ docs = [
     "sphinx-design>=0.7.0",
 ]
 
+[tool.uv]
+default-groups = ["dev", "docs"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
