@@ -1,0 +1,17 @@
+/* Make MathJax display math scroll instead of overflow on narrow screens. */
+mjx-container[display="true"] {
+    overflow-x: auto;
+    overflow-y: hidden;
+    max-width: 100%;
+    padding: 0.25rem 0;
+}
+
+/* Slightly roomier line height for math-heavy prose. */
+article p {
+    line-height: 1.7;
+}
+
+/* Subtle accent for numbered equations in dark mode. */
+.eqno {
+    opacity: 0.7;
+}
