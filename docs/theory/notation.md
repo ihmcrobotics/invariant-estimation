@@ -52,8 +52,8 @@ $$
 And an aligned block:
 
 $$
-\begin{align}
+\begin{aligned}
 \dbf{x} &= \mathbf{f}(\mathbf{x}, \mathbf{u}) \\
 \mathbf{y} &= \mathbf{h}(\mathbf{x}) + \tbf{n}, \qquad \mag{\tbf{n}} \le \epsilon.
-\end{align}
+\end{aligned}
 $$
