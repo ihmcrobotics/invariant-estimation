@@ -7,8 +7,17 @@ correction side only (see `CLAUDE.md` for the full design record).  The filter
 holds no trainable parameters — BPTT during training flows *through* it.
 
 Build order (one module per prompt): group -> state -> propagate -> correct ->
-contact -> filter.  Implemented so far: group, state, propagate.
+contact -> filter.  Implemented so far: group, state, propagate, correct.
 """
+from .correct import (
+    apply_correction,
+    correct,
+    innovation,
+    joseph_update,
+    kalman_gain,
+    measurement_noise,
+    predicted_contact,
+)
 from .group import (
     Adjoint,
     Gamma0,
@@ -56,4 +65,12 @@ __all__ = [
     "propagate_cov",
     "build_Qd",
     "inertial_Qd",
+    # correction (§4)
+    "correct",
+    "innovation",
+    "predicted_contact",
+    "measurement_noise",
+    "kalman_gain",
+    "joseph_update",
+    "apply_correction",
 ]
