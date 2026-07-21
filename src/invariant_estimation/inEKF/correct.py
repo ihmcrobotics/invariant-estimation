@@ -55,9 +55,13 @@ vectorised (no Python loop over contacts), ``S⁻¹`` is a Cholesky solve, and t
 covariance is kept symmetric.  ``N`` is static, so the ``N = 0`` (no candidates)
 case is a plain early return.
 """
+from typing import NamedTuple
+
 from jax import Array
 import jax.numpy as jnp
 from jax.scipy.linalg import cho_factor, cho_solve
+
+from ..config import section
 
 from .group import exp_SEn3
 from .state import (
@@ -238,6 +242,127 @@ def apply_correction(state: InEKFState, xi: Array) -> InEKFState:
 
 
 # ---------------------------------------------------------------------------
+# Generic linear update (Java `InvariantUpdater`)
+# ---------------------------------------------------------------------------
+
+class UpdateDiagnostics(NamedTuple):
+    """Published per-update diagnostics.
+
+    These are the Java `InvariantUpdater` / `InvariantEKF` introspection getters
+    (`getNormalizedInnovationSquared`, `wasLastUpdateApplied`,
+    `getLastConditionProxy`, `getLastCorrectionRotationNorm`).  CLAUDE.md §4:
+    diagnostics are part of the seam surface, not optional logging — the ported
+    tests read them.
+
+    Attributes
+    ----------
+    applied : Array, scalar float
+        1.0 if the gain was applied, 0.0 if gated out.  A gated update leaves
+        ``(X̂, P)`` bit-for-bit unchanged (masked ``K``, never a Python branch).
+    nis : Array, scalar
+        Normalised innovation squared ``rᵀ S⁻¹ r``, computed on the **prior**
+        ``P`` and the **prior** residual (§6 trap).  NaN before any update.
+    condition_proxy : Array, scalar
+        ``(max L_ii / min L_ii)²`` from the Cholesky of ``S`` — the §4 gate proxy.
+    correction_rotation_norm : Array, scalar
+        ``‖(Kν)_rotation‖``; zero-release checks read this.
+    """
+    applied: Array
+    nis: Array
+    condition_proxy: Array
+    correction_rotation_norm: Array
+
+
+def no_update_diagnostics() -> UpdateDiagnostics:
+    """Diagnostics before any update has run — ``nis`` is **NaN**.
+
+    Java initialises NIS to NaN so a never-updated value cannot read as
+    "in-band"; `testNormalizedInnovationSquaredIsNaNBeforeAnyUpdate` locks it.
+    """
+    return UpdateDiagnostics(
+        applied=jnp.array(0.0),
+        nis=jnp.array(jnp.nan),
+        condition_proxy=jnp.array(jnp.nan),
+        correction_rotation_norm=jnp.array(jnp.nan),
+    )
+
+
+def linear_update(
+    state: InEKFState,
+    H: Array,
+    residual: Array,
+    R: Array,
+    cond_max: float | None = None,
+    gate: Array | float = 1.0,
+) -> tuple[InEKFState, UpdateDiagnostics]:
+    r"""Generic linear measurement update — Java ``InvariantUpdater.update``.
+
+    The one code path every update in the filter goes through (contact FK,
+    gravity leveling, and anything the orchestrator adds), so they cannot drift
+    apart::
+
+        S  = H P Hᵀ + R                       (symmetrised)
+        K  = P Hᵀ S⁻¹                         (Cholesky solve — never `inv`)
+        X̂⁺ = exp(−(Kν)^∧) X̂                   (I5)
+        P⁺ = (I − KH) P (I − KH)ᵀ + K R Kᵀ    (Joseph — mandatory)
+
+    Gating (§4): the conditioning proxy ``(max L_ii / min L_ii)²`` of ``S`` and
+    the caller's ``gate`` multiply into ``K``.  A gated update therefore leaves
+    ``(X̂, P)`` **bit-for-bit unchanged** rather than latching a bad correction —
+    which is what `testSingularInnovationIsSkippedNotLatched` requires — and it
+    does so without a data-dependent Python branch (I7).
+
+    Parameters
+    ----------
+    state : InEKFState
+    H : Array, shape (z, 3N+9)
+    residual : Array, shape (z,)
+    R : Array, shape (z, z)
+        Measurement covariance, in the same frame as ``residual``.
+    cond_max : float, optional
+        Conditioning threshold; ``None`` takes ``inekf.cond_max`` from the config.
+    gate : Array or float
+        External mask (e.g. a quasi-static gate), multiplied into ``K``.
+
+    Returns
+    -------
+    state : InEKFState
+    diagnostics : UpdateDiagnostics
+    """
+    if cond_max is None:
+        cond_max = section("inekf")["cond_max"]
+
+    S = H @ state.P @ H.T + R
+    S = 0.5 * (S + S.T)
+    factor = cho_factor(S)
+
+    diag = jnp.abs(jnp.diag(factor[0]))
+    condition_proxy = (jnp.max(diag) / jnp.min(diag)) ** 2
+
+    K = cho_solve(factor, H @ state.P).T           # P Hᵀ S⁻¹
+    nis = residual @ cho_solve(factor, residual)   # prior P, prior residual
+
+    applied = jnp.asarray(gate, dtype=jnp.float64) * (
+        condition_proxy < cond_max
+    ).astype(jnp.float64)
+    K = applied * K
+
+    xi = K @ residual
+    corrected = apply_correction(state, xi)
+    P_new = joseph_update(state.P, K, H, R)
+
+    return (
+        corrected._replace(P=P_new),
+        UpdateDiagnostics(
+            applied=applied,
+            nis=nis,
+            condition_proxy=condition_proxy,
+            correction_rotation_norm=jnp.linalg.norm(xi[0:3]),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # ContactUpdater seams (Java `ContactUpdater`, ported suite)
 #
 # The per-contact views of the machinery above.  `correct` is the vectorised
@@ -322,8 +447,9 @@ def contact_update(
 ) -> tuple[InEKFState, Array]:
     r"""One single-contact FK update — Java `InvariantUpdater.update(...)`.
 
-    Composes the seams above: residual → rotate noise to world → gain → Joseph →
-    ``exp(−ξ)`` (I5).  Returns the corrected state and the residual actually used.
+    Composes the seams above: residual → rotate noise to world → `linear_update`.
+    Going through the shared update path is what makes the EKF-delegation tests
+    bit-exact — there is only one implementation of the gain/Joseph/gate logic.
 
     Parameters
     ----------
@@ -343,6 +469,8 @@ def contact_update(
     -------
     state : InEKFState
     residual : Array, shape (3,)
+        The **prior** residual actually used.
+    diagnostics : UpdateDiagnostics
     """
     if learned:
         raise NotImplementedError(
@@ -355,10 +483,8 @@ def contact_update(
     residual = contact_residual(state, contact_index, measurement)
     Nmat = rotate_measurement_covariance(state, body_covariance)
 
-    K, _ = kalman_gain(state.P, H, Nmat)
-    corrected = apply_correction(state, K @ residual)
-    P_new = joseph_update(state.P, K, H, Nmat)
-    return corrected._replace(P=P_new), residual
+    updated, diagnostics = linear_update(state, H, residual, Nmat)
+    return updated, residual, diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -403,9 +529,5 @@ def correct(
     nu = innovation(state, y)                     # (3N,)
     Nmat = measurement_noise(Np)                  # (3N, 3N)
 
-    K, _ = kalman_gain(state.P, H, Nmat)          # (3N+9, 3N)
-    xi = K @ nu                                   # (3N+9,)
-
-    corrected = apply_correction(state, xi)
-    P_new = joseph_update(state.P, K, H, Nmat)
-    return corrected._replace(P=P_new), nu
+    corrected, _ = linear_update(state, H, nu, Nmat)
+    return corrected, nu

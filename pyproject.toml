@@ -11,7 +11,8 @@ authors = [
 dependencies = [
   "jax",
   "jaxlie",
-  "ipython"
+  "ipython",
+  "pyyaml",
 ]
 
 [project.scripts]

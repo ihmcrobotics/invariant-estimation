@@ -50,6 +50,8 @@ from typing import NamedTuple
 import jax.numpy as jnp
 from jax import Array
 
+from ..config import section
+
 
 class JointKFState(NamedTuple):
     """Sufficient statistic for the bias-augmented joint-chain KF.
@@ -265,23 +267,25 @@ def init_state(
     return JointKFState(q_hat=q_hat, q_dot_hat=q_dot_hat, b_omega=b_omega, P=P)
 
 
-def default_params(dt: float = 1e-3) -> JointKFParams:
-    """Sensible default parameters for a 1 kHz humanoid joint KF.
+def default_params(dt: float | None = None) -> JointKFParams:
+    """Default parameters for a 1 kHz humanoid joint KF.
 
-    These are starting-point values, NOT tuned constants.  Adjust to match the
-    encoder spec, the Mahony-cleaned gyro noise, and the dynamics roughness
-    you expect.
+    All values come from the ``joint_kf`` section of ``config/filter_cfg.yaml``
+    — the single place tuning numbers live.  These are starting-point values,
+    NOT tuned constants: match them to the encoder spec, the Mahony-cleaned gyro
+    noise, and the dynamics roughness you expect.
 
     Parameters
     ----------
-    dt : float
-        Filter timestep [s].  Default matches the IHMC 1 kHz control loop.
+    dt : float, optional
+        Filter timestep [s].  ``None`` takes the configured value (1 kHz).
     """
+    cfg = section("joint_kf")
     return JointKFParams(
-        sigma_enc=jnp.deg2rad(0.05).item(),    # 0.05 deg encoder noise
-        sigma_omega=2e-3,                       # [rad/s] Mahony-cleaned rel-gyro
-        sigma_tau=1.0,                          # [N·m] torque-space process noise
-        sigma_acc=5.0,                          # [rad/s^2] early-dev diagonal Q_a
-        sigma_b=1e-4,                           # [rad/s] residual bias — TIGHT
-        dt=dt,
+        sigma_enc=jnp.deg2rad(cfg["sigma_enc_deg"]).item(),
+        sigma_omega=cfg["sigma_omega"],         # [rad/s] Mahony-cleaned rel-gyro
+        sigma_tau=cfg["sigma_tau"],             # [N·m] torque-space process noise
+        sigma_acc=cfg["sigma_acc"],             # [rad/s^2] early-dev diagonal Q_a
+        sigma_b=cfg["sigma_b"],                 # [rad/s] residual bias — TIGHT
+        dt=cfg["dt"] if dt is None else dt,
     )

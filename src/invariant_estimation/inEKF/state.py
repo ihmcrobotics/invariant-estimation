@@ -48,6 +48,7 @@ from typing import NamedTuple
 from jax import Array
 import jax.numpy as jnp
 
+from ..config import section
 from .group import skew
 
 
@@ -313,10 +314,10 @@ def init_state(
     v0: Array | None = None,
     p0: Array | None = None,
     d0: Array | None = None,
-    p_R: float = 1e-2,
-    p_v: float = 1e-1,
-    p_p: float = 1e-2,
-    p_d: float = 1.0,
+    p_R: float | None = None,
+    p_v: float | None = None,
+    p_p: float | None = None,
+    p_d: float | None = None,
 ) -> InEKFState:
     """Construct an initial `InEKFState` with a diagonal prior covariance.
 
@@ -329,16 +330,23 @@ def init_state(
         to identity / zeros.
     d0 : Array, shape (N, 3), optional
         Initial contact positions.  Defaults to zeros.
-    p_R, p_v, p_p, p_d : float
+    p_R, p_v, p_p, p_d : float, optional
         Diagonal prior variances on the orientation / velocity / position /
-        per-contact error blocks.  Contacts default to a diffuse ``p_d`` because
-        a candidate not yet in firm contact is "off" via a large covariance
-        (CoCo, §1.1).  These are untuned starting points, not tuned constants.
+        per-contact error blocks.  ``None`` (the default) takes the value from
+        ``inekf.init`` in ``config/filter_cfg.yaml``.  Contacts default to a
+        diffuse ``p_d`` because a candidate not yet in firm contact is "off" via
+        a large covariance (CoCo).
 
     Returns
     -------
     InEKFState
     """
+    prior = section("inekf")["init"]
+    p_R = prior["rotation_var"] if p_R is None else p_R
+    p_v = prior["velocity_var"] if p_v is None else p_v
+    p_p = prior["position_var"] if p_p is None else p_p
+    p_d = prior["contact_var"] if p_d is None else p_d
+
     R0 = jnp.eye(3) if R0 is None else R0
     v0 = jnp.zeros(3) if v0 is None else v0
     p0 = jnp.zeros(3) if p0 is None else p0
@@ -357,11 +365,11 @@ def init_state(
 
 def default_params(
     N: int,
-    dt: float = 1e-3,
+    dt: float | None = None,
     g: Array | None = None,
-    gyro_var: float = 1e-4,
-    accel_var: float = 1e-3,
-    contact_floor: float = 1e-4,
+    gyro_var: float | None = None,
+    accel_var: float | None = None,
+    contact_floor: float | None = None,
 ) -> InEKFParams:
     """Sensible default `InEKFParams` for an ``N``-contact filter at 1 kHz.
 
@@ -373,17 +381,23 @@ def default_params(
     ----------
     N : int
         Number of contact candidates (static — fixes the constant graph).
-    dt : float
-        Filter timestep [s].  Default matches the IHMC 1 kHz control loop.
+    dt : float, optional
     g : Array, shape (3,), optional
-        Gravity acceleration vector.  Defaults to ``[0, 0, -9.81]``.
-    gyro_var, accel_var : float
+    gyro_var, accel_var : float, optional
         Isotropic IMU noise **variance** densities (see `InEKFParams`).
-        Defaults are the test-locked InEKF values of CLAUDE.md §2b.
-    contact_floor : float
+    contact_floor : float, optional
         Variance floor on the contact covariances [m²].
+
+    All of the above default to the ``inekf`` section of
+    ``config/filter_cfg.yaml``; pass a value to override it.
     """
-    g = jnp.array([0.0, 0.0, -9.81]) if g is None else g
+    cfg = section("inekf")
+    dt = cfg["dt"] if dt is None else dt
+    gyro_var = cfg["gyro_var"] if gyro_var is None else gyro_var
+    accel_var = cfg["accel_var"] if accel_var is None else accel_var
+    contact_floor = cfg["contact_floor"] if contact_floor is None else contact_floor
+    g = jnp.asarray(cfg["gravity"], dtype=float) if g is None else g
+
     return InEKFParams(
         g=g,
         dt=dt,

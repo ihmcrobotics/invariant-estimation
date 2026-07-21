@@ -69,9 +69,9 @@ from typing import NamedTuple
 
 from jax import Array
 import jax.numpy as jnp
-from jax.scipy.linalg import cho_factor, cho_solve
 
-from .correct import apply_correction, joseph_update
+from ..config import section
+from .correct import UpdateDiagnostics, linear_update
 from .group import skew
 from .state import InEKFState
 
@@ -115,26 +115,38 @@ class GravityParams(NamedTuple):
 
 
 def default_gravity_params(
-    gravity: float = 9.81,
-    roll_var: float = 2.5e-3,
-    pitch_var: float = 1.9e-1,
-    pitch_disabled_var: float = 1.0e4,
-    tau: float = 5.0,
-    norm_tol: float = 0.05,
-    rot_tol: float = 0.15,
-    horiz_tol: float = 0.5,
-    cond_max: float = 1.0e9,
+    gravity: float | None = None,
+    roll_var: float | None = None,
+    pitch_var: float | None = None,
+    pitch_disabled_var: float | None = None,
+    tau: float | None = None,
+    norm_tol: float | None = None,
+    rot_tol: float | None = None,
+    horiz_tol: float | None = None,
+    cond_max: float | None = None,
 ) -> GravityParams:
-    """`GravityParams` with the test-locked defaults (CLAUDE.md §2b)."""
+    """`GravityParams`, defaulting to ``gravity_leveling`` in filter_cfg.yaml.
+
+    Every argument is an override: pass ``None`` (the default) to take the
+    configured value.
+    """
+    cfg = section("gravity_leveling")
+    gates = cfg["gates"]
     return GravityParams(
-        gravity=gravity, roll_var=roll_var, pitch_var=pitch_var,
-        pitch_disabled_var=pitch_disabled_var, tau=tau,
-        norm_tol=norm_tol, rot_tol=rot_tol, horiz_tol=horiz_tol,
-        cond_max=cond_max,
+        gravity=cfg["gravity"] if gravity is None else gravity,
+        roll_var=cfg["roll_var"] if roll_var is None else roll_var,
+        pitch_var=cfg["pitch_var"] if pitch_var is None else pitch_var,
+        pitch_disabled_var=(cfg["pitch_disabled_var"] if pitch_disabled_var is None
+                            else pitch_disabled_var),
+        tau=cfg["reference_tau"] if tau is None else tau,
+        norm_tol=gates["norm_tol"] if norm_tol is None else norm_tol,
+        rot_tol=gates["rot_tol"] if rot_tol is None else rot_tol,
+        horiz_tol=gates["horiz_tol"] if horiz_tol is None else horiz_tol,
+        cond_max=section("inekf")["cond_max"] if cond_max is None else cond_max,
     )
 
 
-def isotropic_gravity_params(variance: float, gravity: float = 9.81, **kw) -> GravityParams:
+def isotropic_gravity_params(variance: float, gravity: float | None = None, **kw) -> GravityParams:
     """Java `GravityLevelingUpdater(tangentSize, isotropicVar, G)`.
 
     The isotropic constructor: roll and pitch share one variance.
@@ -364,50 +376,24 @@ def assemble_gravity_leveling(
 # Update
 # ---------------------------------------------------------------------------
 
-class GravityDiagnostics(NamedTuple):
-    """Published diagnostics — part of the seam surface, not optional logging (§4)."""
-    applied: Array           # scalar float: 1.0 if the update was applied
-    condition_proxy: Array   # scalar: Cholesky-diagonal conditioning proxy of S
-    nis: Array               # scalar: rᵀ S⁻¹ r on the PRIOR P and prior residual
-
-
 def apply_gravity_leveling(
     state: InEKFState,
     meas: GravityMeasurement,
     params: GravityParams,
     gate: Array | float = 1.0,
-) -> tuple[InEKFState, GravityDiagnostics]:
+) -> tuple[InEKFState, UpdateDiagnostics]:
     r"""Joseph-form gravity update ``X̂⁺ = exp(−(Kν)^∧) X̂`` (I5).
 
-    The conditioning gate of §4: ``cond ≈ (max L_ii / min L_ii)²`` from the
-    Cholesky of ``S``; if it exceeds ``cond_max`` the gain is masked to zero,
-    which leaves ``(X̂, P)`` bit-for-bit unchanged rather than latching a bad
-    update.  ``gate`` multiplies in any external mask (e.g. the quasi-static
-    gate) the same way.
+    A thin wrapper over the shared `correct.linear_update`: the gravity update
+    is an ordinary linear update with an unusual ``H`` and ``R``, so it must not
+    have its own gain/Joseph/gate implementation to drift out of sync.
 
-    NIS is computed on the **prior** ``P`` and the prior residual (§6 trap).
+    ``gate`` is where an external mask (typically `is_quasi_static`) enters; a
+    gated update leaves ``(X̂, P)`` bit-for-bit unchanged.
     """
-    H, R, r = meas.H, meas.R, meas.residual
-
-    S = H @ state.P @ H.T + R
-    S = 0.5 * (S + S.T)
-    c, lower = cho_factor(S)
-    diag = jnp.abs(jnp.diag(c))
-    condition_proxy = (jnp.max(diag) / jnp.min(diag)) ** 2
-
-    K = (cho_solve((c, lower), H @ state.P)).T          # P Hᵀ S⁻¹
-    nis = r @ cho_solve((c, lower), r)                  # prior P, prior residual
-
-    applied = jnp.asarray(gate, dtype=jnp.float64) * (
-        condition_proxy < params.cond_max
-    ).astype(jnp.float64)
-    K = applied * K
-
-    corrected = apply_correction(state, K @ r)
-    P_new = joseph_update(state.P, K, H, R)
-    return (
-        corrected._replace(P=P_new),
-        GravityDiagnostics(applied=applied, condition_proxy=condition_proxy, nis=nis),
+    return linear_update(
+        state, meas.H, meas.residual, meas.R,
+        cond_max=params.cond_max, gate=gate,
     )
 
 

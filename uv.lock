@@ -270,6 +270,7 @@ dependencies = [
     { name = "ipython" },
     { name = "jax" },
     { name = "jaxlie" },
+    { name = "pyyaml" },
 ]
 
 [package.dev-dependencies]
@@ -290,6 +291,7 @@ requires-dist = [
     { name = "ipython" },
     { name = "jax" },
     { name = "jaxlie" },
+    { name = "pyyaml" },
 ]
 
 [package.metadata.requires-dev]

@@ -43,10 +43,13 @@ from jax import Array, vmap
 import jax.numpy as jnp
 from jaxlie import SO3
 
+from ..config import section
+
 # Below this value of θ² = ‖φ‖² the SO(3) coefficient closed forms suffer
 # catastrophic cancellation, so we switch to their truncated Taylor series.
 # θ ≈ 1e-4; the series (kept to θ⁴) is then accurate to ~1e-24, far past float64.
-_EPS = 1e-8
+# Tunable: `numerics.small_angle_eps` in config/filter_cfg.yaml.
+_EPS = section("numerics")["small_angle_eps"]
 
 
 # ---------------------------------------------------------------------------

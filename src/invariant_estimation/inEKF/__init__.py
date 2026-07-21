@@ -16,6 +16,7 @@ from .contact import (
     rotate_to_world,
 )
 from .correct import (
+    UpdateDiagnostics,
     apply_correction,
     contact_jacobian,
     contact_residual,
@@ -24,13 +25,24 @@ from .correct import (
     innovation,
     joseph_update,
     kalman_gain,
+    linear_update,
     map_encoder_noise,
     measurement_noise,
+    no_update_diagnostics,
     predicted_contact,
     rotate_measurement_covariance,
 )
+from .ekf import (
+    InvariantEKF,
+    create,
+    gravity_leveling_update,
+    initial_diagnostics,
+    initialize,
+    initialize_from_state,
+    predict,
+    update,
+)
 from .gravity_update import (
-    GravityDiagnostics,
     GravityMeasurement,
     GravityParams,
     GravityRef,
@@ -111,17 +123,28 @@ __all__ = [
     "kalman_gain",
     "joseph_update",
     "apply_correction",
+    "linear_update",
+    "UpdateDiagnostics",
+    "no_update_diagnostics",
     # ContactUpdater seams (ported suite)
     "contact_jacobian",
     "contact_residual",
     "contact_update",
     "rotate_measurement_covariance",
     "map_encoder_noise",
+    # EKF orchestrator (G5)
+    "InvariantEKF",
+    "create",
+    "initialize",
+    "initialize_from_state",
+    "predict",
+    "update",
+    "gravity_leveling_update",
+    "initial_diagnostics",
     # gravity leveling (G4)
     "GravityParams",
     "GravityRef",
     "GravityMeasurement",
-    "GravityDiagnostics",
     "default_gravity_params",
     "isotropic_gravity_params",
     "init_gravity_ref",

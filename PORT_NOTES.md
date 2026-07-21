@@ -381,3 +381,121 @@ proxy, masked `K`, so a gated update leaves `(X̂, P)` bit-for-bit unchanged) an
 computes NIS on the **prior** `P` and prior residual. Neither is exercised by
 this test class — both belong to G5's `InvariantUpdaterTest` — but they are
 wired now so the orchestrator has nothing left to bolt on.
+
+---
+
+## Config — `config/filter_cfg.yaml`
+
+Every tuning number in the estimator now lives in one file; no module hard-codes
+one. `invariant_estimation.config` loads it, and each `default_*_params` factory
+takes its defaults from there while still accepting explicit keyword overrides
+(so a sweep or a test needn't touch the file).
+
+Moved into the config: the InEKF noise variances / gravity / conditioning gate /
+init priors, the whole gravity-leveling block (anisotropic variances, reference
+τ, the three quasi-static gate thresholds), the joint-KF sigmas, and
+`group._EPS` (the small-angle branch threshold, now `numerics.small_angle_eps`).
+
+**Deliberately left in code:** tangent indices, block layouts, group sizes. Those
+are structural — changing one changes the math, not the tuning — and I4 exists
+precisely to stop them from moving.
+
+Values the Java suite pins carry a `[test-locked]` comment, and
+`tests/test_config.py::test_test_locked_values_match_the_java_suite` asserts them
+against the §2b constants table, which CLAUDE.md §5 designates the acceptance
+checksum for the config file.
+
+### Trap found while writing it
+
+PyYAML implements **YAML 1.1**, in which an exponent requires an explicit sign.
+`cond_max: 1.0e9` parses as the *string* `"1.0e9"`, not a float — and the failure
+surfaced ~2000 lines away as a `jnp.where` dtype error inside the gravity update,
+with nothing pointing at the config. `1.0e-3` is fine (it has a sign), so most of
+the file worked and only two keys were broken, which is the worst case.
+
+`load_config` now walks the parsed tree and rejects any string that `float()`
+accepts, naming the key and suggesting the signed form. `tests/test_config.py`
+covers both the guard and the invariant that no configured scalar is a string.
+
+---
+
+## G5 (partial) — `InvariantUpdaterTest` + `InvariantEKFTest`
+
+**Status:** green. `tests/inEKF/test_invariant_updater.py` (6 Java tests → 7
+pytest functions) and `tests/inEKF/test_invariant_ekf.py` (7 → 9). New module
+`inEKF/ekf.py`.
+
+**Scope, per Lucas 2026-07-21:** reseed and contact-trust are out —
+see "Deferred" below. `InvariantEKFReseedTest`, `TouchdownReseedLatchTest` and
+`FootSwitchContactProbabilityProviderTest` are therefore unported, and
+`reseed.py` / `contact_trust.py` do not exist.
+
+### Source change: one shared update path
+
+`correct.py` gained `linear_update(state, H, residual, R, cond_max, gate)` —
+Java's generic `InvariantUpdater.update` — plus the `UpdateDiagnostics` pytree
+and `no_update_diagnostics()` (NIS initialised to **NaN**, so a never-updated
+value cannot read as in-band).
+
+`contact_update`, `correct` and `apply_gravity_leveling` were all refactored to
+go through it. That was not optional bookkeeping: `testUpdateDelegatesToUpdater`
+asserts the orchestrator matches the standalone updater **bit-for-bit at 1e-12**,
+and the first attempt failed exactly this way — `contact_update` had picked up
+the conditioning gate while `correct` still had its own inline gain/Joseph, so
+the two drifted. There is now one implementation of gain / Joseph / gating / NIS.
+
+`contact_update` consequently returns `(state, residual, diagnostics)` rather
+than `(state, residual)`; the G4a call sites were updated.
+
+### `inEKF/ekf.py`
+
+Java's mutable `InvariantEKF` splits in two: `InvariantEKF` (immutable wiring —
+contact count, params, contact noise, gravity params; built by `create`) and the
+`InEKFState` carry threaded explicitly through every call (I10). The
+introspection getters (`wasLastUpdateApplied`, `getLastNormalizedInnovationSquared`,
+`getLastConditionProxy`, `getLastCorrectionRotationNorm`) become the returned
+`UpdateDiagnostics` pytree (§4).
+
+### Deliberate deviations
+
+1. **`testCreateWiresConsistentSizes`'s `IllegalStateException` has no analogue.**
+   Java can construct an `InvariantUpdater` without installing a `ContactUpdater`
+   and throws on use; the port wires the contact path by construction, so that
+   state is unreachable. The test keeps the positive half (update must not
+   raise); the negative half was already adapted in G4a.
+2. **`IllegalArgumentException` → `ValueError`** on `initialize`'s two shape
+   contracts (contact count, covariance size).
+3. **`dt` is not a per-call `predict` argument.** It is baked into the
+   precomputed `Φ`, so accepting it per call would mean rebuilding a constant
+   inside the loop (I7). It lives in `ekf.params`.
+4. **The 4000-sample NIS mean is `vmap`'d**, not looped — same 4000 draws.
+
+### Port-specific tests added
+
+- `test_gated_update_leaves_state_bit_for_bit_unchanged` — a gated-out update
+  (`gate=0`) must leave `(X̂, P)` bit-identical and still report a finite NIS.
+  This is the §4 masked-`K` contract that G8's
+  `testSingularInnovationIsSkippedNotLatched` depends on; cheaper to pin here.
+- `test_update_publishes_diagnostics` — the introspection surface, including NaN
+  NIS before any update.
+- `test_reseed_is_not_implemented` — asserts `reseed_contact` is absent and the
+  TODO is present, so the deferral cannot rot into a half-implementation.
+
+### Deferred (Lucas, 2026-07-21)
+
+- **Touchdown reseed.** No measurable difference on the real robot. `TODO(reseed)`
+  in `ekf.py` names the call site (between `predict` and `update`) and the exact
+  contract (`P_dd = P_pp + R N Rᵀ`, `P_θd = P_θp`, fire-once latch at
+  trigger 0.5 / rearm 0.1 / dwell 100). Parameters parked under `reseed:` in the
+  config with `enabled: false`.
+- **Contact trust** (`FootSwitchContactProbabilityProvider`). Will be validated
+  by comparing the Python and Java implementations on logged data rather than by
+  a unit-test port. Parameters parked under `contact_trust:`.
+
+### Housekeeping
+
+Deleted three empty placeholder modules (`inEKF/filter.py`, `routing.py`,
+`update.py` — all 0 bytes, nothing imported them). Renamed the orchestrator's
+gravity entry point to `gravity_leveling_update` so the package re-export stops
+shadowing the `gravity_update` *module* — the same name collision that already
+forced `importlib` imports for `correct` in two test files.

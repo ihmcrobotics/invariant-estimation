@@ -88,7 +88,7 @@ def test_contact_update_drives_residual_to_zero():
     body_cov = jnp.eye(3) * 1.0e-10
 
     before = _world_residual_norm(estimate, 0, measurement)
-    updated, _ = co.contact_update(estimate, 0, measurement, body_cov, False)
+    updated, _, _ = co.contact_update(estimate, 0, measurement, body_cov, False)
     after = _world_residual_norm(updated, 0, measurement)
 
     assert after < 1.0e-6
@@ -108,7 +108,7 @@ def test_contact_update_reduces_residual_for_larger_error():
     body_cov = jnp.eye(3) * 1.0e-8
 
     before = _world_residual_norm(estimate, 0, measurement)
-    updated, _ = co.contact_update(estimate, 0, measurement, body_cov, False)
+    updated, _, _ = co.contact_update(estimate, 0, measurement, body_cov, False)
     after = _world_residual_norm(updated, 0, measurement)
 
     assert after < 0.1 * before
@@ -125,7 +125,7 @@ def test_covariance_shrinks_and_stays_symmetric():
     estimate = _perturb(truth, _random_error(rng, 0.02))
     trace_before = float(jnp.trace(estimate.P))
 
-    updated, _ = co.contact_update(estimate, 0, measurement, jnp.eye(3) * 1.0e-4, False)
+    updated, _, _ = co.contact_update(estimate, 0, measurement, jnp.eye(3) * 1.0e-4, False)
 
     assert_symmetric(updated.P, 1.0e-9)
     assert float(jnp.trace(updated.P)) < trace_before
@@ -276,7 +276,7 @@ def test_contact_update_matches_vectorised_correct_at_one_contact():
     # `correct` consumes world-frame noise; `contact_update` rotates it itself.
     world_cov = co.rotate_measurement_covariance(estimate, body_cov)
 
-    via_seam, _ = co.contact_update(estimate, 0, measurement, body_cov, False)
+    via_seam, _, _ = co.contact_update(estimate, 0, measurement, body_cov, False)
     via_correct, _ = co.correct(estimate, measurement[None, :], world_cov[None], params)
 
     assert jnp.allclose(via_seam.as_matrix, via_correct.as_matrix, atol=1e-12)

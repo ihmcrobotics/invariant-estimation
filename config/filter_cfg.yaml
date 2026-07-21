@@ -1,0 +1,105 @@
+# filter_cfg.yaml — single source of truth for every tunable in the estimator.
+#
+# Nothing in `src/` should hard-code a tuning number: modules read their defaults
+# from here via `invariant_estimation.config`. Structural constants (tangent
+# indices, block layouts, group sizes) are NOT tunables and deliberately stay in
+# code — changing them changes the math, not the tuning.
+#
+# Values marked [test-locked] are asserted by the ported Java suite
+# (TEST_SUITE_MAP.md §"Filter constants the tests lock in"). Changing one will
+# fail a test — that is the intent, not a bug.
+#
+# GOTCHA: PyYAML is YAML 1.1, where an exponent needs an explicit sign. Write
+# `1.0e+9`, never `1.0e9` — the latter parses as the *string* "1.0e9" and blows
+# up far away from here. `load_config` type-checks every scalar to catch it at
+# load time; see `config.py`.
+
+inekf:
+  dt: 1.0e-3                      # [s] 1 kHz control loop
+  gravity: [0.0, 0.0, -9.81]      # [m/s^2] world frame  [test-locked]
+
+  # Continuous error-density VARIANCES (not standard deviations — see
+  # PORT_NOTES.md "G3 / Resolved"). Q_g = gyro_var*I3, Q_a = accel_var*I3.
+  gyro_var: 1.0e-4                # [(rad/s)^2/Hz]  [test-locked]
+  accel_var: 1.0e-3               # [(m/s^2)^2/Hz]  [test-locked]
+  contact_var: 1.0e-6             # [m^2/Hz] default isotropic contact density  [test-locked]
+
+  # Variance floor added to every digested ContactNet covariance. Keeps the
+  # L -> Sigma map smooth and PSD at a (near-)singular factor, which an
+  # eigenvalue clamp would not.
+  contact_floor: 1.0e-4           # [m^2]
+
+  # Conditioning gate on the innovation covariance S. Above this, the gain is
+  # masked to zero and (X, P) are left bit-for-bit unchanged (CLAUDE.md §4).
+  cond_max: 1.0e+9
+
+  # Diagonal prior for `init_state`. Contacts start diffuse: a candidate not yet
+  # in firm contact is "off" via a large covariance (CoCo), never a shape change.
+  init:
+    rotation_var: 1.0e-2
+    velocity_var: 1.0e-1
+    position_var: 1.0e-2
+    contact_var: 1.0
+
+  # Prior used by the EKF orchestrator's `initialize` when none is supplied.
+  initial_covariance: 1.0         # [test-locked]
+
+gravity_leveling:
+  gravity: 9.81                   # [m/s^2] magnitude  [test-locked]
+
+  # Anisotropic measurement variances. Pitch is trusted far less than roll:
+  # fore-aft specific force is contaminated by walking, lateral much less so.
+  roll_var: 2.5e-3                # ~(2.9 deg)^2  [test-locked]
+  pitch_var: 1.9e-1               # ~(25 deg)^2   [test-locked]
+
+  # Substituted for pitch_var when pitch is not observable. Large enough to
+  # freeze pitch, small enough to keep S well conditioned. Java's exact value is
+  # not observable from the test, which only asserts R(0,0) > 1e3.
+  pitch_disabled_var: 1.0e+4
+
+  # Complementary gravity-reference time constant. Sets the artifact rejection:
+  # gain at the 0.49 Hz balance mode is 1/sqrt(1+(w*tau)^2) ~ 0.065 (~15x).
+  reference_tau: 5.0              # [s]  [test-locked]
+
+  # Quasi-static gate. The horizontal test resolves against the sensor-driven
+  # gravity reference, NEVER the estimate's attitude (regression F.3).
+  gates:
+    norm_tol: 0.05                # fraction of g  [test-locked]
+    rot_tol: 0.15                 # [rad/s] on RAW gyro  [test-locked]
+    horiz_tol: 0.5                # [m/s^2]  [test-locked]
+
+joint_kf:
+  dt: 1.0e-3                      # [s]
+  sigma_enc_deg: 0.05             # [deg] encoder noise
+  sigma_omega: 2.0e-3             # [rad/s] Mahony-cleaned relative gyro
+  sigma_tau: 1.0                  # [N.m] torque-space process noise
+  sigma_acc: 5.0                  # [rad/s^2] early-dev diagonal Q_a
+  sigma_b: 1.0e-4                 # [rad/s] residual bias — deliberately TIGHT
+
+numerics:
+  # Below this value of theta^2 the SO(3) coefficient closed forms suffer
+  # catastrophic cancellation and the truncated series is used instead
+  # (theta ~ 1e-4; the series is then accurate to ~1e-24, far past float64).
+  small_angle_eps: 1.0e-8
+
+# ---------------------------------------------------------------------------
+# Not yet implemented — parameters recorded here so the tuning surface is
+# complete and the modules have somewhere to read from when they land.
+# ---------------------------------------------------------------------------
+
+# TODO(reseed): touchdown re-seed + TouchdownReseedLatch. Deferred by Lucas
+# 2026-07-21 — did not make a measurable difference on the real robot. See
+# PORT_NOTES.md "G5 / Deferred". Values below are the Java ones, unused for now.
+reseed:
+  enabled: false
+  latch_trigger: 0.5              # rising-crossing fire threshold
+  latch_rearm: 0.1                # sustained-low threshold that re-arms
+  latch_dwell_ticks: 100          # consecutive below-rearm ticks needed
+
+# TODO(contact_trust): FootSwitchContactProbabilityProvider. Not ported — will
+# be validated by comparing the Python and Java implementations on logged data
+# rather than by a unit-test port (Lucas, 2026-07-21).
+contact_trust:
+  schmitt_stay: 0.25
+  schmitt_enter: 0.35
+  dwell_seconds: 0.04
