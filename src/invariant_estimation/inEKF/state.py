@@ -51,6 +51,32 @@ import jax.numpy as jnp
 from .group import skew
 
 
+# ---------------------------------------------------------------------------
+# Tangent-space layout  (CLAUDE.md I4 — rotation-first, never permuted)
+#
+#   ξ = [ ξ_R (0:3) ; ξ_v (3:6) ; ξ_p (6:9) ; ξ_{d_i} (9+3i : 12+3i) ]
+#
+# Locked by the ported `InvariantStateTest.testTangentIndices`.  These are
+# plain Python ints (static) — safe to index traced arrays with.
+# ---------------------------------------------------------------------------
+
+ROTATION_TANGENT_INDEX = 0
+BASE_VELOCITY_TANGENT_INDEX = 3
+BASE_POSITION_TANGENT_INDEX = 6
+CONTACT_TANGENT_OFFSET = 9
+
+
+def contact_tangent_index(i: int) -> int:
+    """Tangent index of contact ``i``: ``9 + 3i`` (no bounds check — see method)."""
+    return CONTACT_TANGENT_OFFSET + 3 * i
+
+
+def _check_contact_index(i: int, N: int) -> None:
+    """Reject out-of-range contact indices, Java-style (no negative wraparound)."""
+    if not 0 <= i < N:
+        raise IndexError(f"contact index {i} out of range for N = {N}")
+
+
 class InEKFState(NamedTuple):
     """Sufficient statistic for the contact-aided InEKF.
 
@@ -84,6 +110,68 @@ class InEKFState(NamedTuple):
     def dim(self) -> int:
         """Tangent / covariance dimension ``3N + 9``."""
         return 3 * self.N + 9
+
+    # -- Java-parity aliases (`InvariantState`, ported suite) ---------------
+    #
+    # `getGroupSize()` / `getTangentSize()` / `getNumberOfContacts()` in the
+    # Java `InvariantState`.  Same numbers as `N` / `dim`, named so the ported
+    # tests read 1:1 against `InvariantStateTest`.
+
+    @property
+    def group_size(self) -> int:
+        """Side length ``N + 5`` of the dense group element ``X``."""
+        return self.N + 5
+
+    @property
+    def tangent_size(self) -> int:
+        """Tangent dimension ``3N + 9`` (alias of `dim`)."""
+        return self.dim
+
+    @classmethod
+    def identity(cls, N: int) -> "InEKFState":
+        """Fresh state at the group identity with **zero** covariance.
+
+        The Java `InvariantState(int numberOfContacts)` constructor: ``X = I``
+        of size ``(5+N)x(5+N)``, ``P = 0`` of size ``(9+3N)x(9+3N)``.  Note
+        ``P`` is zeros, *not* identity — a prior is applied separately by
+        `init_state`.
+        """
+        return cls(
+            R=jnp.eye(3),
+            v=jnp.zeros(3),
+            p=jnp.zeros(3),
+            d=jnp.zeros((N, 3)),
+            P=jnp.zeros((3 * N + 9, 3 * N + 9)),
+        )
+
+    def set_to_identity(self) -> "InEKFState":
+        """Reset ``X`` to the group identity, leaving ``P`` untouched.
+
+        Mirrors Java `setToIdentity()`, which only touches the group element.
+        """
+        return self._replace(
+            R=jnp.eye(3),
+            v=jnp.zeros(3),
+            p=jnp.zeros(3),
+            d=jnp.zeros_like(self.d),
+        )
+
+    # -- contact accessors (bounds-checked, static index) -------------------
+
+    def get_contact_position(self, i: int) -> Array:
+        """World position ``d_i`` of contact ``i``; `IndexError` if out of range."""
+        _check_contact_index(i, self.N)
+        return self.d[i]
+
+    def set_contact_position(self, i: int, d_i: Array) -> "InEKFState":
+        """Return a copy with contact ``i`` set to ``d_i``; `IndexError` if out of range."""
+        _check_contact_index(i, self.N)
+        return self._replace(d=self.d.at[i].set(d_i))
+
+    def contact_tangent_index(self, i: int) -> int:
+        """Tangent index ``9 + 3i`` of contact ``i``; `IndexError` if out of range."""
+        _check_contact_index(i, self.N)
+        return contact_tangent_index(i)
 
     @property
     def as_matrix(self) -> Array:

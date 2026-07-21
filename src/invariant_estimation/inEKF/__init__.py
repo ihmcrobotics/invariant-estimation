@@ -41,10 +41,14 @@ from .propagate import (
     propagate_mean,
 )
 from .state import (
+    BASE_POSITION_TANGENT_INDEX,
+    BASE_VELOCITY_TANGENT_INDEX,
+    ROTATION_TANGENT_INDEX,
     InEKFParams,
     InEKFState,
     build_H,
     build_Phi,
+    contact_tangent_index,
     default_params,
     init_state,
 )
@@ -65,6 +69,11 @@ __all__ = [
     "default_params",
     "build_Phi",
     "build_H",
+    # tangent layout (I4)
+    "ROTATION_TANGENT_INDEX",
+    "BASE_VELOCITY_TANGENT_INDEX",
+    "BASE_POSITION_TANGENT_INDEX",
+    "contact_tangent_index",
     # propagation (§3)
     "propagate",
     "propagate_mean",
