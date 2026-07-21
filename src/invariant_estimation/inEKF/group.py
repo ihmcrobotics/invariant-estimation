@@ -175,6 +175,48 @@ def Gamma2(phi: Array) -> Array:
 # Group exp / log on SE_{N+2}(3)
 # ---------------------------------------------------------------------------
 
+def exp_SEk3(xi: Array) -> Array:
+    r"""Exponential map onto ``SE_k(3)``, ``k`` inferred from ``ξ``.
+
+    The general-``k`` entry point (Java ``SEK3_Utils.exp``).  ``ξ`` has length
+    ``3 + 3k`` and the result is ``(3+k)x(3+k)``: a ``Γ_0(φ)`` rotation block
+    with ``Γ_1(φ)`` applied to each of the ``k`` translational components.
+    `exp_SEn3` is the filter-facing alias at ``k = N + 2``.
+
+    Parameters
+    ----------
+    xi : Array, shape (3+3k,)
+        Tangent vector, rotation-first: ``[φ ; ρ_1 ; … ; ρ_k]``.
+
+    Returns
+    -------
+    Array, shape (3+k, 3+k)
+
+    Raises
+    ------
+    ValueError
+        If ``len(ξ)`` is not ``3 + 3k`` for an integer ``k ≥ 1``.
+    """
+    m = xi.shape[0]
+    if m < 6 or (m - 3) % 3 != 0:
+        raise ValueError(
+            f"tangent length {m} is not 3 + 3k for an integer k >= 1"
+        )
+    k = (m - 3) // 3
+
+    phi = xi[:3]
+    R = Gamma0(phi)
+    J = Gamma1(phi)
+
+    rest = xi[3:].reshape(k, 3)             # (k, 3): the translational components
+    cols = J @ rest.T                        # (3, k): Γ_1 applied to each
+
+    X = jnp.eye(k + 3)
+    X = X.at[0:3, 0:3].set(R)
+    X = X.at[0:3, 3:].set(cols)
+    return X
+
+
 def exp_SEn3(xi: Array, N: int) -> Array:
     r"""Exponential map ``ξ ↦ X`` onto ``SE_{N+2}(3)``.
 
@@ -193,19 +235,18 @@ def exp_SEn3(xi: Array, N: int) -> Array:
     -------
     Array, shape (N+5, N+5)
         The dense group element ``X``.
+
+    Raises
+    ------
+    ValueError
+        If ``len(ξ) != 3N + 9``.
     """
-    phi = xi[:3]
-    R = Gamma0(phi)
-    J = Gamma1(phi)
-
-    # rest: the N+2 translational tangent vectors as rows -> columns of J @ rest^T
-    rest = xi[3:].reshape(N + 2, 3)        # (N+2, 3): v, p, d_1, …, d_N
-    cols = J @ rest.T                       # (3, N+2): Γ_1 applied to each
-
-    X = jnp.eye(N + 5)
-    X = X.at[0:3, 0:3].set(R)
-    X = X.at[0:3, 3:].set(cols)
-    return X
+    if xi.shape[0] != 3 * N + 9:
+        raise ValueError(
+            f"tangent length {xi.shape[0]} does not match 3N+9 = {3 * N + 9} "
+            f"for N = {N} contacts"
+        )
+    return exp_SEk3(xi)
 
 
 def log_SEn3(X: Array) -> Array:
@@ -224,7 +265,25 @@ def log_SEn3(X: Array) -> Array:
     -------
     Array, shape (3N+9,)
         Tangent vector in the fixed ``[ξ_R ; ξ_v ; ξ_p ; ξ_{d_1} ; …]`` order.
+
+    Raises
+    ------
+    ValueError
+        If ``X`` is not square, or is smaller than ``4x4`` (``k < 1``).  This is
+        the port's form of the Java size-consistency guard between the matrix
+        dimension ``n = 3 + k`` and the tangent length ``3 + 3k``: the Java API
+        packs into a caller-supplied output array and rejects a mismatched one,
+        whereas this function *returns* the tangent, so only the input can be
+        inconsistent.
     """
+    if X.ndim != 2 or X.shape[0] != X.shape[1]:
+        raise ValueError(f"group element must be a square matrix, got {X.shape}")
+    if X.shape[0] < 4:
+        raise ValueError(
+            f"group element of size {X.shape[0]} is smaller than the minimum "
+            f"4x4 (k = 1) SE_k(3) element"
+        )
+
     R = X[0:3, 0:3]
     phi = SO3.from_matrix(R).log()          # (3,)
     J = Gamma1(phi)

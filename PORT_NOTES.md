@@ -61,8 +61,58 @@ needed; `testTangentIndices` passes against the existing layout unchanged.
 
 - `TEST_SUITE_MAP.md` is not in the repo (read from `~/Documents/`). It is
   declared a companion file to `CLAUDE.md` — should be checked in.
-- `SEK3UtilsTest` (the other half of gate G2) is not yet ported;
-  `tests/inEKF/test_group.py` covers `group.py` but is not the 1:1 port and
-  lacks the SE(3)-reference agreement at k=1, the adjoint homomorphism /
-  conjugation identities at 1000 trials, and the wrong-sized-output `ValueError`
-  guard on `log`.
+---
+
+## G2 — `SEK3UtilsTest` → `tests/inEKF/test_sek3_utils.py`
+
+**Status:** green (5 Java tests → 13 pytest functions; the three `k = 1,2,3`
+loops are parametrized, and the size guard splits into `log` and `exp` halves).
+
+`tests/inEKF/test_group.py` (pre-existing) is kept — it covers what the Java
+class does not: the `Γ_0/Γ_1/Γ_2` closed forms, the θ→0 branch, finite gradients
+at θ = 0, and jit-vs-eager parity.
+
+### Source change: general-`k` entry point
+
+`group.log_SEn3` and `group.Adjoint` were already generic in the matrix size,
+but `exp_SEn3(xi, N)` is parameterized by *contact count*, so `k = 1` (plain
+SE(3)) would have required the nonsense `N = -1`. Added **`exp_SEk3(xi)`**,
+which infers `k = (len(ξ) - 3)/3` — the direct analogue of Java
+`SEK3_Utils.exp`. `exp_SEn3(xi, N)` is now a thin filter-facing alias at
+`k = N + 2`; no call site changed and no math moved.
+
+### Deliberate deviations
+
+1. **`testLogRejectsWrongSizedOutput` adapted.** Java packs into a
+   caller-supplied output array and throws `IllegalArgumentException` when its
+   length ≠ `3 + 3k`. The port *returns* the tangent, so that failure mode does
+   not exist; the observable ported instead is the size-consistency guard
+   itself, split in two: `log_SEn3` raises `ValueError` on a non-square or
+   sub-4×4 input, and `exp_SEk3`/`exp_SEn3` raise `ValueError` on a tangent
+   length inconsistent with `k`/`N`.
+2. **1000-trial loops → one `vmap` over a batch of 1000.** Trial counts are
+   preserved exactly (`ITERATIONS = 1000` per `k`); the Java `for` loop over the
+   sample index becomes a batch axis, per the repo's no-Python-loops-over-data
+   convention. Every assertion is a property recomputed from the same draw, so
+   matching Java's RNG stream is unnecessary (and impossible).
+3. **`SE3LieGroupTools` replaced** by `_se3_exp_reference` /
+   `_se3_adjoint_reference`: NumPy Rodrigues + left-Jacobian `V`, written from
+   the closed forms rather than calling `group.Gamma0/Gamma1`, so the k=1
+   agreement test is a real cross-check and not a tautology. Adjoint reference
+   block form under rotation-first ordering is `[[R, 0], [(t)_× R, R]]`.
+4. **`EuclidCoreRandomTools.nextRotationVector`** reproduced as random unit axis
+   × angle ~ U(-π, π) (bounded by the injectivity radius); translational blocks
+   ~ U(-1, 1) per `nextVector3D`.
+
+### Tolerances
+
+Verbatim from Java: `1e-10` on round-trip and both k=1 agreement tests, loosened
+to `1e-9` on the adjoint homomorphism and `1e-8` on the conjugation identity.
+The port is comfortably inside all three — observed worst-case error on the
+conjugation identity is **2e-15** across all `k`, i.e. ~7 orders of margin.
+
+One consideration checked and discarded: whether full-π ξ draws could push the
+conjugated element `X exp(ξ) X⁻¹` outside the injectivity radius and break the
+uniqueness of `log`. They cannot — conjugation is a similarity transform on the
+rotation block, so the conjugated angle equals `‖φ_ξ‖ ≤ π`. Java's
+full-magnitude draws are kept unmodified.
