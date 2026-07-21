@@ -215,3 +215,83 @@ Consequences:
   NEES/NIS at G10 shows the cross terms are overstated.
 - New regression `test_build_Qd_keeps_the_adjoint` fails if anyone "cleans up"
   the conjugation to match Hartley — the §6 trap, now guarded.
+
+---
+
+## G4a — `ContactUpdaterTest` → `tests/inEKF/test_contact_updater.py`
+
+**Status:** green (9 Java tests → 13 pytest functions; 2 are port-specific
+oracles, 1 parametrized over N). G4's other half (`GravityLevelingUpdaterTest`,
+14 tests + a new `gravity_update.py`) is **not** done — see "Remaining" below.
+
+### Source change: sign convention flipped to Java / I5
+
+The port previously used `H_i = [0 0 −I … +I(d_i) …]` with the update
+`X̂⁺ = exp(+Kν)X̂`. Java (and CLAUDE.md **I5**) use the opposite:
+`H_i = [0 0 +I … −I(d_i) …]` with `X̂⁺ = exp(−(Kν)^∧)X̂`.
+
+**The two are mathematically identical** — flipping `H` flips `K = P Hᵀ S⁻¹`, so
+`KH` (hence the Joseph form) is unchanged and `exp(+K_old ν) = exp(−K_new ν)`
+gives the same posterior. Confirmed empirically: after the flip every behavioral
+test (residual reduction, covariance shrink, PSD, Joseph-vs-short form) passed
+untouched; only the three tests that *assert the convention itself* needed
+updating.
+
+Flipped anyway, because:
+- `ContactUpdaterTest.testJacobianStructureAndStateIndependence` asserts `H`'s
+  signs **element-wise at tol 0.0** — tests outrank implementation (precedence
+  rule), and this one is explicit.
+- It makes I5 read literally rather than as an equivalent-but-mirrored
+  convention, which matters for the §6 update-sign trap: with Java's `H` the
+  residual linearises as `ν ≈ +Hξ`, so `ξ⁺ = Kν` estimates the error *itself*
+  and must be subtracted.
+
+Changed: `state.build_H` (p block +I, contact block −I), `correct.apply_correction`
+(now `exp(−ξ)`), and the three convention tests
+(`test_H_shape_and_pattern`, `test_innovation_linearises_to_plus_H` — renamed
+from `_minus_H`, `test_apply_correction_left_multiply`).
+
+### Source addition: ContactUpdater seams
+
+`correct.py` had only the vectorised all-contacts hot path. Added the
+single-contact seams the Java class exposes and the ported test drives directly
+(I10 — the seam list is the required public surface):
+`contact_jacobian(N, i)`, `contact_residual(state, i, y)`,
+`rotate_measurement_covariance(state, body_cov)`, `map_encoder_noise(J, Σ)`,
+and `contact_update(state, i, y, body_cov, learned=False)`.
+
+Note `contact_jacobian` takes the contact **index**, not a state — state
+independence is structural, not merely asserted.
+
+### Deliberate deviations
+
+1. **`testUpdateWithoutContactUpdaterThrows` adapted.** Java throws
+   `IllegalStateException` when `InvariantUpdater` has no `ContactUpdater`
+   installed. The port has no installable collaborator — `contact_update` is a
+   free function, so the state is unreachable. Ported the analogous failure:
+   an out-of-range contact index raises `IndexError`, consistent with the
+   `InvariantStateTest` bounds contract.
+2. **`NotImplementedException` → `NotImplementedError`** on the `learned=True`
+   branch (§7 ContactNet socket), per the map's port note.
+3. Java's `Random`/`EuclidCoreRandomTools` draws are not reproduced; every
+   oracle (FK, residual, covariance rotation, `JΣJᵀ`) is recomputed from the
+   same draw, so the assertions are tolerance-based as the map prescribes.
+
+### Port-specific oracles added
+
+- `test_single_contact_jacobians_stack_into_the_precomputed_H` — row-stacking the
+  per-contact `H_i` must equal `state.build_H(N)` exactly. This is CLAUDE.md G4's
+  "programmatic-H-from-b ≡ Table I closed form" check for the contact case, and
+  it ties the seam to the vectorised hot path so a sign or block-offset drift in
+  either is caught.
+- `test_contact_update_matches_vectorised_correct_at_one_contact` — the two entry
+  points must produce the same posterior at N = 1 (to 1e-12).
+
+### Remaining for G4
+
+`GravityLevelingUpdaterTest` (14 tests) and the `gravity_update.py` module it
+tests. Note several of its tests (`testGravityUpdateLevelsTiltAndPreservesYaw`,
+`testRollStillLevelsUnderAnisotropy`, `testPitchCorrectionAuthorityBelowRoll`)
+drive the EKF orchestrator API (`assembleGravityLeveling` / `applyGravityLeveling`
+/ `wasLastUpdateApplied` / `getLastConditionProxy`), which is G5's `ekf.py` — so
+that half needs at least a minimal orchestrator seam alongside the new module.

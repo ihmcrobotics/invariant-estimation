@@ -93,13 +93,14 @@ def test_innovation_zero_when_measurement_matches(N):
 
 
 @pytest.mark.parametrize("N", NS_POS)
-def test_innovation_linearises_to_minus_H(N):
-    r"""\nu(exp(ξ) X_true, y_true) ≈ −H ξ — fixes the sign vs the precomputed H.
+def test_innovation_linearises_to_plus_H(N):
+    r"""\nu(exp(ξ) X_true, y_true) ≈ +H ξ — fixes the sign vs the precomputed H.
 
     With the measurement taken from the *true* state, perturbing the mean by a
     small right-invariant error ξ makes the (measurement − model) innovation
-    reproduce ``−H ξ`` to first order; the ``+K \nu`` update then drives the error
-    to ``(I−KH) ξ`` (§4.1, §4.3).  This is the definitive sign check.
+    reproduce ``+H ξ`` to first order under the Java/I5 sign convention; ``ξ⁺ = Kν``
+    is then an estimate of ξ itself, removed by ``exp(−ξ⁺)``, driving the error to
+    ``(I−KH) ξ``.  This is the definitive sign check.
     """
     p = _params(N)
     true = _seed_state(N, key=3)
@@ -112,7 +113,7 @@ def test_innovation_linearises_to_minus_H(N):
         R=Xbar[0:3, 0:3], v=Xbar[0:3, 3], p=Xbar[0:3, 4], d=Xbar[0:3, 5:].T,
     )
     nu = co.innovation(pert, y)
-    assert jnp.allclose(nu, -p.H @ xi, atol=1e-9)
+    assert jnp.allclose(nu, p.H @ xi, atol=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -177,11 +178,11 @@ def test_joseph_matches_standard_form(N):
 
 @pytest.mark.parametrize("N", NS_POS)
 def test_apply_correction_left_multiply(N):
-    """X̄⁺ = exp(ξ⁺) X̄ — exp multiplies on the LEFT (invariant 9)."""
+    """X̂⁺ = exp(−ξ⁺) X̂ — exp multiplies on the LEFT, with the I5 sign."""
     st = _seed_state(N)
     xi = jax.random.normal(jax.random.PRNGKey(5), (3 * N + 9,)) * 0.05
     out = co.apply_correction(st, xi)
-    Xexp = g.exp_SEn3(xi, N) @ st.as_matrix
+    Xexp = g.exp_SEn3(-xi, N) @ st.as_matrix
     assert jnp.allclose(out.as_matrix, Xexp, atol=1e-10)
     assert jnp.allclose(out.R @ out.R.T, jnp.eye(3), atol=1e-10)   # stays SO(3)
     assert jnp.array_equal(out.P, st.P)                            # P untouched here

@@ -17,15 +17,14 @@ With ``b`` the homogeneous selector ``[0_3 ; 0 ; 1 ; −1]`` (the ``+1`` in the
 prediction ``h_pred_i = R̄ᵀ(d̄_i − p̄)``, the right-invariant innovation mapped
 into the world frame is (§4.3)
 
-    \nu_i = Π(X̄ Y_i) = R̄ y_i + p̄ − d̄_i = R̄ (y_i − h_pred_i)   (measurement − model).
+    \nu_i = Π(X̄ Y_i) = R̄ y_i − (d̄_i − p̄) = R̄ (y_i − h_pred_i)  (measurement − model).
 
-**Sign convention.**  The precomputed ``H`` (`state.build_H`) is
-``H_i = [0  0  −I  …  +I(col d_i)  …]`` ⟹ ``H_i ξ = −ξ_p + ξ_{d_i}``.  The
-innovation linearises to the *opposite*: ``\nu_i ≈ ξ_p − ξ_{d_i} = −H_i ξ``.  That
-is the standard "measurement − prediction" convention, so the update is the
-ordinary ``ξ⁺ = +K \nu`` with ``K = P Hᵀ S⁻¹``: then ``ξ_err⁺ = (I − KH) ξ_err``
-(error reduces) and the Joseph form is exact.  The module test that checks the
-update *reduces* the innovation pins this independent of the derivation.
+**Sign convention (CLAUDE.md I5).**  The precomputed ``H`` (`state.build_H`) is
+``H_i = [0  0  +I  …  −I(col d_i)  …]`` ⟹ ``H_i ξ = ξ_p − ξ_{d_i}``, matching the
+Java `ContactUpdater.computeJacobian` element-for-element.  The innovation
+linearises the *same* way, ``\nu_i ≈ ξ_p − ξ_{d_i} = +H_i ξ``, so ``ξ⁺ = K \nu``
+estimates the error and is removed by ``X̂⁺ = exp(−(Kν)^∧) X̂``.  Then
+``ξ_err⁺ = (I − KH) ξ_err`` (error reduces) and the Joseph form is exact.
 
 Measurement noise (§4.2)
 ------------------------
@@ -49,7 +48,7 @@ Gain + update (§4.3)
     K  = P Hᵀ S⁻¹                         (via cho_solve — never `inv`)
     ξ⁺ = K \nu
     P⁺ = (I − K H) P (I − K H)ᵀ + K N Kᵀ  (Joseph form — mandatory)
-    X̄⁺ = exp(ξ⁺) X̄                        (right-invariant: exp on the LEFT)
+    X̂⁺ = exp(−ξ⁺) X̂                       (right-invariant: exp on the LEFT, I5)
 
 Everything is ``jax.jit``-able and differentiable (§8): per-contact work is
 vectorised (no Python loop over contacts), ``S⁻¹`` is a Cholesky solve, and the
@@ -61,7 +60,12 @@ import jax.numpy as jnp
 from jax.scipy.linalg import cho_factor, cho_solve
 
 from .group import exp_SEn3
-from .state import InEKFState, InEKFParams
+from .state import (
+    InEKFParams,
+    InEKFState,
+    _check_contact_index,
+    contact_tangent_index,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +95,8 @@ def innovation(state: InEKFState, y: Array) -> Array:
     r"""Right-invariant innovation stacked over contacts (§4.1), shape ``(3N,)``.
 
     ``\nu_i = Π(X̄ Y_i) = R̄ y_i − (d̄_i − p̄)`` (measurement − model, world frame);
-    it linearises to ``ξ_p − ξ_{d_i} = −H_i ξ``, so the update is ``ξ⁺ = +K \nu``.
+    it linearises to ``ξ_p − ξ_{d_i} = +H_i ξ``, so ``ξ⁺ = K \nu`` is the error
+    estimate and is applied as ``exp(−ξ⁺)`` (I5).
 
     Parameters
     ----------
@@ -197,18 +202,24 @@ def joseph_update(P: Array, K: Array, H: Array, N: Array) -> Array:
 
 
 def apply_correction(state: InEKFState, xi: Array) -> InEKFState:
-    r"""Apply the tangent correction ``X̄⁺ = exp(ξ⁺) X̄`` (left multiply, §4.3).
+    r"""Apply the tangent correction ``X̂⁺ = exp(−ξ⁺) X̂`` (left multiply, I5).
 
-    Right-invariant ⟹ ``exp`` multiplies on the **left** of ``X̄`` (invariant 9),
-    so base *and* every contact move consistently — the off-diagonal covariance
-    coupling is what lets a foot measurement sharpen the base and vice versa.
+    Right-invariant ⟹ ``exp`` multiplies on the **left** of ``X̂``, so base *and*
+    every contact move consistently — the off-diagonal covariance coupling is
+    what lets a foot measurement sharpen the base and vice versa.
+
+    **Sign** — with the Java/I5 ``H`` (`state.build_H`) the residual linearises
+    to ``ν ≈ +H ξ``, so ``ξ⁺ = Kν`` is an estimate *of the error itself* and must
+    be subtracted: hence ``exp(−ξ⁺)``, CLAUDE.md I5 verbatim. Getting this
+    backwards passes the easy tests and diverges under transients (§6).
 
     Parameters
     ----------
     state : InEKFState
         Predicted state (covariance left untouched here; updated separately).
     xi : Array, shape (3N+9,)
-        Correction ``ξ⁺ = K \nu`` in the fixed ``[ξ_R ; ξ_v ; ξ_p ; ξ_{d_i}]`` order.
+        Correction ``ξ⁺ = K \nu`` in the fixed ``[ξ_R ; ξ_v ; ξ_p ; ξ_{d_i}]``
+        order.  Applied as ``exp(−ξ⁺)``.
 
     Returns
     -------
@@ -216,7 +227,7 @@ def apply_correction(state: InEKFState, xi: Array) -> InEKFState:
         State with corrected ``(R, v, p, d)``; ``P`` unchanged.
     """
     N = state.N
-    Xi = exp_SEn3(xi, N)                          # (N+5, N+5)
+    Xi = exp_SEn3(-xi, N)                         # (N+5, N+5) — I5 sign
     Xnew = Xi @ state.as_matrix
     return state._replace(
         R=Xnew[0:3, 0:3],
@@ -224,6 +235,130 @@ def apply_correction(state: InEKFState, xi: Array) -> InEKFState:
         p=Xnew[0:3, 4],
         d=Xnew[0:3, 5:].T,
     )
+
+
+# ---------------------------------------------------------------------------
+# ContactUpdater seams (Java `ContactUpdater`, ported suite)
+#
+# The per-contact views of the machinery above.  `correct` is the vectorised
+# hot path over all N contacts; these are the single-contact entry points the
+# Java class exposes and the ported `ContactUpdaterTest` exercises directly
+# (CLAUDE.md I10 — the test seams ARE the public surface).
+# ---------------------------------------------------------------------------
+
+def contact_jacobian(N: int, contact_index: int) -> Array:
+    r"""Single-contact observation Jacobian ``H_i``, shape ``(3, 3N+9)``.
+
+    ``H_i = [ 0_{3x6} | +I_3 | … −I_3 (own d_i block) … ]`` — Java
+    `ContactUpdater.computeJacobian`.  **State-independent by construction**:
+    the argument is the contact *index*, not the state, which is exactly the
+    property `testJacobianStructureAndStateIndependence` asserts (it calls the
+    Java form with two different random states and demands bit-equality).
+
+    Parameters
+    ----------
+    N : int
+        Number of contact candidates (static).
+    contact_index : int
+        Which contact; `IndexError` if out of range.
+
+    Returns
+    -------
+    Array, shape (3, 3N+9)
+    """
+    _check_contact_index(contact_index, N)
+    H = jnp.zeros((3, 3 * N + 9))
+    H = H.at[:, 6:9].set(jnp.eye(3))
+    j = contact_tangent_index(contact_index)
+    return H.at[:, j:j + 3].set(-jnp.eye(3))
+
+
+def contact_residual(state: InEKFState, contact_index: int, y: Array) -> Array:
+    r"""Single-contact world residual ``r = R̂ y − (d̂_i − p̂)``, shape ``(3,)``.
+
+    Java `ContactUpdater.computeResidual`.  The per-contact slice of
+    `innovation`; ``y`` is the measured body-frame FK vector.
+    """
+    _check_contact_index(contact_index, state.N)
+    return state.R @ y - (state.d[contact_index] - state.p)
+
+
+def rotate_measurement_covariance(state: InEKFState, body_cov: Array) -> Array:
+    r"""Rotate a body-frame measurement covariance to world: ``R̂ N R̂ᵀ``.
+
+    Java `ContactUpdater.computeMeasurementCovariance`.  The residual lives in
+    the world frame (`contact_residual`), so the body-frame FK noise must be
+    conjugated by the estimated attitude before it enters ``S``.
+    """
+    return state.R @ body_cov @ state.R.T
+
+
+def map_encoder_noise(contact_jac: Array, joint_cov: Array) -> Array:
+    r"""Encoder noise through the kinematics: ``N = J Σ_q Jᵀ`` (§4.2).
+
+    Java `ContactUpdater.mapEncoderNoise` (static).  ``J`` is the contact-point
+    position Jacobian at ``q̂`` and ``Σ_q`` the filtered joint covariance from the
+    joint KF; the result is the **body-frame** FK covariance, which
+    `rotate_measurement_covariance` then takes to world.
+
+    Parameters
+    ----------
+    contact_jac : Array, shape (3, n_joints)
+    joint_cov : Array, shape (n_joints, n_joints)
+
+    Returns
+    -------
+    Array, shape (3, 3)
+    """
+    return contact_jac @ joint_cov @ contact_jac.T
+
+
+def contact_update(
+    state: InEKFState,
+    contact_index: int,
+    measurement: Array,
+    body_covariance: Array,
+    learned: bool = False,
+) -> tuple[InEKFState, Array]:
+    r"""One single-contact FK update — Java `InvariantUpdater.update(...)`.
+
+    Composes the seams above: residual → rotate noise to world → gain → Joseph →
+    ``exp(−ξ)`` (I5).  Returns the corrected state and the residual actually used.
+
+    Parameters
+    ----------
+    state : InEKFState
+    contact_index : int
+        Which contact; `IndexError` if out of range.
+    measurement : Array, shape (3,)
+        Measured body-frame FK vector ``y_i = h_{p,i}(q̂)``.
+    body_covariance : Array, shape (3, 3)
+        Body-frame measurement covariance (e.g. from `map_encoder_noise`).
+    learned : bool
+        The learned-measurement branch.  Raises `NotImplementedError` while
+        ContactNet is unlanded — the Java contract raises
+        `NotImplementedException` and the ported test asserts it (§7).
+
+    Returns
+    -------
+    state : InEKFState
+    residual : Array, shape (3,)
+    """
+    if learned:
+        raise NotImplementedError(
+            "learned contact measurement module is not implemented; "
+            "see CLAUDE.md §7 (ContactNet socket)"
+        )
+    _check_contact_index(contact_index, state.N)
+
+    H = contact_jacobian(state.N, contact_index)
+    residual = contact_residual(state, contact_index, measurement)
+    Nmat = rotate_measurement_covariance(state, body_covariance)
+
+    K, _ = kalman_gain(state.P, H, Nmat)
+    corrected = apply_correction(state, K @ residual)
+    P_new = joseph_update(state.P, K, H, Nmat)
+    return corrected._replace(P=P_new), residual
 
 
 # ---------------------------------------------------------------------------

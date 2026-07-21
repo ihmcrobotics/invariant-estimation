@@ -233,13 +233,19 @@ def build_H(N: int) -> Array:
     r"""Constant FK observation matrix ``H`` (§4.1), shape ``(3N, 3N+9)``.
 
     Each contact's right-invariant FK observation has Jacobian
-    ``H_i = [ 0  0  −I  …  +I(col d_i)  … ]`` — ``−I`` in the ``p`` block and
-    ``+I`` in its own ``d_i`` block.  Stacked over contacts this is
+    ``H_i = [ 0  0  +I  …  −I(col d_i)  … ]`` — ``+I`` in the ``p`` block and
+    ``−I`` in its own ``d_i`` block.  Stacked over contacts this is
 
-        H = [ 0_{3N×3} | 0_{3N×3} | (−I_3 ×N) | I_{3N} ]
+        H = [ 0_{3N×3} | 0_{3N×3} | (+I_3 ×N) | −I_{3N} ]
 
-    i.e. the ``d`` columns form a plain identity (contact ``i`` selects ``d_i``).
-    State-independent by construction (world-centric + right-invariant, §0).
+    State-independent by construction (world-centric + right-invariant).
+
+    **Sign convention** — this is the Java `ContactUpdater.computeJacobian`
+    layout, locked element-wise (tol 0.0) by the ported
+    `ContactUpdaterTest.testJacobianStructureAndStateIndependence`, and it is
+    what makes CLAUDE.md I5 read literally: the residual linearises as
+    ``ν ≈ +H ξ``, so the correction ``ξ⁺ = Kν`` *estimates* the error and is
+    removed by ``X̂⁺ = exp(−(Kν)^∧) X̂``.
 
     Parameters
     ----------
@@ -251,8 +257,8 @@ def build_H(N: int) -> Array:
     Array, shape (3N, 3N+9)
     """
     H = jnp.zeros((3 * N, 3 * N + 9))
-    H = H.at[:, 6:9].set(jnp.tile(-jnp.eye(3), (N, 1)))   # p block: −I per contact
-    H = H.at[:, 9:9 + 3 * N].set(jnp.eye(3 * N))          # d block: identity
+    H = H.at[:, 6:9].set(jnp.tile(jnp.eye(3), (N, 1)))    # p block: +I per contact
+    H = H.at[:, 9:9 + 3 * N].set(-jnp.eye(3 * N))         # d block: −I
     return H
 
 

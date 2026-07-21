@@ -176,11 +176,11 @@ def test_H_shape_and_pattern(N):
     assert jnp.allclose(H[:, 0:6], 0.0)
     for i in range(N):
         rows = slice(3 * i, 3 * i + 3)
-        assert jnp.allclose(H[rows, 6:9], -jnp.eye(3))                 # −I in p
-        # +I in this contact's own d_i block, zero in the others.
+        assert jnp.allclose(H[rows, 6:9], jnp.eye(3))                  # +I in p
+        # −I in this contact's own d_i block, zero in the others (I5 / Java).
         for j in range(N):
             cols = slice(9 + 3 * j, 9 + 3 * j + 3)
-            expected = jnp.eye(3) if i == j else jnp.zeros((3, 3))
+            expected = -jnp.eye(3) if i == j else jnp.zeros((3, 3))
             assert jnp.allclose(H[rows, cols], expected)
 
 

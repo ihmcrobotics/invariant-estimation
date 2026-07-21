@@ -17,12 +17,17 @@ from .contact import (
 )
 from .correct import (
     apply_correction,
+    contact_jacobian,
+    contact_residual,
+    contact_update,
     correct,
     innovation,
     joseph_update,
     kalman_gain,
+    map_encoder_noise,
     measurement_noise,
     predicted_contact,
+    rotate_measurement_covariance,
 )
 from .group import (
     Adjoint,
@@ -90,6 +95,12 @@ __all__ = [
     "kalman_gain",
     "joseph_update",
     "apply_correction",
+    # ContactUpdater seams (ported suite)
+    "contact_jacobian",
+    "contact_residual",
+    "contact_update",
+    "rotate_measurement_covariance",
+    "map_encoder_noise",
     # contact-covariance digest (§5)
     "digest",
     "reconstruct_cov",
