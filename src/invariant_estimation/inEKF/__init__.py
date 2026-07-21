@@ -36,7 +36,7 @@ from .group import (
 )
 from .propagate import (
     build_Qd,
-    inertial_Qd,
+    continuous_Qc,
     propagate,
     propagate_cov,
     propagate_mean,
@@ -81,7 +81,7 @@ __all__ = [
     "propagate_mean",
     "propagate_cov",
     "build_Qd",
-    "inertial_Qd",
+    "continuous_Qc",
     # correction (§4)
     "correct",
     "innovation",

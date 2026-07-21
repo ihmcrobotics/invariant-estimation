@@ -137,15 +137,13 @@ Java `InvariantPropagator(N, gyroNoise, accelNoise, contactNoise)` +
 params)`. The constructor scalars are folded into `InEKFParams` and the
 per-contact `sigma_c` stack by the `_propagator` shim in the test file.
 
-**Undetermined by the tests:** whether Java's `gyroNoise`/`accelNoise` scalars
-are standard deviations or variances. The port reads them as densities (std),
-matching `InEKFParams.sigma_gyro`; the contact scalar becomes
-`contact_noise² · I₃`. Nothing in this class discriminates the two readings
-(every covariance check is symmetry / positive-trace / zero-stays-zero), so this
-is a **guess to revisit** when `config/alex_inekf.yaml` is filled from
-`AlexSensorNoiseParameters`. CLAUDE.md §2b lists the InEKF values as
-"variances 1e-4 / 1e-3 / 1e-6", which if taken literally contradicts the std
-reading.
+**Resolved (2026-07-21, Lucas):** all noise parameters in the port are
+**variances**, matching CLAUDE.md §2b ("variances 1e-4 / 1e-3 / 1e-6"). Only one
+upstream source is quoted in standard deviations; those get converted at the
+build boundary rather than propagated through the filter. `InEKFParams.sigma_gyro`
+/`sigma_accel` were accordingly renamed to **`gyro_var`/`accel_var`** and are now
+consumed directly (`Q_g = gyro_var · I₃`, no squaring). The Java constructor
+scalars map straight through.
 
 ### Deliberate deviations
 
@@ -182,18 +180,38 @@ Added `test_mean_integration_exact_under_simultaneous_rotation_and_acceleration`
 Rodrigues formula — independent of `Γ_1`/`Γ_2` by construction. Discrimination
 is ~10 orders: exact integrator 1e-14, Euler mutant 2e-4.
 
-### Open — `Q_d` form is contradicted between the two design docs
+### Resolved — `Q_d` is now I3 / paper Eq. 38, verbatim
 
-`propagate.py` currently implements the **exact closed-form integral**
-`Q̄_d = ∫₀^dt e^{A s} Q̄_c e^{Aᵀ s} ds` (polynomial in dt, no `Ad`), per
-`src/invariant_estimation/inEKF/CLAUDE.md` §3.3, which argues explicitly against
-the `·dt` form. The top-level CLAUDE.md **I3** instead specifies paper Eq. 38,
-`Q_d = Φ Ad_X̂ Q_c Ad_X̂ᵀ Φᵀ Δt`, and §6 names dropping the `Ad` as a trap.
+The old `src/invariant_estimation/inEKF/CLAUDE.md` specified an exact
+closed-form integral `∫₀^dt e^{As} Q_c e^{Aᵀs} ds` with **no** `Ad`
+conjugation, and argued the conjugation was trivial for isotropic `Q_g, Q_a`.
+That argument is wrong: it holds for the rotation block (`R̂ σ²I R̂ᵀ = σ²I`), but
+`Ad_X̂` also carries `(v)_× R̂` and `(p)_× R̂` in its first block-column, so
+`Ad Q_c Adᵀ` generates genuine cross terms regardless of isotropy.
 
-**These are different filters**, and `InvariantPropagatorTest` does not
-adjudicate: every covariance assertion in it (symmetry, positive trace,
-zero-noise-stays-zero) holds under both. Per the precedence rule
-(tests > paper > Java source) the tests are silent, so the paper decides — which
-points at I3. Left unchanged pending Lucas's call; see the session summary for
-the technical argument. Whichever wins, `inEKF/CLAUDE.md` §3.3 and §10 need
-amending, since it records the opposite decision as "resolved".
+`InvariantPropagatorTest` does not adjudicate — every covariance assertion in it
+(symmetry, positive trace, zero-noise-stays-zero) holds under both forms, and the
+ported class stayed green across the switch.
+
+**Decision (2026-07-21, Lucas):** implement I3 literally,
+`Q_d = Φ Ad_X̂ Q_c Ad_X̂ᵀ Φᵀ Δt`, including the first-order `·Δt` discretisation —
+the working Java estimator does not use the Van Loan / exact integral, so neither
+does the port. The old design doc was deleted rather than amended.
+
+Consequences:
+
+- `inertial_Qd` (the closed-form integral) is **gone**, replaced by
+  `continuous_Qc(sigma_c, params)` building the block-diagonal continuous density
+  `blkdiag(gyro_var·I, accel_var·I, 0, Σ_{C_i})`.
+- `build_Qd(sigma_c, Ad, params)` and `propagate_cov(P, sigma_c, Ad, params)` now
+  take the adjoint. `propagate` evaluates it at the **prior** estimate, matching
+  the Java predict ordering (the difference is O(dt)).
+- **Frame change in the digest:** `Ad_X̂`'s contact diagonal blocks are `R̂`, so the
+  conjugation performs the rotation to world itself. `contact.digest` therefore
+  no longer calls `rotate_to_world` and returns **body-frame** `Σ_{C_i}`;
+  digesting to world as well would apply `R̂` twice. `rotate_to_world` is kept as
+  a standalone utility, explicitly out of the propagation path.
+- `TODO(van-loan)` left at the `build_Qd` docstring: revisit the exact integral if
+  NEES/NIS at G10 shows the cross terms are overstated.
+- New regression `test_build_Qd_keeps_the_adjoint` fails if anyone "cleans up"
+  the conjugation to match Hartley — the §6 trap, now guarded.

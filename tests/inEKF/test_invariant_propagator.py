@@ -47,17 +47,16 @@ G_VEC = jnp.array([0.0, 0.0, GRAVITY])
 def _propagator(N, gyro_noise, accel_noise, contact_noise, dt):
     """`InvariantPropagator(N, gyroNoise, accelNoise, contactNoise)` + `dt`.
 
-    Returns ``(params, sigma_c)``. The Java scalars are read as noise *densities*
-    (std-like), matching `InEKFParams.sigma_gyro` / `sigma_accel`; the contact
-    scalar becomes an isotropic per-contact density ``contact_noise² · I₃``.
-    Nothing in this test class discriminates the std-vs-variance reading — see
-    PORT_NOTES.md.
+    Returns ``(params, sigma_c)``. Per the repo-wide convention the Java scalars
+    are read as **variances**, mapping straight onto `InEKFParams.gyro_var` /
+    `accel_var`; the contact scalar becomes an isotropic per-contact variance
+    density ``contact_noise · I₃``.
     """
     params = s.default_params(
         N, dt=dt, g=G_VEC,
-        sigma_gyro=gyro_noise, sigma_accel=accel_noise, contact_floor=0.0,
+        gyro_var=gyro_noise, accel_var=accel_noise, contact_floor=0.0,
     )
-    sigma_c = jnp.tile(contact_noise**2 * jnp.eye(3), (N, 1, 1))
+    sigma_c = jnp.tile(contact_noise * jnp.eye(3), (N, 1, 1))
     return params, sigma_c
 
 

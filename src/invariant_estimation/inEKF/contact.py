@@ -4,8 +4,8 @@ inEKF/contact.py
 Contact-covariance **digest** for the world-centric, right-invariant InEKF
 (CLAUDE.md §5).  This module is a pure *consumer*: it takes the lower-triangular
 Cholesky factors ``L_{C_i}`` emitted by the external ContactNet module and turns
-them into the world-frame contact noise densities ``R̄ Σ_{C_i} R̄ᵀ`` that
-`propagate.build_Qd` injects into the ``Q̄_d`` contact blocks (§3.3).
+them into the per-contact covariances ``Σ_{C_i}`` that `propagate.build_Qd`
+injects into the contact blocks of the continuous density ``Q_c``.
 
 > **It contains no learned components and does not compute ``Σ_{C_i}``.**
 > ContactNet (the MLP, its features, weights and the SPD-safe parameterisation
@@ -13,13 +13,19 @@ them into the world-frame contact noise densities ``R̄ Σ_{C_i} R̄ᵀ`` that
 > module, out of scope here (invariant 4).  This file imports nothing from it; it
 > only consumes its output — the lower-triangular Cholesky argument, nothing more.
 
-The digest is three pure, branch-free, vectorised-over-contacts steps:
+The digest is two pure, branch-free, vectorised-over-contacts steps:
 
     1. reconstruct   Σ_{C_i} = L_{C_i} L_{C_i}ᵀ          (`reconstruct_cov`)
     2. noise floor   Σ_{C_i} ← Σ_{C_i} + floor · I       (`apply_floor`)
-    3. rotate        Σ^W_{C_i} = R̄ Σ_{C_i} R̄ᵀ            (`rotate_to_world`)
 
-`digest` composes the three and is the single entry point the filter calls.
+`digest` composes the two and is the single entry point the filter calls.  The
+output stays in the **body / contact frame**: under CLAUDE.md I3 the process
+noise is ``Q_d = Φ Ad_X̂ Q_c Ad_X̂ᵀ Φᵀ Δt``, and the diagonal contact blocks of
+``Ad_X̂`` are ``R̂`` — so the adjoint conjugation already performs the rotation to
+world (and adds the ``(d_i)_× R̂`` cross terms with rotation, which a bare
+rotate-to-world cannot).  Rotating here as well would apply ``R̂`` twice.
+`rotate_to_world` is kept as a standalone utility but is deliberately **not**
+part of the propagation path.
 
 Contact condition is expressed *only* through the magnitude / anisotropy of
 ``Σ_{C_i}`` — small (firm) / anisotropic (slip) / large (no contact).  There is
@@ -110,29 +116,32 @@ def rotate_to_world(Sigma: Array, R: Array) -> Array:
 # Full digest (§5) — the single entry point the filter calls
 # ---------------------------------------------------------------------------
 
-def digest(L: Array, R: Array, params: InEKFParams) -> Array:
-    r"""Digest ContactNet Cholesky factors into world-frame noise densities (§5).
+def digest(L: Array, params: InEKFParams) -> Array:
+    r"""Digest ContactNet Cholesky factors into per-contact covariances (§5).
 
-    Composes reconstruct → floor → rotate.  The output ``sigma_c`` (shape
-    ``(N, 3, 3)``) is exactly what `propagate.propagate` / `propagate.build_Qd`
-    consume for the ``Q̄_d`` contact blocks (``Σ^W_{C_i} dt``).
+    Composes reconstruct → floor.  The output ``sigma_c`` (shape ``(N, 3, 3)``)
+    is exactly what `propagate.propagate` / `propagate.build_Qd` consume for the
+    contact blocks of ``Q_c``.
+
+    Frame: **body / contact**, not world.  ``Ad_X̂`` in `build_Qd` does the
+    rotation (see the module docstring) — digesting to world here would double-
+    rotate.
 
     Parameters
     ----------
     L : Array, shape (N, 3, 3)
         Per-contact lower-triangular Cholesky factors ``L_{C_i}`` from ContactNet.
-    R : Array, shape (3, 3)
-        Base orientation ``R̄`` (current state mean).
     params : InEKFParams
         Carries the variance floor (`InEKFParams.contact_floor`).
 
     Returns
     -------
     Array, shape (N, 3, 3)
-        World-frame per-contact noise densities ``R̄ Σ_{C_i} R̄ᵀ``.
+        Per-contact body-frame covariances ``Σ_{C_i}``.
     """
     Sigma = reconstruct_cov(L)
     Sigma = apply_floor(Sigma, params.contact_floor)
+
 
     # TODO(re-anchor): see §5.  On a candidate's transition to firm contact, snap
     # its mean d̄_i ← p̄ + R̄ h_{p,i}(q̂) and reset its covariance block via the
@@ -140,4 +149,4 @@ def digest(L: Array, R: Array, params: InEKFParams) -> Array:
     # *soft* contact indicator through jnp.where (branch-free).  Deferred for v1;
     # this is the call site — it consumes the same per-contact Σ digested above.
 
-    return rotate_to_world(Sigma, R)
+    return Sigma

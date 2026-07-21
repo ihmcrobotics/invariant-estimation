@@ -37,7 +37,7 @@ NS_POS = [1, 2, 4]
 def _params(N, dt=2e-3, grav=None):
     grav = jnp.array([0.1, -0.2, -9.7]) if grav is None else grav
     return s.InEKFParams(
-        g=grav, dt=dt, sigma_gyro=3e-3, sigma_accel=2e-2, contact_floor=1e-4,
+        g=grav, dt=dt, gyro_var=9e-6, accel_var=4e-4, contact_floor=1e-4,
         Phi=s.build_Phi(grav, dt, N), H=s.build_H(N),
     )
 

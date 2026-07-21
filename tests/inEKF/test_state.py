@@ -191,13 +191,13 @@ def test_H_shape_and_pattern(N):
 @pytest.mark.parametrize("N", NS)
 def test_default_params(N):
     p = s.default_params(N, dt=2e-3)
-    expected = {"g", "dt", "sigma_gyro", "sigma_accel", "contact_floor", "Phi", "H"}
+    expected = {"g", "dt", "gyro_var", "accel_var", "contact_floor", "Phi", "H"}
     assert set(p._fields) == expected
     assert p.dt == 2e-3
     assert p.Phi.shape == (3 * N + 9, 3 * N + 9)
     assert p.H.shape == (3 * N, 3 * N + 9)
     assert jnp.allclose(p.g, jnp.array([0.0, 0.0, -9.81]))
-    for v in (p.sigma_gyro, p.sigma_accel, p.contact_floor):
+    for v in (p.gyro_var, p.accel_var, p.contact_floor):
         assert v > 0.0
 
 

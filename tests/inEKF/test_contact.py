@@ -35,7 +35,7 @@ NS_POS = [1, 2, 4]
 def _params(N, floor=1e-4):
     grav = jnp.array([0.1, -0.2, -9.7])
     return s.InEKFParams(
-        g=grav, dt=2e-3, sigma_gyro=3e-3, sigma_accel=2e-2, contact_floor=floor,
+        g=grav, dt=2e-3, gyro_var=9e-6, accel_var=4e-4, contact_floor=floor,
         Phi=s.build_Phi(grav, 2e-3, N), H=s.build_H(N),
     )
 
@@ -149,38 +149,43 @@ def test_digest_composition(N):
     p = _params(N)
     L = _L(N)
     R = _R()
-    out = co.digest(L, R, p)
+    out = co.digest(L, p)
     assert out.shape == (N, 3, 3)
-    manual = co.rotate_to_world(
-        co.apply_floor(co.reconstruct_cov(L), p.contact_floor), R
-    )
+    manual = co.apply_floor(co.reconstruct_cov(L), p.contact_floor)
     assert jnp.allclose(out, manual, atol=1e-14)
+    # Body frame: the digest must NOT pre-rotate — Ad_X̂ in build_Qd does that.
+    if N:
+        assert not jnp.allclose(out, co.rotate_to_world(manual, R), atol=1e-9)
 
 
 @pytest.mark.parametrize("N", NS_POS)
 def test_digest_symmetric_psd_floored(N):
     p = _params(N, floor=1e-3)
-    out = co.digest(_L(N), _R(), p)
+    out = co.digest(_L(N), p)
     assert jnp.allclose(out, jnp.swapaxes(out, -1, -2), atol=1e-12)
     assert jnp.all(jnp.linalg.eigvalsh(out) >= p.contact_floor - 1e-10)
 
 
 @pytest.mark.parametrize("N", NS)
 def test_digest_feeds_build_Qd(N):
-    """digest output is exactly the sigma_c that build_Qd consumes (§3.3/§5 seam)."""
+    """digest output is exactly the sigma_c that build_Qd consumes (I3 seam)."""
     p = _params(N)
-    sigma_c = co.digest(_L(N), _R(), p)
-    Qd = pr.build_Qd(sigma_c, p)
+    sigma_c = co.digest(_L(N), p)
+    Ad = jnp.eye(3 * N + 9)
+    Qd = pr.build_Qd(sigma_c, Ad, p)
     assert Qd.shape == (3 * N + 9, 3 * N + 9)
+    # At Ad = Φ = I the contact blocks reduce to Σ_{C_i} dt.
+    p_identity = p._replace(Phi=jnp.eye(3 * N + 9))
+    Qd_plain = pr.build_Qd(sigma_c, Ad, p_identity)
     for i in range(N):
         sl = slice(9 + 3 * i, 12 + 3 * i)
-        assert jnp.allclose(Qd[sl, sl], sigma_c[i] * p.dt, atol=1e-14)
+        assert jnp.allclose(Qd_plain[sl, sl], sigma_c[i] * p.dt, atol=1e-14)
     assert jnp.all(jnp.linalg.eigvalsh(Qd) >= -1e-9)
 
 
 def test_digest_no_contacts():
     p = _params(0)
-    out = co.digest(jnp.zeros((0, 3, 3)), _R(), p)
+    out = co.digest(jnp.zeros((0, 3, 3)), p)
     assert out.shape == (0, 3, 3)
 
 
@@ -190,17 +195,16 @@ def test_digest_no_contacts():
 
 def test_digest_jit_matches_eager():
     p = _params(2)
-    L, R = _L(2), _R()
-    assert jnp.allclose(co.digest(L, R, p), jax.jit(co.digest)(L, R, p), atol=1e-12)
+    L = _L(2)
+    assert jnp.allclose(co.digest(L, p), jax.jit(co.digest)(L, p), atol=1e-12)
 
 
 def test_digest_differentiable():
     """BPTT into ContactNet: grad wrt the Cholesky factors must be finite."""
     p = _params(2)
-    R = _R()
 
     def loss(L):
-        return jnp.sum(co.digest(L, R, p) ** 2)
+        return jnp.sum(co.digest(L, p) ** 2)
 
     grad = jax.grad(loss)(_L(2))
     assert jnp.all(jnp.isfinite(grad))
@@ -209,11 +213,10 @@ def test_digest_differentiable():
 def test_digest_grad_finite_at_singular_factor():
     """The additive floor keeps the gradient finite even at a zero factor."""
     p = _params(2, floor=1e-3)
-    R = _R()
 
     def loss(L):
-        # trace of the world-frame density: smooth in L through the floor.
-        return jnp.sum(jnp.trace(co.digest(L, R, p), axis1=-2, axis2=-1))
+        # trace of the digested covariance: smooth in L through the floor.
+        return jnp.sum(jnp.trace(co.digest(L, p), axis1=-2, axis2=-1))
 
     grad = jax.grad(loss)(jnp.zeros((2, 3, 3)))
     assert jnp.all(jnp.isfinite(grad))

@@ -273,12 +273,13 @@ class InEKFParams(NamedTuple):
         Gravity acceleration vector in world [m/s²], e.g. ``[0, 0, -9.81]``.
     dt : float
         Filter timestep [s].
-    sigma_gyro : float
-        Gyro continuous noise density [rad/s/√Hz].  Builds the isotropic gyro
-        block ``Q_g = sigma_gyro² I₃`` of the continuous error density (§3.3).
-    sigma_accel : float
-        Accelerometer continuous noise density [m/s²/√Hz].  Builds
-        ``Q_a = sigma_accel² I₃``.
+    gyro_var : float
+        Gyro continuous noise **variance** density [(rad/s)²/Hz].  Builds the
+        isotropic gyro block ``Q_g = gyro_var · I₃`` of the continuous error
+        density (§3.3).
+    accel_var : float
+        Accelerometer continuous noise **variance** density [(m/s²)²/Hz].
+        Builds ``Q_a = accel_var · I₃``.
     contact_floor : float
         Variance floor [m²] applied to the per-contact covariances before they
         enter the ``Q̄_d`` contact block (the digest/clamp of §5).
@@ -289,8 +290,8 @@ class InEKFParams(NamedTuple):
     """
     g: Array            # (3,) gravity accel [m/s²], world
     dt: float           # [s]
-    sigma_gyro: float   # [rad/s/√Hz]  → Q_g = σ_g² I₃
-    sigma_accel: float  # [m/s²/√Hz]   → Q_a = σ_a² I₃
+    gyro_var: float     # [(rad/s)²/Hz] → Q_g = gyro_var · I₃
+    accel_var: float    # [(m/s²)²/Hz]  → Q_a = accel_var · I₃
     contact_floor: float  # [m²] variance floor on contact covariances
     Phi: Array          # (3N+9, 3N+9) precomputed transition
     H: Array            # (3N, 3N+9) precomputed FK observation
@@ -352,8 +353,8 @@ def default_params(
     N: int,
     dt: float = 1e-3,
     g: Array | None = None,
-    sigma_gyro: float = 1e-3,
-    sigma_accel: float = 1e-2,
+    gyro_var: float = 1e-4,
+    accel_var: float = 1e-3,
     contact_floor: float = 1e-4,
 ) -> InEKFParams:
     """Sensible default `InEKFParams` for an ``N``-contact filter at 1 kHz.
@@ -370,8 +371,9 @@ def default_params(
         Filter timestep [s].  Default matches the IHMC 1 kHz control loop.
     g : Array, shape (3,), optional
         Gravity acceleration vector.  Defaults to ``[0, 0, -9.81]``.
-    sigma_gyro, sigma_accel : float
-        Isotropic IMU noise densities (see `InEKFParams`).
+    gyro_var, accel_var : float
+        Isotropic IMU noise **variance** densities (see `InEKFParams`).
+        Defaults are the test-locked InEKF values of CLAUDE.md §2b.
     contact_floor : float
         Variance floor on the contact covariances [m²].
     """
@@ -379,8 +381,8 @@ def default_params(
     return InEKFParams(
         g=g,
         dt=dt,
-        sigma_gyro=sigma_gyro,
-        sigma_accel=sigma_accel,
+        gyro_var=gyro_var,
+        accel_var=accel_var,
         contact_floor=contact_floor,
         Phi=build_Phi(g, dt, N),
         H=build_H(N),

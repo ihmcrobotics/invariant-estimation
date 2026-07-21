@@ -13,7 +13,6 @@ Three things are pinned here:
 """
 import jax
 import jax.numpy as jnp
-import jax.scipy.linalg as jsl
 import pytest
 
 import importlib
@@ -30,20 +29,12 @@ pr = importlib.import_module("invariant_estimation.inEKF.propagate")
 NS = [0, 1, 2, 4]
 
 
-def _params(N, dt=2e-3, grav=None, sg=3e-3, sa=2e-2):
+def _params(N, dt=2e-3, grav=None, sg=9e-6, sa=4e-4):
     grav = jnp.array([0.1, -0.2, -9.7]) if grav is None else grav
     return s.InEKFParams(
-        g=grav, dt=dt, sigma_gyro=sg, sigma_accel=sa, contact_floor=1e-4,
+        g=grav, dt=dt, gyro_var=sg, accel_var=sa, contact_floor=1e-4,
         Phi=s.build_Phi(grav, dt, N), H=s.build_H(N),
     )
-
-
-def _A_r_inertial(grav):
-    """The 9x9 inertial part of the constant error-dynamics matrix A^r (§3.2)."""
-    A = jnp.zeros((9, 9))
-    A = A.at[3:6, 0:3].set(g.skew(grav))   # (g)_× : R → v
-    A = A.at[6:9, 3:6].set(jnp.eye(3))     # I    : v → p
-    return A
 
 
 def _seed_state(N, key=0):
@@ -119,71 +110,93 @@ def test_mean_contacts_and_cov_frozen(N):
 # Process noise Q̄_d (§3.3)
 # ---------------------------------------------------------------------------
 
-def test_inertial_Qd_matches_integral():
-    """Closed-form inertial Q̄_d == ∫₀^{dt} e^{A s} Q̄_c e^{Aᵀ s} ds (§3.3)."""
-    p = _params(0, dt=5e-3)
-    A = _A_r_inertial(p.g)
-    Qc = jsl.block_diag(
-        p.sigma_gyro ** 2 * jnp.eye(3),
-        p.sigma_accel ** 2 * jnp.eye(3),
-        jnp.zeros((3, 3)),
-    )
-    # Dense Simpson quadrature of the matrix integrand (reference, not used in prod).
-    n = 2000
-    sgrid = jnp.linspace(0.0, p.dt, n + 1)
-
-    def integrand(sv):
-        E = jsl.expm(A * sv)
-        return E @ Qc @ E.T
-
-    vals = jax.vmap(integrand)(sgrid)                 # (n+1, 9, 9)
-    w = jnp.ones(n + 1).at[1:-1:2].set(4.0).at[2:-1:2].set(2.0)
-    ref = (p.dt / n) / 3.0 * jnp.einsum("k,kij->ij", w, vals)
-
-    assert jnp.allclose(pr.inertial_Qd(p), ref, atol=1e-12, rtol=1e-9)
+def _Ad(st):
+    """Adjoint of a state's group element — what build_Qd conjugates by."""
+    return g.Adjoint(st.as_matrix)
 
 
-def test_inertial_Qd_double_integrator_limit():
-    """Drop gyro noise ⇒ textbook double-integrator block (§3.3 sanity check)."""
-    p = _params(0, dt=3e-3, sg=0.0, sa=0.0)
-    p = p._replace(sigma_accel=0.5)
-    dt, q = p.dt, p.sigma_accel ** 2
-    Q = pr.inertial_Qd(p)
-    # gyro off ⇒ R block zero, and v/p reduce to [[q dt³/3, q dt²/2],[·, q dt]].
-    assert jnp.allclose(Q[0:3, 0:3], 0.0)
-    assert jnp.allclose(Q[3:6, 3:6], q * dt * jnp.eye(3))
-    assert jnp.allclose(Q[6:9, 6:9], q * dt ** 3 / 3.0 * jnp.eye(3))
-    assert jnp.allclose(Q[3:6, 6:9], q * dt ** 2 / 2.0 * jnp.eye(3))
-    assert jnp.allclose(Q[6:9, 3:6], q * dt ** 2 / 2.0 * jnp.eye(3))
-
-
-def test_inertial_Qd_symmetric_psd():
-    p = _params(0)
-    Q = pr.inertial_Qd(p)
-    assert jnp.allclose(Q, Q.T, atol=1e-14)
-    assert jnp.all(jnp.linalg.eigvalsh(Q) >= -1e-12)
+def test_continuous_Qc_structure():
+    """Q_c = blkdiag(gyro_var·I, accel_var·I, 0, Σ_{C_i}) — position block zero."""
+    N = 2
+    p = _params(N)
+    sig = _sigma_c(N)
+    Qc = pr.continuous_Qc(sig, p)
+    assert Qc.shape == (3 * N + 9, 3 * N + 9)
+    assert jnp.allclose(Qc[0:3, 0:3], p.gyro_var * jnp.eye(3))
+    assert jnp.allclose(Qc[3:6, 3:6], p.accel_var * jnp.eye(3))
+    assert jnp.allclose(Qc[6:9, 6:9], 0.0)          # position: no direct noise
+    for i in range(N):
+        sl = slice(9 + 3 * i, 12 + 3 * i)
+        assert jnp.allclose(Qc[sl, sl], sig[i])
+    # Block diagonal: no cross terms in the *continuous* density.
+    assert jnp.allclose(Qc[0:3, 3:], 0.0)
+    assert jnp.allclose(Qc[9:, 0:9], 0.0)
 
 
 @pytest.mark.parametrize("N", NS)
-def test_build_Qd_structure(N):
-    """Inertial block in the corner; decoupled contact blocks = Σ_c dt; PSD."""
+def test_build_Qd_is_eq38(N):
+    """Q_d = Φ Ad Q_c Adᵀ Φᵀ Δt exactly (CLAUDE.md I3 / paper Eq. 38)."""
     p = _params(N)
+    st = _seed_state(N)
     sig = _sigma_c(N)
-    Qd = pr.build_Qd(sig, p)
+    Ad = _Ad(st)
+
+    Qd = pr.build_Qd(sig, Ad, p)
+    M = p.Phi @ Ad
+    expected = M @ pr.continuous_Qc(sig, p) @ M.T * p.dt
+
     assert Qd.shape == (3 * N + 9, 3 * N + 9)
-    assert jnp.allclose(Qd[0:9, 0:9], pr.inertial_Qd(p))
-    # No cross terms between inertial and contact blocks (decoupled in A^r).
-    assert jnp.allclose(Qd[0:9, 9:], 0.0)
-    assert jnp.allclose(Qd[9:, 0:9], 0.0)
-    for i in range(N):
-        sl = slice(9 + 3 * i, 12 + 3 * i)
-        assert jnp.allclose(Qd[sl, sl], sig[i] * p.dt)
-        for j in range(N):
-            if i != j:
-                cl = slice(9 + 3 * j, 12 + 3 * j)
-                assert jnp.allclose(Qd[sl, cl], 0.0)
+    assert jnp.allclose(Qd, expected, atol=1e-14)
     assert jnp.allclose(Qd, Qd.T, atol=1e-14)
-    assert jnp.all(jnp.linalg.eigvalsh(Qd) >= -1e-10)
+    assert jnp.all(jnp.linalg.eigvalsh(Qd) >= -1e-12)
+
+
+@pytest.mark.parametrize("N", NS)
+def test_build_Qd_keeps_the_adjoint(N):
+    """The Ad_X̂ conjugation is load-bearing — dropping it is the §6 trap.
+
+    Even with isotropic Q_g/Q_a the adjoint is not a no-op: its first
+    block-column carries (v)_× R̂ and (p)_× R̂, which generate genuine cross
+    terms. This test fails if someone "cleans up" build_Qd to match Hartley.
+    """
+    p = _params(N)
+    st = _seed_state(N)
+    sig = _sigma_c(N)
+
+    with_ad = pr.build_Qd(sig, _Ad(st), p)
+    without_ad = pr.build_Qd(sig, jnp.eye(3 * N + 9), p)
+    assert not jnp.allclose(with_ad, without_ad, atol=1e-9)
+
+
+def test_build_Qd_is_error_independent():
+    """Q_d depends on the estimate X̂ but never on the error ξ (I3).
+
+    Perturbing the *estimate* changes Q_d (state-dependent); that is expected.
+    What must hold is that build_Qd is a pure function of (X̂, Σ_C, params) —
+    it never sees an error state at all, which is what keeps Φ log-linear.
+    """
+    N = 2
+    p = _params(N)
+    st = _seed_state(N)
+    sig = _sigma_c(N)
+    Ad = _Ad(st)
+    # Same estimate ⇒ bit-identical Q_d, regardless of P (the error covariance).
+    a = pr.build_Qd(sig, Ad, p)
+    b = pr.build_Qd(sig, Ad, p)
+    assert jnp.array_equal(a, b)
+    st_other_P = st._replace(P=st.P * 7.0 + jnp.eye(3 * N + 9))
+    assert jnp.array_equal(pr.build_Qd(sig, _Ad(st_other_P), p), a)
+
+
+@pytest.mark.parametrize("N", NS)
+def test_build_Qd_scales_linearly_with_dt(N):
+    """First-order discretisation: Q_d ∝ Δt at fixed Φ (TODO(van-loan) in source)."""
+    p1 = _params(N, dt=1e-3)
+    p2 = p1._replace(dt=2e-3)                    # Φ held fixed on purpose
+    st = _seed_state(N)
+    sig = _sigma_c(N)
+    Ad = _Ad(st)
+    assert jnp.allclose(pr.build_Qd(sig, Ad, p2), 2.0 * pr.build_Qd(sig, Ad, p1), atol=1e-14)
 
 
 # ---------------------------------------------------------------------------
@@ -196,8 +209,9 @@ def test_propagate_cov_formula(N):
     p = _params(N)
     st = _seed_state(N)
     sig = _sigma_c(N)
-    Pn = pr.propagate_cov(st.P, sig, p)
-    expected = p.Phi @ st.P @ p.Phi.T + pr.build_Qd(sig, p)
+    Ad = _Ad(st)
+    Pn = pr.propagate_cov(st.P, sig, Ad, p)
+    expected = p.Phi @ st.P @ p.Phi.T + pr.build_Qd(sig, Ad, p)
     assert jnp.allclose(Pn, expected, atol=1e-10)
     assert jnp.allclose(Pn, Pn.T, atol=1e-14)
     assert jnp.all(jnp.linalg.eigvalsh(Pn) >= -1e-9)
@@ -208,7 +222,7 @@ def test_propagate_cov_grows_uncertainty():
     p = _params(2)
     st = _seed_state(2)
     sig = _sigma_c(2)
-    Pn = pr.propagate_cov(st.P, sig, p)
+    Pn = pr.propagate_cov(st.P, sig, _Ad(st), p)
     assert jnp.trace(Pn) >= jnp.trace(st.P)
 
 
@@ -229,7 +243,7 @@ def test_propagate_full_step(N):
     assert jnp.allclose(out.v, mean.v)
     assert jnp.allclose(out.p, mean.p)
     assert jnp.array_equal(out.d, st.d)
-    assert jnp.allclose(out.P, pr.propagate_cov(st.P, sig, p))
+    assert jnp.allclose(out.P, pr.propagate_cov(st.P, sig, _Ad(st), p))
     assert out.P.shape == (3 * N + 9, 3 * N + 9)
 
 
