@@ -126,3 +126,30 @@ def assert_symmetric(M, epsilon: float) -> None:
     assert np.max(np.abs(M - M.T)) < epsilon, (
         f"matrix not symmetric to {epsilon}: max |M - Mᵀ| = {np.max(np.abs(M - M.T))}"
     )
+
+
+def yaw_pitch_roll_to_matrix(yaw: float, pitch: float, roll: float) -> np.ndarray:
+    """IHMC ``yawPitchRoll`` → rotation matrix: ``R = R_z(yaw) R_y(pitch) R_x(roll)``."""
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cr, sr = np.cos(roll), np.sin(roll)
+    Rz = np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+    Ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+    Rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
+    return Rz @ Ry @ Rx
+
+
+def matrix_to_yaw_pitch_roll(R) -> tuple:
+    """Inverse of `yaw_pitch_roll_to_matrix` (Z-Y-X Euler extraction)."""
+    R = np.asarray(R)
+    yaw = np.arctan2(R[1, 0], R[0, 0])
+    pitch = np.arctan2(-R[2, 0], np.hypot(R[2, 1], R[2, 2]))
+    roll = np.arctan2(R[2, 1], R[2, 2])
+    return yaw, pitch, roll
+
+
+def assert_symmetric_psd(P, epsilon: float = 1.0e-9) -> None:
+    """Java ``assertSymmetricPSD``: symmetric to eps, and Cholesky of P + 1e-12·I works."""
+    P = np.asarray(P)
+    assert_symmetric(P, epsilon)
+    np.linalg.cholesky(0.5 * (P + P.T) + 1e-12 * np.eye(P.shape[0]))

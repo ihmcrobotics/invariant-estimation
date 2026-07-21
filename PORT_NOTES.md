@@ -295,3 +295,89 @@ tests. Note several of its tests (`testGravityUpdateLevelsTiltAndPreservesYaw`,
 drive the EKF orchestrator API (`assembleGravityLeveling` / `applyGravityLeveling`
 / `wasLastUpdateApplied` / `getLastConditionProxy`), which is G5's `ekf.py` — so
 that half needs at least a minimal orchestrator seam alongside the new module.
+
+---
+
+## G4b — `GravityLevelingUpdaterTest` → `tests/inEKF/test_gravity_leveling_updater.py`
+
+**Status:** green (14 Java tests → 17 pytest functions; the extra 3 are one
+port-specific oracle parametrized over attitude). **G4 is now complete.**
+
+New module: `src/invariant_estimation/inEKF/gravity_update.py`. All 14 tests are
+deterministic (no RNG) — the map calls this the most portable behavioural spec in
+the suite, and that held up: no tolerance needed loosening.
+
+### Model as implemented
+
+- **Residual** (body frame): `r = ĝ_ref − R̂ᵀe_z`, against the complementary
+  reference rather than the raw specific force. Diagnostics read straight off it:
+  `tilt_pitch = r[0]`, `tilt_roll = r[1]`,
+  `tilt_angle = acos(clamp(ĝ_ref · R̂ᵀe_z))`.
+- **Jacobian**: perturbing `R̂ = Γ_0(φ)R` gives `R̂ᵀe_z ≈ Rᵀe_z + Rᵀ(e_z)_×φ`, so
+  `H = [−R̂ᵀ(e_z)_× | 0 …]`. Yaw column is `−R̂ᵀ(e_z)_×e_z = 0` exactly.
+- **Reference**: `ġ_ref = −ω × g_ref + (ĝ_meas − g_ref)/τ`, τ = 5 s, renormalised.
+  With ω = 0 it is a pure first-order low-pass (gain `1/√(1+(ωτ)²)` — the test's
+  `PREDICTED_ARTIFACT_GAIN`); with real gyro the `−ω × g_ref` term tracks true
+  tilt at unity gain and no lag. DC authority undiminished.
+- **Gate**: norm ∧ rotation (raw gyro) ∧ horizontal, the last resolved against
+  `ĝ_ref` — never `R̂ᵀe_z` (regression F.3).
+
+### The one real bug, and what caught it
+
+First implementation built `R`'s anisotropy triad about the **measured**
+direction `ĝ_ref`. Every structural test passed; only
+`testGravityUpdateLevelsTiltAndPreservesYaw` failed, and only just — tilt
+converged to 1.87e-3 against a 1e-3 bound. Not a crash, not a sign error: a
+convergence-*rate* shortfall, which is exactly the kind of thing that gets
+"fixed" by loosening a tolerance.
+
+Diagnosis: `H` satisfies `(R̂ᵀe_z)ᵀH = −e_zᵀ(e_z)_× = 0` **exactly** — the
+measurement is a unit vector, so its variation is always orthogonal to itself and
+the residual component along `R̂ᵀe_z` is structurally unobservable. Building `R`'s
+triad about `ĝ_ref` instead left the two null directions misaligned by precisely
+the tilt being corrected, so the unobservable channel stayed coupled into `S` and
+got fitted against the tight `ROLL_VAR`. The update fought itself.
+
+Fix: build the triad about the **predicted** direction `R̂ᵀe_z`. `S` block
+diagonalises, the unobservable channel decouples, and its variance can no longer
+perturb the roll/pitch correction. Measured: pitch tilt after 200 steps goes
+1.87e-3 → 1.77e-4, against an analytic best-case of 1.90e-4 (the scalar-KF
+telescoping bound `θ_0 σ²/(σ² + N)`) — i.e. the update now extracts essentially
+all available information.
+
+No test distinguishes the two choices structurally: at every point where the
+covariance structure is asserted (`testAnisotropicMeasurementCovarianceStructure`,
+`testPitchGateFreezesPitchButNotRoll`, `testPitchDistrustAxisIsBodyYAtNonZeroYaw`)
+the predicted and measured directions coincide. Only the convergence-rate test
+separates them.
+
+### Deliberate deviations
+
+1. **Mutable updater → explicit arguments + carried pytree.** Java's
+   `setPitchObservable` becomes a `pitch_observable` argument; the internally-held
+   gravity reference becomes a `GravityRef` pytree threaded through the caller.
+2. **Lazy seeding kept, made branch-free.** Java seeds its reference on first use
+   (the only behaviour consistent with all 14 tests: `testPitchTiltDiagnostic...`
+   asserts a full residual with no prior settle, while the sway tests require the
+   filtered reference). Reproduced with a float `initialized` mask and `jnp.where`
+   rather than a Python branch, per I7.
+3. **`InvariantEKF` stood up as a 3-line local driver** (`_level_once`) in the
+   test file. Three tests drive the Java EKF's `assembleGravityLeveling` /
+   `applyGravityLeveling` / `wasLastUpdateApplied` / `getLastConditionProxy`; the
+   real orchestrator is G5, and the module under test here is the updater.
+   `wasLastUpdateApplied` / `getLastConditionProxy` are ported as fields of the
+   returned `GravityDiagnostics` pytree (§4: diagnostics are seam surface, not
+   optional logging).
+4. **`pitch_disabled_var = 1e4`** chosen to satisfy `R(0,0) > 1e3` while keeping
+   `S` well conditioned. Java's exact value is not observable from the test.
+5. **Settling and sway loops run through `lax.scan`** — identical arithmetic and
+   tick counts (3000 / 12000), but eager Python loops took the full suite from
+   60 s to 119 s; scanned it is 68 s.
+
+### Note
+
+`apply_gravity_leveling` implements the §4 conditioning gate (Cholesky-diagonal
+proxy, masked `K`, so a gated update leaves `(X̂, P)` bit-for-bit unchanged) and
+computes NIS on the **prior** `P` and prior residual. Neither is exercised by
+this test class — both belong to G5's `InvariantUpdaterTest` — but they are
+wired now so the orchestrator has nothing left to bolt on.
