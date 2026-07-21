@@ -15,33 +15,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from invariant_estimation.inEKF import group as g
 from invariant_estimation.inEKF import state as s
+
+from ._oracles import next_rotation_matrix, next_vector3d
 
 EPSILON = 1.0e-12
 ITERATIONS = 500
-
-
-# ---------------------------------------------------------------------------
-# Oracles — stand-ins for EuclidCoreRandomTools
-# ---------------------------------------------------------------------------
-
-def _next_rotation_matrix(rng: np.random.Generator) -> jnp.ndarray:
-    """Uniform-ish random rotation, magnitude bounded by π (injectivity radius).
-
-    Euclid's ``nextRotationMatrix`` draws a random axis and an angle in
-    ``(-π, π)``; reproduced here through the port's own ``Γ_0`` so the test
-    exercises the same exp used everywhere else.
-    """
-    axis = rng.normal(size=3)
-    axis /= np.linalg.norm(axis)
-    angle = rng.uniform(-np.pi, np.pi)
-    return g.Gamma0(jnp.asarray(axis * angle))
-
-
-def _next_vector3d(rng: np.random.Generator) -> jnp.ndarray:
-    """Euclid ``nextVector3D``: components ~ U(-1, 1)."""
-    return jnp.asarray(rng.uniform(-1.0, 1.0, size=3))
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +52,7 @@ def test_rotation_round_trip():
     rng = np.random.default_rng(1234)
     st = s.InEKFState.identity(2)
     for _ in range(ITERATIONS):
-        expected = _next_rotation_matrix(rng)
+        expected = jnp.asarray(next_rotation_matrix(rng))
         st = st._replace(R=expected)
         assert jnp.allclose(st.R, expected, atol=EPSILON)
         # …and it survives the trip through the dense group element.
@@ -88,8 +67,8 @@ def test_base_velocity_and_position_round_trip():
     rng = np.random.default_rng(2345)
     st = s.InEKFState.identity(2)
     for _ in range(ITERATIONS):
-        v = _next_vector3d(rng)
-        p = _next_vector3d(rng)
+        v = jnp.asarray(next_vector3d(rng)[0])
+        p = jnp.asarray(next_vector3d(rng)[0])
         st = st._replace(v=v, p=p)
         assert jnp.allclose(st.v, v, atol=EPSILON)
         assert jnp.allclose(st.p, p, atol=EPSILON)
@@ -108,10 +87,10 @@ def test_named_components_are_independent():
     N = 3
     st = s.InEKFState.identity(N)
 
-    R = _next_rotation_matrix(rng)
-    v = _next_vector3d(rng)
-    p = _next_vector3d(rng)
-    contacts = [_next_vector3d(rng) for _ in range(N)]
+    R = jnp.asarray(next_rotation_matrix(rng))
+    v = jnp.asarray(next_vector3d(rng)[0])
+    p = jnp.asarray(next_vector3d(rng)[0])
+    contacts = [jnp.asarray(next_vector3d(rng)[0]) for _ in range(N)]
 
     st = st._replace(R=R, v=v, p=p)
     for i, d_i in enumerate(contacts):
@@ -171,13 +150,13 @@ def test_set_to_identity():
     rng = np.random.default_rng(4567)
     st = s.InEKFState.identity(2)
     st = st._replace(
-        R=_next_rotation_matrix(rng),
-        v=_next_vector3d(rng),
-        p=_next_vector3d(rng),
+        R=jnp.asarray(next_rotation_matrix(rng)),
+        v=jnp.asarray(next_vector3d(rng)[0]),
+        p=jnp.asarray(next_vector3d(rng)[0]),
         P=jnp.eye(15),                      # must survive untouched
     )
-    st = st.set_contact_position(0, _next_vector3d(rng))
-    st = st.set_contact_position(1, _next_vector3d(rng))
+    st = st.set_contact_position(0, jnp.asarray(next_vector3d(rng)[0]))
+    st = st.set_contact_position(1, jnp.asarray(next_vector3d(rng)[0]))
 
     st = st.set_to_identity()
 
