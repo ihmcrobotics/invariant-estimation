@@ -986,3 +986,22 @@ The second is the one worth noting: with a merged update, a NaN on a single IMU
 silently costs the encoder update as well, and *nothing else in the suite
 notices* — the state stays finite and PSD, it is simply less informed than it
 should be.
+
+### A constant-graph test that measured the test session, not the code
+
+`test_step_does_not_recompile_across_contact_patterns` asserted
+`jstep._cache_size() == 1`. It passed alone and inside its own file, and failed
+only under the full suite — the shape of failure that usually gets "fixed" by
+loosening something (plan §4 lesson 2), so the mechanism was found first.
+
+`_cache_size()` read **0**, not 2. JAX's jit cache is a global LRU, and the other
+177 tests in `tests/jointKF` evicted the entry. The assertion was measuring a
+shared resource other tests pollute: it can fail with no retrace whatsoever, and
+eviction means it says nothing about the property it claims to.
+
+Replaced with a comparison of the **lowered program** (`lower(...).as_text()`)
+across contact patterns, which is immune to eviction, plus `_cache_size() <= 1` —
+a retrace can only push the cache *above* one entry, so that direction survives a
+full-suite run while the equality did not. Mutation-checked: introducing a
+data-dependent Python branch on `carry.trusted_feet` raises
+`ConcretizationTypeError`, which is the failure this test exists to catch.

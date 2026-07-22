@@ -13,10 +13,11 @@ things that have no Java analogue because Java simply reshapes:
 
 On what the graph tests prove. Traced arrays cannot change a jaxpr, so equality
 across contact patterns is nearly automatic; what these genuinely catch is a
-data-dependent branch, which raises at trace time. `_cache_size() == 1` is the
-load-bearing assertion — it says no *recompilation* happened, which is the port's
-analogue of the Java allocation guard (CLAUDE.md §3, "Skip"). Stated as what it
-proves, not what one might hope (JOINTKF_PORT_PLAN §4 lesson 3).
+data-dependent branch, which raises at trace time. The load-bearing assertion is
+that the *lowered program* is identical across contact patterns — i.e. no
+recompilation — which is the port's analogue of the Java allocation guard
+(CLAUDE.md §3, "Skip"). Stated as what it proves, not what one might hope
+(JOINTKF_PORT_PLAN §4 lesson 3).
 """
 import jax
 import jax.numpy as jnp
@@ -159,20 +160,41 @@ def test_recovery_is_automatic_after_a_bad_window(scene):
 # Constant graph (I7)
 # ---------------------------------------------------------------------------
 
-def test_step_does_not_recompile_across_contact_patterns(scene):
-    """The load-bearing constant-graph assertion: no recompilation.
+def test_step_compiles_to_one_program_across_contact_patterns(scene):
+    """The constant-graph property (I7), measured by the LOWERED program.
 
-    This is the port's analogue of the Java allocation guard, which is skipped as
-    JVM-specific (CLAUDE.md §3). A data-dependent branch would raise; a changed
-    shape would recompile. `_cache_size() == 1` rules out both.
+    What this proves: the compiled executable is byte-identical whichever feet
+    are on the ground, so a touchdown cannot trigger a recompilation inside a
+    vmapped/scanned MJX rollout.  That is the port's analogue of the Java
+    allocation guard, which is skipped as JVM-specific (CLAUDE.md §3).
+
+    What it does NOT prove: that the masks are *correct*.  Traced arrays cannot
+    change a jaxpr, so structural equality here is close to automatic; the real
+    failure it catches is a data-dependent branch, which raises at trace time
+    (JOINTKF_PORT_PLAN §4 lesson 3 — state what a test proves).
+
+    Measured by comparing `lower(...).as_text()` rather than `_cache_size()`.
+    The jit cache is a global LRU: running the full suite evicts this entry and
+    `_cache_size()` reads 0, so an assertion on it fails without any retrace
+    having occurred.  It measures a shared resource other tests pollute, which is
+    a property of the test session, not of the code under test.
     """
     f, build, params, model, motion = scene
     jstep = jax.jit(lambda c, s: step(c, s, model, build, params))
 
     carry = init_carry(build, params, jnp.asarray(motion.q))
+    programs = set()
     for contact in ([0.0], [1.0], [0.0], [1.0]):
-        carry, _ = jstep(carry, sensors_for(build, motion, contact))
-    assert jstep._cache_size() == 1, "contact pattern must not change the graph"
+        sensors = sensors_for(build, motion, contact)
+        programs.add(jstep.lower(carry, sensors).as_text())
+        carry, _ = jstep(carry, sensors)
+
+    assert len(programs) == 1, (
+        f"contact pattern changed the compiled program ({len(programs)} distinct)"
+    )
+    # A retrace would push the cache above one entry; eviction can only take it
+    # below, so this direction stays meaningful under a full-suite run.
+    assert jstep._cache_size() <= 1, "a contact pattern triggered a retrace"
 
 
 def test_run_scans_a_trajectory(scene):
