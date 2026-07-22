@@ -577,7 +577,52 @@ the masked contact's covariance block moves < 1e-6 while the trusted one moves
 finite **and non-zero** — a dead path would otherwise pass silently. Same for
 `Σ_q` through the joint boundary. This is the BPTT prerequisite for ContactNet.
 
+### Correction (2026-07-22): the contact mask was wrong and is gone
+
+The first version of `filter.py` carried a per-foot `contact_mask` that blended
+`R_eff = w·Np + (1−w)·R_LARGE·I`. Lucas questioned it ("isn't the whole point
+that ContactNet gives us R via the Cholesky factor anyway?"), which surfaced two
+defects:
+
+1. **The blend was a step function.** With `Np ~ 1e-6` and `R_LARGE = 1e12`,
+   `w = 0.999` contributed 1e-15 of the information; only `w` within ~1e-12 of 1
+   meant anything. The `[0.5, 0.25]` pattern in the jaxpr test was therefore
+   testing "off, off", not partial trust.
+2. **It was imported from the wrong filter.** CLAUDE.md §4's `R_LARGE` masking
+   rule governs the **joint KF's stance anchors** — §2's "trusted feet → anchors"
+   row, with the oracle checked in the **G7** stacked-oracle port — not the InEKF
+   contact update. The InEKF's governing invariants are I2 and §7, and neither
+   mentions masking.
+
+Removed `contact_mask` from `InEKFInputs`, and `mask_contact_noise` / `R_LARGE`
+from the module; they belong to the joint KF at G7.
+
+Rationale, measured: the FK measurement is not wrong in swing — the encoders
+still locate the foot relative to the base. What breaks is the static-anchor
+assumption, which lives in the **process** noise. With `Σ_C = 1.0` over 100 swing
+ticks, an 8 cm displacement is absorbed 96% into the anchor and perturbs the base
+by 3.7 mm — a 7.6× attenuation versus the planted control. The residual base
+motion is correct Bayesian behaviour (`P_pp/(P_pp+P_dd) ≈ 8%`), not a leak.
+
+Locked by `test_large_contact_covariance_isolates_a_swing_foot`, and documented
+in **`DESIGN_DECISIONS.md` §1** (new file) plus a `DECISION` block in
+`filter.py`'s module docstring.
+
+### Correction: the jaxpr tests were oversold
+
+`contact_mask`/`contact_chol` are *traced* arrays, so the jaxpr cannot depend on
+their values — jaxpr equality across input patterns is close to automatic. What
+those tests genuinely catch is a **data-dependent branch** (`if x > c`,
+`jnp.nonzero`, boolean indexing), which raises at trace time. Renamed and
+re-worded to say what they actually prove; the load-bearing one is
+`test_step_does_not_recompile_across_contact_conditions` (`_cache_size() == 1`).
+
 ### Housekeeping
 
 `inEKF/__init__.py` had picked up duplicated import and `__all__` blocks; deduped
-and now asserted clean (75 names, no duplicates, all resolving).
+and now asserted clean (74 names, no duplicates, all resolving).
+
+New file **`DESIGN_DECISIONS.md`**, linked from the README: deliberate choices
+whose *symptoms* look like bugs (no contact mask, first-order `Q_d`, no reseed,
+no contact-trust port, unapplied `N^v`). Each entry records what / why / what it
+costs / which test guards it.

@@ -6,8 +6,12 @@ scan body must guarantee:
 
 * the joint-KF boundary is routed correctly (`Σ_q` reaches `N^p` through `J`,
   and nothing from the joint KF reaches `Φ` or the inertial `Q`);
-* **I7 — the traced jaxpr is identical** regardless of contact mask or gate
-  state, which is the constant-graph proof G9 reuses;
+* **I7 — no data-dependent branch survives tracing**, and the jitted step never
+  recompiles as contact condition or gate state changes (the constant-graph
+  property G9 reuses);
+* contact condition rides in `Σ_C` alone — see the DECISION note in
+  `inEKF/filter.py`, and `test_large_contact_covariance_isolates_a_swing_foot`
+  below, which is the regression guarding it;
 * the whole scan is differentiable, so BPTT into ContactNet works.
 
 The `ContactKinematics` seam is filled by a deterministic analytic fixture; MJX
@@ -26,12 +30,10 @@ from invariant_estimation.inEKF.filter import (
     ContactFrames,
     InEKFInputs,
     JointFilterOutput,
-    R_LARGE,
     contact_position_noise,
     contact_velocity_noise,
     init_carry,
     make_step,
-    mask_contact_noise,
     run,
 )
 
@@ -73,10 +75,10 @@ def _make_kinematics(n_contacts=N_CONTACTS, n_joints=N_JOINTS):
     return kinematics
 
 
-def _inputs(rng, contact_mask=None, accel=None, omega=None):
+def _inputs(rng, contact_chol=None, accel=None, omega=None):
     """One tick of inputs."""
-    if contact_mask is None:
-        contact_mask = jnp.ones(N_CONTACTS)
+    if contact_chol is None:
+        contact_chol = jnp.tile(jnp.eye(3) * 1.0e-3, (N_CONTACTS, 1, 1))
     joint = JointFilterOutput(
         q=jnp.asarray(rng.uniform(-0.5, 0.5, N_JOINTS)),
         q_dot=jnp.asarray(rng.uniform(-0.5, 0.5, N_JOINTS)),
@@ -88,8 +90,7 @@ def _inputs(rng, contact_mask=None, accel=None, omega=None):
         accel=jnp.array([0.0, 0.0, 9.81]) if accel is None else accel,
         raw_omega=jnp.zeros(3) if omega is None else omega,
         joint=joint,
-        contact_mask=jnp.asarray(contact_mask, dtype=float),
-        contact_chol=jnp.tile(jnp.eye(3) * 1.0e-3, (N_CONTACTS, 1, 1)),
+        contact_chol=jnp.asarray(contact_chol, dtype=float),
     )
 
 
@@ -161,40 +162,63 @@ def test_velocity_noise_is_routed_separately():
         assert np.max(np.abs(np.asarray(Nv[i]) - expected)) < 1.0e-12
 
 
-def test_mask_substitutes_R_large_never_zero():
-    """An untrusted contact gets R_LARGE, not a zeroed row (§6 trap: singular S)."""
-    Np = jnp.tile(jnp.eye(3) * 1e-4, (N_CONTACTS, 1, 1))
-    masked = mask_contact_noise(Np, jnp.array([1.0, 0.0]))
+def test_large_contact_covariance_isolates_a_swing_foot():
+    """Contact condition rides in Σ_C alone — this is the measurement that decision rests on.
 
-    assert jnp.allclose(masked[0], Np[0])
-    assert jnp.allclose(masked[1], R_LARGE * jnp.eye(3))
-    # Emphatically not zero — that is what makes S singular.
-    assert float(jnp.min(jnp.diag(masked[1]))) > 1.0
+    See the DECISION note in `inEKF/filter.py`: there is no contact mask. A swing
+    foot is expressed as a large Σ_C, which inflates P_dd so the FK residual is
+    absorbed by the *anchor* rather than the base.
 
-
-def test_masked_contact_matches_excluded_contact():
-    """Masking contact 1 must reproduce the posterior that never saw it.
-
-    The `R_LARGE -> infinity` oracle of §4: a masked measurement is the limit of
-    an infinitely-noisy one, so its block of the posterior is untouched.
+    If someone reintroduces a mask, or Σ_C stops reaching Q_d, this is the test
+    that should fail. The thresholds are loose around the measured values
+    (96% absorbed, 7.6x attenuation) so ordinary retuning does not trip it.
     """
-    rng = np.random.default_rng(3)
-    ekf, state, kinematics = _setup(rng)
-    step = make_step(ekf, kinematics)
-
-    # Same tick, same draw — only the mask differs.
-    both, _ = step(init_carry(state), _inputs(np.random.default_rng(30), [1.0, 1.0]))
-    first_only, _ = step(init_carry(state), _inputs(np.random.default_rng(30), [1.0, 0.0]))
-
-    # The masked contact's own covariance block must be essentially unchanged by
-    # its (nonexistent) measurement, while the trusted one's is not.
-    d1 = slice(9 + 3, 9 + 6)
-    moved_when_trusted = float(jnp.max(jnp.abs(both.state.P[d1, d1] - state.P[d1, d1])))
-    moved_when_masked = float(
-        jnp.max(jnp.abs(first_only.state.P[d1, d1] - state.P[d1, d1]))
+    from invariant_estimation.inEKF.correct import (
+        innovation, linear_update, measurement_noise,
     )
-    assert moved_when_masked < 1.0e-6
-    assert moved_when_trusted > 1.0e-4
+    from invariant_estimation.inEKF.propagate import propagate
+
+    ekf = ekf_mod.create(N_CONTACTS, dt=DT)
+    state = ekf_mod.initialize(
+        ekf, jnp.eye(3), jnp.zeros(3), jnp.array([0.0, 0.0, 0.9]),
+        jnp.array([[0.0, 0.1, 0.0], [0.0, -0.1, 0.0]]),
+        jnp.eye(9 + 3 * N_CONTACTS) * 1.0e-2,
+    )
+    Np = jnp.tile(jnp.eye(3) * 1.0e-6, (N_CONTACTS, 1, 1))
+    planted = jnp.tile(jnp.eye(3) * 1.0e-6, (N_CONTACTS, 1, 1))
+    swinging = planted.at[1].set(jnp.eye(3) * 1.0)      # foot 1 in swing
+
+    def evolve(sigma_c, ticks=100):
+        st = state
+        for _ in range(ticks):
+            st = propagate(st, jnp.zeros(3), jnp.array([0.0, 0.0, 9.81]),
+                           sigma_c, ekf.params)
+        return st
+
+    def apply_displaced_measurement(st):
+        """Foot 1 has physically moved 8 cm; foot 0's measurement is consistent."""
+        y = jax.vmap(lambda d: st.R.T @ (d - st.p))(st.d)
+        y = y.at[1].add(jnp.array([0.08, 0.0, 0.0]))
+        out, _ = linear_update(st, ekf.params.H, innovation(st, y), measurement_noise(Np))
+        return out
+
+    swing_state = evolve(swinging)
+    planted_state = evolve(planted)
+
+    # The swing foot's anchor covariance has grown; the planted one's has not.
+    assert float(swing_state.P[12, 12]) > 10.0 * float(swing_state.P[9, 9])
+
+    after_swing = apply_displaced_measurement(swing_state)
+    after_planted = apply_displaced_measurement(planted_state)
+
+    base_swing = float(jnp.linalg.norm(after_swing.p - swing_state.p))
+    base_planted = float(jnp.linalg.norm(after_planted.p - planted_state.p))
+    absorbed = float(jnp.linalg.norm(after_swing.d[1] - swing_state.d[1]))
+
+    # Most of the 8 cm discrepancy is taken by the anchor, not the base.
+    assert absorbed > 0.9 * 0.08
+    # …and the base is far less perturbed than it would be for a planted foot.
+    assert base_swing < 0.25 * base_planted
 
 
 # ---------------------------------------------------------------------------
@@ -263,23 +287,34 @@ def _jaxpr_of(ekf, kinematics, state, inputs):
     return jax.make_jaxpr(step)(init_carry(state), inputs)
 
 
-def test_jaxpr_is_identical_across_contact_masks():
-    """I7: which feet are trusted must not change the traced graph.
+def test_no_data_dependent_branch_on_contact_covariance():
+    """I7: contact condition must not change the traced graph.
 
-    This is the port's analogue of the Java allocation tests — "no recompilation"
-    IS "no per-tick allocation". G9 reuses it on the fused estimator.
+    Note what this does and does not prove. `contact_chol` is a *traced* array,
+    so the jaxpr cannot depend on its value — equality here is close to
+    automatic. What it genuinely catches is a data-dependent branch
+    (`if sigma[i] > x`, `jnp.nonzero(...)`, boolean indexing), which raises at
+    trace time rather than producing a different graph. That is the failure mode
+    worth guarding, and it is why the assertion is phrased as "tracing succeeds
+    and agrees" rather than as a strong claim about coverage.
     """
     rng = np.random.default_rng(7)
     ekf, state, kinematics = _setup(rng)
 
-    masks = [[1.0, 1.0], [1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.5, 0.25]]
+    # Firm, slipping (anisotropic), swinging, and mixed.
+    cases = [
+        jnp.tile(jnp.eye(3) * 1e-4, (N_CONTACTS, 1, 1)),
+        jnp.tile(jnp.diag(jnp.array([1.0, 1.0, 1e-6])), (N_CONTACTS, 1, 1)),
+        jnp.tile(jnp.eye(3) * 1.0, (N_CONTACTS, 1, 1)),
+        jnp.stack([jnp.eye(3) * 1e-6, jnp.eye(3) * 10.0]),
+    ]
     jaxprs = [
-        str(_jaxpr_of(ekf, kinematics, state, _inputs(np.random.default_rng(7), m)))
-        for m in masks
+        str(_jaxpr_of(ekf, kinematics, state, _inputs(np.random.default_rng(7), c)))
+        for c in cases
     ]
 
     for other in jaxprs[1:]:
-        assert other == jaxprs[0], "contact mask changed the traced graph — I7 violated"
+        assert other == jaxprs[0], "contact covariance changed the traced graph — I7"
 
 
 def test_jaxpr_is_identical_across_gate_states():
@@ -298,15 +333,20 @@ def test_jaxpr_is_identical_across_gate_states():
         str(_jaxpr_of(ekf, kinematics, state, shaken))
 
 
-def test_step_does_not_recompile_across_masks():
-    """The operational form of I7: one trace, many mask patterns."""
+def test_step_does_not_recompile_across_contact_conditions():
+    """The operational form of I7: one trace, every contact condition.
+
+    This is the port's analogue of the Java allocation tests — *no recompilation
+    IS no per-tick allocation*. G9 reuses it on the fused estimator.
+    """
     rng = np.random.default_rng(9)
     ekf, state, kinematics = _setup(rng)
     step = jax.jit(make_step(ekf, kinematics))
 
     carry = init_carry(state)
-    for mask in ([1.0, 1.0], [0.0, 1.0], [1.0, 0.0], [0.0, 0.0]):
-        carry, _ = step(carry, _inputs(np.random.default_rng(9), mask))
+    for scale in (1e-6, 1.0, 1e3, 1e-2):
+        chol = jnp.stack([jnp.eye(3) * scale, jnp.eye(3) * 1e-4])
+        carry, _ = step(carry, _inputs(np.random.default_rng(9), chol))
 
     assert step._cache_size() == 1
 

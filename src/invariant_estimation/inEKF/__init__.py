@@ -45,7 +45,6 @@ from .filter import (
     contact_velocity_noise,
     init_carry,
     make_step,
-    mask_contact_noise,
     run,
 )
 from .ekf import (
@@ -160,7 +159,6 @@ __all__ = [
     "init_carry",
     "contact_position_noise",
     "contact_velocity_noise",
-    "mask_contact_noise",
     # EKF orchestrator (G5)
     "InvariantEKF",
     "create",

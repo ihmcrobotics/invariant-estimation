@@ -17,15 +17,54 @@ Constant-graph contract (I7)
 trusted, whether the quasi-static gate is open, or whether pitch is observable.
 Nothing here branches on data:
 
-* an untrusted contact keeps its measurement rows but gets ``R_LARGE`` noise and
-  a zeroed residual — never a dropped row (a zeroed ``R`` row makes ``S``
-  singular; §6 trap);
 * the gravity gate multiplies into ``K`` as a float mask, so a closed gate leaves
   ``(X̂, P)`` bit-for-bit unchanged rather than skipping work;
+* contact condition is a *continuous covariance*, never a shape change (below);
 * ``N``, the joint count, and the contact count are static, fixed at build time.
 
-`tests/inEKF/test_filter.py` asserts the jaxpr hash is identical across
-differing contact masks and gate states — the I7 proof, which G9 reuses.
+`tests/inEKF/test_filter.py` covers this: no data-dependent branch survives
+tracing, and the jitted step never recompiles as inputs change.
+
+.. _no-contact-mask:
+
+DECISION — there is no contact mask.  Read this before debugging a foot.
+------------------------------------------------------------------------
+**Contact condition is expressed *only* through ``Σ_C``** (the ContactNet
+Cholesky factor, which reaches the contact block of ``Q_d`` via `contact.digest`).
+There is deliberately **no per-foot trust mask and no measurement kill-switch**
+in this filter.  If you are debugging a foot that "should have been ignored",
+this is the thing you are looking for, and it is absent on purpose.
+
+Why: the FK measurement ``y_i = R̂ᵀ(d̄_i − p̄)`` is *not wrong* during swing — the
+encoders still locate the foot relative to the base perfectly well.  What breaks
+in swing is the assumption that ``d_i`` is world-static, and that assumption
+lives in the **process** noise, not the measurement noise.  Inflating ``Σ_C`` is
+therefore the physically correct lever; masking the measurement treats a true
+observation as false.
+
+Measured (`test_large_contact_covariance_isolates_a_swing_foot`): with
+``Σ_C = 1.0`` for 100 swing ticks, an 8 cm foot displacement is absorbed **96%**
+into the contact anchor and perturbs the base by 3.7 mm — a **7.6x** attenuation
+versus the same foot planted.  The residual base motion is not a leak: it is
+``P_pp/(P_pp + P_dd) ≈ 8%`` of the residual, which is what Bayes says belongs to
+the base under that prior, and it shrinks further as the swing continues.
+
+``Σ_C`` is also strictly more expressive than a scalar trust weight: a full
+covariance can say "this foot slides along the surface but not through it",
+which no single number can.
+
+Consequences to keep in mind:
+
+* A swing foot **does** still receive a small, correct base correction.  That is
+  intended.  If it is too large, ``Σ_C`` is too small — do not reach for a mask.
+* CLAUDE.md §4's ``R_LARGE = 1e12·I₃`` masking rule is **not** about this filter.
+  It governs the **joint KF's stance anchors** (§2 "trusted feet → anchors",
+  oracle checked in the G7 stacked-oracle port).  An earlier version of this
+  module imported that mechanism here by mistake; see PORT_NOTES.md.
+* An encoder fault is ``Σ_q``, not a contact concern.
+
+CLAUDE.md I2 (contacts permanently in state) and §7 (contact condition expressed
+through ``Σ_C``) are the governing invariants.
 
 The joint-filter boundary
 -------------------------
@@ -65,12 +104,6 @@ from .gravity_update import (
 )
 from .propagate import propagate
 from .state import InEKFState
-
-# Noise substituted for an untrusted contact.  Large enough that the update is
-# numerically a no-op on that block, small enough that S stays well conditioned
-# in float64 (CLAUDE.md §4).
-R_LARGE = 1.0e12
-
 
 # ---------------------------------------------------------------------------
 # Boundary types
@@ -145,18 +178,17 @@ class InEKFInputs(NamedTuple):
         requires the gate to see the uncorrected signal.
     joint : JointFilterOutput
         The joint-KF boundary (above).
-    contact_mask : Array, shape (N,)
-        Per-contact trust in ``[0, 1]``, from the **previous** tick's trusted set
-        (§4 phase ordering).  0 ⇒ that contact's FK update is masked out.
     contact_chol : Array, shape (N, 3, 3)
         ContactNet Cholesky factors ``L_{C_i}``; `contact.digest` reconstructs
-        and floors them.  Default heuristic: a constant diagonal factor.
+        and floors them into ``Σ_C``.  **This is the only contact-condition
+        input** — see the DECISION note in the module docstring.  Firm contact ⇒
+        small; slip ⇒ anisotropic; swing ⇒ large.  Default heuristic: a constant
+        diagonal factor, inflated for swing feet.
     """
     omega: Array
     accel: Array
     raw_omega: Array
     joint: JointFilterOutput
-    contact_mask: Array
     contact_chol: Array
 
 
@@ -199,19 +231,6 @@ def contact_velocity_noise(J_dot: Array, sigma_q_dot: Array) -> Array:
     return jax.vmap(map_encoder_noise, in_axes=(0, None))(J_dot, sigma_q_dot)
 
 
-def mask_contact_noise(Np: Array, contact_mask: Array) -> Array:
-    r"""Blend per-contact noise toward ``R_LARGE`` for untrusted contacts (§4).
-
-    ``mask = 1`` keeps ``N^p_i``; ``mask = 0`` substitutes ``R_LARGE · I₃``.  The
-    rows stay — dropping them would change the shape (I7), and *zeroing* them
-    would make ``S`` singular (§6 trap).  As ``R_LARGE → ∞`` the posterior tends
-    to the one that excludes the contact entirely.
-    """
-    big = R_LARGE * jnp.eye(3)
-    w = contact_mask.reshape(-1, 1, 1)
-    return w * Np + (1.0 - w) * big
-
-
 # ---------------------------------------------------------------------------
 # The scan body
 # ---------------------------------------------------------------------------
@@ -240,8 +259,9 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
         frames = kinematics(inputs.joint.q, inputs.joint.q_dot)
 
         # Joint-KF covariance enters here and only here, through the Jacobian.
+        # Note there is no per-contact mask: contact condition rides entirely in
+        # Σ_C (the DECISION note above).
         Np = contact_position_noise(frames.J, inputs.joint.sigma_q)
-        Np = mask_contact_noise(Np, inputs.contact_mask)
 
         # TODO(N^v / zero-velocity): `contact_velocity_noise(frames.J_dot,
         # inputs.joint.sigma_q_dot)` is the noise on the contact *zero-velocity*
@@ -251,10 +271,6 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
         # through the boundary so adding it later is a change here only.
 
         nu = innovation(state, frames.y)
-        # Zero the residual on untrusted contacts as well as inflating R, so a
-        # masked contact contributes nothing rather than a large-but-nonzero pull.
-        nu = (nu.reshape(-1, 3) * inputs.contact_mask.reshape(-1, 1)).reshape(-1)
-
         state, contact_diagnostics = linear_update(
             state, ekf.params.H, nu, measurement_noise(Np)
         )
