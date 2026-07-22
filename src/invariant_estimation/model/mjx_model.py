@@ -57,7 +57,7 @@ import numpy as np
 from jax import Array
 from mujoco import mjx
 
-__all__ = ["MjxModel", "MassMatrixBlocks"]
+__all__ = ["MjxModel", "MassMatrixBlocks", "ModelEval"]
 
 _MJ_JNT_FREE = int(mujoco.mjtJoint.mjJNT_FREE)      # 0
 _MJ_JNT_HINGE = int(mujoco.mjtJoint.mjJNT_HINGE)    # 3
@@ -80,6 +80,23 @@ class MassMatrixBlocks(NamedTuple):
     jb: Array   # (n, n_nuisance)
     bb: Array   # (n_nuisance, n_nuisance)
     bj: Array   # (n_nuisance, n)
+
+
+class ModelEval(NamedTuple):
+    """Everything the filter needs from the model at one configuration.
+
+    The individual accessors below each run their own position-level pass, which
+    is convenient but wasteful: the estimator wants FK, the site Jacobians and
+    `M(q)` at the *same* `q`, once per tick.  `MjxModel.evaluate` is that single
+    pass, and it is also what keeps the test gate affordable -- one MJX trace per
+    shape instead of one per quantity.
+    """
+
+    site_pos: Array     # (n_sites, 3)
+    site_rot: Array     # (n_sites, 3, 3)
+    J_ang: Array        # (n_sites, 3, nv)   world frame
+    J_rel: Array        # (n_pairs, 3, n)    child frame, S_ab applied
+    M: Array            # (nv, nv)
 
 
 @dataclass(frozen=True)
@@ -300,15 +317,18 @@ class MjxModel:
         `(3, nv)` convention and relative to MuJoCo's own C API.  Transposing here
         keeps that surprise inside this module.
         """
-        d = self._data(q)
+        return self._site_angular_jacobians(self._data(q))
+
+    def _site_angular_jacobians(self, d: mjx.Data) -> Array:
+        """`site_angular_jacobians` on an already-computed `Data`."""
         ids = jnp.asarray(self.site_ids)
-        body = jnp.asarray(self.mj_model.site_bodyid[self.site_ids])
+        bodies = jnp.asarray(self.mj_model.site_bodyid[self.site_ids])
 
         def one(point, bid):
             _, jr = mjx.jac(self.mjx_model, d, point, bid)
             return jr.T
 
-        return jax.vmap(one)(d.site_xpos[ids], body)
+        return jax.vmap(one)(d.site_xpos[ids], bodies)
 
     def relative_gyro_jacobian(self, q: Array) -> Array:
         r"""Stacked pair Jacobians `J_ang(q) S_ab`, `(n_pairs, 3, n)`, child frame.
@@ -333,15 +353,11 @@ class MjxModel:
         contract's `b_omega` being stored in each IMU's own frame.
         """
         d = self._data(q)
+        return self._relative_gyro_jacobian(d, self._site_angular_jacobians(d))
+
+    def _relative_gyro_jacobian(self, d: mjx.Data, J_world: Array) -> Array:
+        """`relative_gyro_jacobian` given the world-frame site Jacobians."""
         ids = jnp.asarray(self.site_ids)
-        bodies = jnp.asarray(self.mj_model.site_bodyid[self.site_ids])
-        pos = d.site_xpos[ids]
-
-        def one(point, bid):
-            _, jr = mjx.jac(self.mjx_model, d, point, bid)
-            return jr.T                                   # (3, nv), world frame
-
-        J_world = jax.vmap(one)(pos, bodies)              # (n_sites, 3, nv)
         cols = jnp.asarray(self.joint_dof)
         J_joint = J_world[:, :, cols]                     # (n_sites, 3, n)
 
@@ -359,7 +375,35 @@ class MjxModel:
         Includes `dof_armature` on the diagonal -- MuJoCo folds it in during CRB.
         Consumers must not add reflected rotor inertia again (`CLAUDE.md` §6).
         """
-        return mjx.full_m(self.mjx_model, self._data(q))
+        return self._mass_matrix(self._data(q))
+
+    def _mass_matrix(self, d: mjx.Data) -> Array:
+        """`mass_matrix` on an already-computed `Data`.
+
+        The public accessor and `evaluate` must go through *this*, not each call
+        `mjx.full_m` for itself: two spellings of the same quantity is exactly the
+        arrangement where a test constrains one path and the estimator uses the
+        other (that failure showed up in the Phase 0b mutation check).
+        """
+        return mjx.full_m(self.mjx_model, d)
+
+    def evaluate(self, q: Array) -> ModelEval:
+        """FK, site Jacobians and `M(q)` from a **single** position-level pass.
+
+        This is the entry point a jitted filter step should call: `_data` (FK ->
+        COM frames -> CRB) is by far the expensive part and there is no reason to
+        run it three times for one tick.
+        """
+        d = self._data(q)
+        ids = jnp.asarray(self.site_ids)
+        J_ang = self._site_angular_jacobians(d)
+        return ModelEval(
+            site_pos=d.site_xpos[ids],
+            site_rot=d.site_xmat[ids],
+            J_ang=J_ang,
+            J_rel=self._relative_gyro_jacobian(d, J_ang),
+            M=self._mass_matrix(d),
+        )
 
     def mass_matrix_blocks(self, q: Array) -> MassMatrixBlocks:
         """`(M_jj, M_jb, M_bb, M_bj)` gathered by the build-time DoF index arrays."""

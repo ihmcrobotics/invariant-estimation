@@ -45,7 +45,7 @@ import numpy as np
 
 from invariant_estimation.model.mjx_model import MjxModel
 
-from ._oracles import SHAPES
+from ._oracles import SHAPES, java_hash_code
 
 #: One seed for the whole file: the geometry must be identical across runs and
 #: across agents, or two ported test classes silently disagree about the model.
@@ -115,7 +115,11 @@ def chain_geometry(shape: dict, *, armature: bool = True, seed: int = CHAIN_SEED
     untouched -- the two-model comparison the G3 oracle needs.
     """
     C = shape["chain"]
-    rng = np.random.default_rng(seed + 1000 * SHAPES.index(shape))
+    # Per-shape stream, keyed on the shape *name* rather than its position in
+    # SHAPES: two shapes must not share geometry (a bug that only shows up as
+    # suspiciously identical numbers), and the keying must survive the table
+    # being reordered or a one-off shape being built ad hoc.
+    rng = np.random.default_rng(seed + (java_hash_code(shape["name"]) % 10_000))
 
     sites = list(shape["imus"]) + [C - 1]            # IMU sites, then the foot site
     n_sites = len(sites)

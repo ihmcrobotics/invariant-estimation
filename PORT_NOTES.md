@@ -775,3 +775,76 @@ API consequence in `process.py`: `rotor=` defaults to the sentinel
 *rejected* rather than aliased to it — so "M carries the rotor" and "I forgot to
 pass the rotor" cannot be spelled the same way. Adding the term requires naming
 it at the call site.
+
+---
+
+## G1 / Phase 0b — MJX model seam
+
+`model/mjx_model.py` (`MjxModel`, implementing `robot.RobotModel`) plus the
+seeded MJCF chain fixture in `tests/jointKF/_fixture.py`, which drives the SAME
+adapter as production — so the armature oracle is a genuine two-model comparison
+rather than one hand writing both sides. 65 tests, covering the six required
+independent-route checks (FK vs hand-rolled, Jacobians vs `jax.jacobian`, `qM`
+vs kinetic energy, armature folding, symmetry/PD, consistent-motion).
+
+### CLAUDE.md §2's armature shorthand is WRONG as written
+
+§2 justifies the MJCF-`armature` path with "armature never touches `M_bb`/`M_jb`,
+so `(M_jj + diag(arm)) - M_jb M_bb^-1 M_bj = Lambda + diag(arm)` — algebraically
+identical", and G3 asserts that equivalence to 1e-12.
+
+That holds only when armature sits on **filtered joints alone**. A **gap joint is
+a nuisance DoF that carries armature**, so its rotor inertia lands in `M_bb` and
+is felt through the marginalisation. Verified independently:
+
+| configuration | `max abs( Schur(M+diag(a)) - [Schur(M) + diag(a_j)] )` |
+|---|---|
+| armature on filtered joints only | **0.0** (exact) |
+| gap joints also carry armature | **3.5e-3** (1.2e-4 relative) |
+
+**This is not hypothetical for Alex: the ankles ARE gap joints** (unfiltered,
+because there are no foot IMUs) **and they DO carry rotor inertia** (`ANKLE_Y
+0.07`, `ANKLE_X 0.05` in the table). So the G3 oracle as specified would fail on
+the real robot, not because the port is wrong but because the identity it asserts
+is false in that configuration.
+
+Note §2 is not self-inconsistent — its own parameter table already says "nuisance
+rotor diag on gap joints, zero on base 6 DoF", i.e. Java *does* carry rotor on
+gap joints. MJX and Java agree; it is the prose shorthand that overreaches.
+
+**Consequence for `process.py`:** `Lambda_eff = Lambda_bare + diag(rotor)` must
+not be written as a general identity. Both pinned as separate tests: (a) the
+shift applies to both partitions; (b) with armature on filtered joints only it
+*is* an exact post-Schur diagonal add.
+
+### `mass_matrix` had two spellings, one tested and one used
+
+Mutation M3 (`+1e-6*I` on `mass_matrix`) left the entire model suite green: every
+oracle read `evaluate()`, while `mass_matrix` recomputed `qM` by an independent
+route. Two spellings of one quantity — the tested one and the used one — which is
+CONTRACT_CARD §8's failure mode exactly, and was found only because the mutation
+was actually run. Fixed by routing both through a single `_mass_matrix(d)`, plus
+`test_accessors_agree_with_the_single_pass`.
+
+### MJX conventions and a G9/G10 risk
+
+- `mjx.jac(...)` returns `(nv, 3)` — **transposed** relative to the MuJoCo C API.
+- `d.site_xmat` is already `(nsite, 3, 3)` in MJX (a flat 9-vector in the C API).
+- mujoco 3.10 changed the signature to `mj_fullM(model, data, dst)`.
+- MuJoCo rejects `diaginertia` violating the triangle inequality; the fixture
+  parameterises principal moments as pairwise sums.
+
+**XLA CPU compile time explodes with kinematic depth**: jitting the position
+pipeline costs ~1.3 s at 4 links, ~1.7 s at 6, and **~240 s at 10** (isolated to
+`mjx.kinematics`, ~336 s). Eager `vmap` over 20 configs is ~7 s regardless, so
+the fixture batch is eager-vmapped and jit-ability is asserted separately on the
+shallowest shape. **This is a live risk for G9/G10**, where the jitted fused step
+must run against full Alex; `lax.scan` over bodies rather than MJX's unrolled
+per-level tracing is the likely lever. Flagged, not solved.
+
+### Open question for B1
+
+Which frame `b_omega` lives in is **not** constrained by anything ported so far.
+The seam chose the **child site frame** for `relative_gyro_jacobian` (Java's
+`GeometricJacobianCalculator` convention, and `state.py` stores bias per-IMU in
+its own frame). The stacked oracle is what will actually decide it.

@@ -24,12 +24,11 @@ for the nuisance gather and for `Lambda_eff = Lambda + diag(rotor)`.  Pinning th
 means a MuJoCo upgrade that changes either fails in this file, against a 4-joint
 chain, rather than at G9 against full Alex.
 
-Performance note: MJX evaluated eagerly, once per configuration, dominates the
-runtime of this file.  Every model call therefore goes through `_evaluated()`,
-which jits+vmaps each entry point over **one shared batch** of `N_Q` random
-configurations and caches the result -- so the whole file pays four traces per
-shape, not four hundred.  That is also the repo convention (`CONTRACT_CARD.md` §7:
-vmap the trial loop rather than Python-looping it).
+Performance note: an MJX position pass costs seconds, so every model call goes
+through `_evaluated()`, which vmaps `MjxModel.evaluate` over **one shared batch**
+of `N_Q` random configurations and caches the result -- the whole file pays one
+MJX trace per shape, not one per assertion.  That is also the repo convention
+(`CONTRACT_CARD.md` §7: vmap the trial loop rather than Python-looping it).
 """
 from functools import lru_cache
 
@@ -65,18 +64,18 @@ def _configs(name: str) -> np.ndarray:
 
 @lru_cache(maxsize=None)
 def _evaluated(name: str, armature: bool = True) -> dict:
-    """Every model quantity, jitted+vmapped over `_configs(name)`, computed once."""
+    """Every model quantity, vmapped over `_configs(name)`, computed once.
+
+    Deliberately **not** wrapped in `jax.jit`: XLA's CPU compile time for MJX's
+    position pipeline grows explosively with kinematic depth on this machine
+    (~1.3 s for the 4-link chain, ~240 s for the 10-link one), while eager vmap
+    over all 20 configurations costs a few seconds regardless.  `jit`-ability is a
+    real requirement (I7) and is asserted separately, on the shallowest shape.
+    """
     ch = fixture(name, armature=armature)
     qs = jnp.asarray(_configs(name))
-    ev = lambda f: np.asarray(jax.jit(jax.vmap(f))(qs))
-    return {
-        "q": np.asarray(qs),
-        "M": ev(ch.model.mass_matrix),
-        "site_pos": ev(lambda q: ch.model.site_poses(q)[0]),
-        "site_rot": ev(ch.model.site_rotations),
-        "J_ang": ev(ch.model.site_angular_jacobians),
-        "J_rel": ev(ch.model.relative_gyro_jacobian),
-    }
+    ev = jax.vmap(ch.model.evaluate)(qs)
+    return {"q": np.asarray(qs)} | {k: np.asarray(v) for k, v in ev._asdict().items()}
 
 
 def _hat(w):
@@ -135,10 +134,12 @@ def test_convention_free_joint_dofs_are_world_linear_then_world_angular(chain):
 def test_convention_armature_is_an_exact_diagonal_add_to_qM(chain):
     """`M(armature) - M(0) == diag(dof_armature)`, exactly, at 20 configurations.
 
-    This is the entire basis of the G3 armature-equivalence claim: because the add
-    touches neither `M_bb` nor `M_jb`, the Schur complement inherits it verbatim,
-    so `Lambda_eff = Lambda + diag(rotor)` needs no post-Schur term -- and adding
-    one anyway is the double-add trap (`CLAUDE.md` §6).
+    The foundation of the G3 armature-equivalence claim: the add is diagonal and
+    touches `M_jb` not at all, so `jointKF/process.py` gets its rotor inertia for
+    free out of `qM` and must never add it a second time post-Schur (`CLAUDE.md`
+    §6, the double-add trap).  How that diagonal propagates through the Schur
+    complement is a separate statement -- see the two tests below, which are more
+    careful about it than the §2 shorthand.
     """
     arm = np.asarray(chain.model.mj_model.dof_armature, dtype=float)
     assert np.all(arm[6:] > 0.0) and np.all(arm[:6] == 0.0), "fixture arms the hinges only"
@@ -150,22 +151,65 @@ def test_convention_armature_is_an_exact_diagonal_add_to_qM(chain):
                                rtol=0.0, atol=1e-14)
 
 
-def test_armature_passes_through_the_schur_complement(chain):
-    """`Schur(M_arm) == Schur(M_0) + diag(rotor_j)` -- the claim G3 actually needs.
+def _schur(M, j, b):
+    """`Lambda = M_jj - M_jb M_bb^-1 M_bj` -- the reference form, explicit solve."""
+    return M[np.ix_(j, j)] - M[np.ix_(j, b)] @ np.linalg.solve(M[np.ix_(b, b)], M[np.ix_(b, j)])
 
-    The diagonal add lands entirely inside `M_jj`, so the marginalisation of the
-    nuisance DoFs cannot see it.  Stated separately from the `qM` identity above
-    because *this* is the sentence `jointKF/process.py` is allowed to rely on.
+
+def test_armature_enters_the_schur_complement_on_both_partitions(chain):
+    """`Schur(M + diag(a)) == Schur(M_0 shifted by a on **both** j and b)`.
+
+    Careful with `CLAUDE.md` §2's shorthand "armature never touches `M_bb`".  It
+    is true of the *base* six DoFs, which carry no armature -- but a **gap joint**
+    is a nuisance DoF that does, so its rotor inertia legitimately lands inside
+    `M_bb` and is felt through the marginalisation.  Java does the same thing
+    (§2: "nuisance rotor diag on gap joints, zero on the base 6 DoF"), so the two
+    agree; what does *not* hold in general is the naive
+    `Lambda_eff = Lambda + diag(rotor_j)`.  See the next test for the exact
+    condition under which it does.
     """
     j, b = chain.dof_joint, chain.dof_nuisance
     arm = np.asarray(chain.model.mj_model.dof_armature, dtype=float)
-
-    def schur(M):
-        return M[np.ix_(j, j)] - M[np.ix_(j, b)] @ np.linalg.solve(M[np.ix_(b, b)], M[np.ix_(b, j)])
+    assert np.any(arm[b] > 0.0), "this shape must have armed gap joints, or the test is vacuous"
 
     M, M0 = _evaluated(chain.name)["M"], _evaluated(chain.name, armature=False)["M"]
     for k in range(5):
-        np.testing.assert_allclose(schur(M[k]), schur(M0[k]) + np.diag(arm[j]),
+        shifted = M0[k] + np.diag(arm)
+        np.testing.assert_allclose(_schur(M[k], j, b), _schur(shifted, j, b), rtol=0.0, atol=1e-12)
+
+
+def test_armature_on_filtered_joints_alone_is_a_post_schur_diagonal_add(chain):
+    """`Schur(M_0 + diag(a_j)) == Schur(M_0) + diag(a_j)`, exactly -- the G3 claim.
+
+    With armature **only** on the filtered joints, the add lands entirely inside
+    `M_jj` and the marginalisation cannot see it, so MuJoCo's pre-Schur armature
+    and Java's post-Schur rotor term are the same number.  That equivalence is what
+    retires the double-add trap (`CLAUDE.md` §6): `jointKF/process.py` must take
+    `Lambda_eff` straight from the MJX `qM` and never add rotor inertia again.
+
+    A third model is built here (armature on the filtered joints, zero on the gap
+    joints) rather than reusing a fixture, because the fixture arms every joint --
+    and on that model the identity above is *false*, which is precisely the
+    distinction worth pinning.
+    """
+    from invariant_estimation.model.mjx_model import MjxModel
+    from jointKF._fixture import chain_geometry, chain_mjcf
+
+    shape = next(s for s in SHAPES if s["name"] == chain.name)
+    g = chain_geometry(shape)
+    filtered_only = np.zeros_like(g.armature)
+    filtered_only[chain.chain_joint_of_filtered] = g.armature[chain.chain_joint_of_filtered]
+    model = MjxModel.from_xml_string(
+        chain_mjcf(shape, g._replace(armature=filtered_only)),
+        site_names=chain.model.site_names, pairs=tuple(shape["pairs"]),
+    )
+
+    j, b = chain.dof_joint, chain.dof_nuisance
+    rotor = filtered_only[chain.chain_joint_of_filtered]
+    M0 = _evaluated(chain.name, armature=False)["M"]
+    for k in range(3):
+        M = np.asarray(model.mass_matrix(_configs(chain.name)[k]))
+        np.testing.assert_allclose(_schur(M, j, b), _schur(M0[k], j, b) + np.diag(rotor),
                                    rtol=0.0, atol=1e-12)
 
 
@@ -182,8 +226,8 @@ def test_site_fk_matches_hand_rolled_chain_fk(chain):
     g, ev = chain.geometry, _evaluated(chain.name)
     for k, q in enumerate(ev["q"]):
         p_link, R_link = chain.forward(_chain_q(chain, q))
-        expect_p = np.stack([p_link[l] + R_link[l] @ g.site_pos[s] for s, l in enumerate(g.site_link)])
-        expect_R = np.stack([R_link[l] @ quat_to_mat(g.site_quat[s]) for s, l in enumerate(g.site_link)])
+        expect_p = np.stack([p_link[b] + R_link[b] @ g.site_pos[s] for s, b in enumerate(g.site_link)])
+        expect_R = np.stack([R_link[b] @ quat_to_mat(g.site_quat[s]) for s, b in enumerate(g.site_link)])
         np.testing.assert_allclose(ev["site_pos"][k], expect_p, rtol=0.0, atol=1e-10)
         np.testing.assert_allclose(ev["site_rot"][k], expect_R, rtol=0.0, atol=1e-10)
 
@@ -211,8 +255,8 @@ def _site_rotations_jax(chain: ChainFixture, q_chain, u):
         R_joint = jnp.eye(3) + jnp.sin(angle) * K + (1.0 - jnp.cos(angle)) * (K @ K)
         R = R @ jnp.asarray(quat_to_mat(g.link_quat[i])) @ R_joint
         R_link.append(R)
-    return jnp.stack([R_link[l] @ jnp.asarray(quat_to_mat(g.site_quat[s]))
-                      for s, l in enumerate(g.site_link)])
+    return jnp.stack([R_link[b] @ jnp.asarray(quat_to_mat(g.site_quat[s]))
+                      for s, b in enumerate(g.site_link)])
 
 
 def test_site_angular_jacobian_matches_autodiff_of_fk(chain):
@@ -345,7 +389,7 @@ def test_mass_matrix_blocks_are_the_documented_gathers(chain):
     q = _configs(chain.name)[0]
     M = _evaluated(chain.name)["M"][0]
     j, b = chain.dof_joint, chain.dof_nuisance
-    blocks = jax.jit(chain.model.mass_matrix_blocks)(q)
+    blocks = chain.model.mass_matrix_blocks(q)
     np.testing.assert_allclose(np.asarray(blocks.jj), M[np.ix_(j, j)], rtol=0.0, atol=0.0)
     np.testing.assert_allclose(np.asarray(blocks.jb), M[np.ix_(j, b)], rtol=0.0, atol=0.0)
     np.testing.assert_allclose(np.asarray(blocks.bb), M[np.ix_(b, b)], rtol=0.0, atol=0.0)
@@ -390,8 +434,8 @@ def test_apply_consistent_motion_agrees_with_mjx_kinematics(chain):
     cm = chain.apply_consistent_motion(q, qd)
     assert np.all(cm.qvel[:6] == 0.0), "consistent motion must command zero base twist"
 
-    R = np.asarray(jax.jit(chain.model.site_rotations)(cm.qpos))
-    J = np.asarray(jax.jit(chain.model.site_angular_jacobians)(cm.qpos))
+    ev = chain.model.evaluate(cm.qpos)
+    R, J = np.asarray(ev.site_rot), np.asarray(ev.J_ang)
     np.testing.assert_allclose(R, cm.site_rot, rtol=0.0, atol=1e-12)
     omega_world = J @ cm.qvel
     for k in range(chain.m):
@@ -402,6 +446,27 @@ def test_apply_consistent_motion_agrees_with_mjx_kinematics(chain):
 # ---------------------------------------------------------------------------
 # Adapter hygiene
 # ---------------------------------------------------------------------------
+
+def test_accessors_agree_with_the_single_pass(chain):
+    """`evaluate(q)` and the individual accessors must be the same numbers.
+
+    Every oracle above reads `evaluate`; the estimator may reach for
+    `mass_matrix` / `relative_gyro_jacobian`.  Without this test a mutation to one
+    path is invisible to the other -- which is not hypothetical: the Phase 0b
+    mutation check found exactly that hole (a perturbed `mass_matrix` passed the
+    whole file because `evaluate` recomputed `qM` independently).
+    """
+    q = _configs(chain.name)[0]
+    ev = _evaluated(chain.name)
+    np.testing.assert_array_equal(np.asarray(chain.model.mass_matrix(q)), ev["M"][0])
+    np.testing.assert_array_equal(np.asarray(chain.model.relative_gyro_jacobian(q)), ev["J_rel"][0])
+    np.testing.assert_array_equal(np.asarray(chain.model.site_angular_jacobians(q)), ev["J_ang"][0])
+    pos, rot = chain.model.site_poses(q)
+    np.testing.assert_array_equal(np.asarray(pos), ev["site_pos"][0])
+    np.testing.assert_array_equal(np.asarray(rot), ev["site_rot"][0])
+    np.testing.assert_array_equal(np.asarray(chain.model.site_positions(q)), ev["site_pos"][0])
+    np.testing.assert_array_equal(np.asarray(chain.model.site_rotations(q)), ev["site_rot"][0])
+
 
 def test_implements_the_robot_model_protocol():
     """`MjxModel` satisfies `robot.RobotModel` -- the seam the estimator depends on."""
