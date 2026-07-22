@@ -101,11 +101,22 @@ class TickDiagnostics(NamedTuple):
 
     The Java filter publishes these as YoVariables; here they are a pytree so a
     scan can stack them over a trajectory without any host callback.
+
+    The per-channel NIS fields are kept **separate** rather than merged into one
+    array.  Java dispatches its diagnostics on an exact-match label string
+    (``"encoder"`` vs ``"encoderVelocity"``), which cannot cross a jit boundary;
+    separate fields port the *observable* that dispatch existed to provide — one
+    channel structurally cannot publish into another's diagnostic.  The
+    direct-velocity channel's cross-talk guard (`velocity.py`) asserts exactly
+    this, and it only holds end-to-end because the encoder channel writes the
+    encoder field and nothing else does.
     """
 
     encoder_nis: Array
+    encoder_nis_per_joint: Array
     encoder_applied: Array
     stacked_nis: Array
+    stacked_nis_per_row: Array
     stacked_applied: Array
     encoder_cond: Array
     stacked_cond: Array
@@ -178,8 +189,10 @@ def step(
 
     diagnostics = TickDiagnostics(
         encoder_nis=enc_info.nis,
+        encoder_nis_per_joint=enc_info.nis_per_row,
         encoder_applied=enc_info.was_applied,
         stacked_nis=stk_info.nis,
+        stacked_nis_per_row=stk_info.nis_per_row,
         stacked_applied=stk_info.was_applied,
         encoder_cond=enc_info.condition_proxy,
         stacked_cond=stk_info.condition_proxy,

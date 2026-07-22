@@ -1094,3 +1094,54 @@ contribution at all. What actually fails is the bias estimate (which drifts to
 |b| ~ 1.8) and the cross-joint velocity correlation (the shared Jacobian is the
 only thing that could induce it). So the guard clause constrains observability of
 velocity *somehow*, not observability *through the gyros*.
+
+---
+
+## Phase 3 — the decisive stacked oracle, and the bug it found
+
+`tests/jointKF/test_stacked_oracle.py`: the feet-active half of
+`JointLevelKFStackedOracleTest` (12 trials, tol 1e-5). The pairs-only half lives
+in `test_measurement.py`. The plan reserves this one for the parent because it is
+where `measure.py`, `anchors.py` and `update.py` must *compose*, and a wrong
+answer is not locally detectable by any single one of them.
+
+It earned its keep: **12/12 trials failed on first run**, off by 2e-4..9e-4
+against a 1e-5 tolerance.
+
+### `R_anchor` was missing the base IMU's own gyro noise, and every cross-term
+
+The reference's base-IMU row has a zero joint Jacobian, so
+`z_base = omega_base + b_base + v_base` with `v_base ~ N(0, Sigma_base)`, and its
+anchor row asserts `J_leg qdot + omega_base = v_anchor` with
+`v_anchor ~ N(0, Sigma_eps)`. Eliminating `omega_base` between the two gives the
+port's anchor row exactly:
+
+    z_base = -J_leg qdot + b_base + (v_anchor - v_base)
+
+So the anchor row's noise is `Sigma_eps + Sigma_base`, **and** it is correlated
+with every pair row that touches the base IMU — through that same shared
+`v_base`. CLAUDE.md §2 specifies `R_anchor = Sigma_eps + J_U diag(sigma^2) J_U^T`,
+which drops both terms; Java does the same, and B2 flagged the omission when
+porting it (`Sigma_base ~ 1e-4` against `anchor_var = 4e-4` is not negligible).
+
+**Fix**: run the `L Sigma L^T` congruence over the WHOLE stacked measurement
+rather than over the pair block alone, and *add* the anchor's slip noise on top
+instead of substituting it. Both missing terms then fall out for free, because
+`L` already carries the anchor's `+I3` on the base-IMU bias columns — B1 had
+built `L` that way so `H[:, 2n:2n+3m] == L` would hold for the whole stacked
+Jacobian, which turned out to be exactly the structure the correct noise model
+needs. This is invariant I6 extending to the anchors: the congruence is the
+model, and anything assembled block-by-block loses the correlations it encodes.
+
+Masking is unaffected: an untrusted anchor has its `H` rows zeroed, so its `L`
+rows are zero, the congruence contributes nothing, and the block stays exactly
+`r_large * I3` with zero cross-terms — which is also what keeps it structurally
+decoupled for `update.py`'s informative-row condition proxy.
+
+**This is a genuine correctness improvement over the Java implementation**, not a
+port artefact. The Java filter under-states its anchor noise by `Sigma_base` and
+treats the anchor as independent of the gyro rows it is derived from. The
+consequence is over-trusting the anchor, which feeds the base gyro-bias estimate
+the downstream InEKF integrates directly into orientation — the exact quantity
+`SIGMA_QD_UNFILTERED`'s "erring large is safe, erring small is not" comment warns
+about.

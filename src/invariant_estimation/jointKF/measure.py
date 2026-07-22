@@ -346,21 +346,43 @@ def build_stacked(
         jnp.eye(3 * K, dtype=jnp.float64) * params.r_large,
     )
     z_anchor = per_row * jnp.asarray(anchor.z, dtype=jnp.float64)
-    H_anchor = jnp.asarray(anchor.H, dtype=jnp.float64)
+    # Mask `H` here rather than trusting the caller to have done it. `anchors.py`
+    # masks too (idempotent), but the masking rule has to hold for ANY caller
+    # following the seam contract -- and it is load-bearing twice over: it is what
+    # zeroes the untrusted anchor's `L` rows, so the congruence below leaves that
+    # block exactly `r_large * I3` with no cross-terms, which in turn is what
+    # makes it structurally decoupled for `update.py`'s condition proxy.
+    H_anchor = per_row[:, None] * jnp.asarray(anchor.H, dtype=jnp.float64)
 
     # -- stack --------------------------------------------------------------
     H = jnp.concatenate([H_pair, H_anchor], axis=0)
     z = jnp.concatenate([z_pair, z_anchor], axis=0)
-    R = jnp.zeros((rows, rows), dtype=jnp.float64)
-    R = R.at[:3 * P, :3 * P].set(R_pair)
-    R = R.at[build.anchor_row0:, build.anchor_row0:].set(R_anchor)
 
-    # `L` spans all rows so that `H[:, 2n:2n+3m] == L` holds for the WHOLE
-    # stacked Jacobian, as `testBiasColumnsOfHgAreExactlyL` asserts. The anchor
-    # rows' own bias columns come from `anchors.py` -- an anchor's noise is slip
-    # (`Sigma_eps`) plus the unfiltered-velocity pushforward, not gyro noise, so
-    # it is NOT part of the `L Sigma L^T` congruence.
+    # `L` spans all rows, so `H[:, 2n:2n+3m] == L` holds for the WHOLE stacked
+    # Jacobian (`testBiasColumnsOfHgAreExactlyL`).
     L = jnp.concatenate([L_pair, H_anchor[:, 2 * n:]], axis=0)
+
+    # The congruence runs over the WHOLE stacked measurement, anchors included.
+    #
+    # An anchor row is written in terms of the base IMU's own *measured* rate --
+    # eliminating `omega_base` between the reference's base-gyro row and its
+    # absolute-rate constraint leaves `z_base = -J_leg qdot + b_base +
+    # (v_anchor - v_base)`. So the anchor row inherits `Sigma_base`, AND it is
+    # correlated with every pair row that touches the base IMU, through exactly
+    # that shared `v_base`. Both terms fall out of `L Sigma L^T` because `L`
+    # already carries the anchor's `+I3` on the base-IMU bias columns.
+    #
+    # Building the anchor block as a separate diagonal entry -- which is what
+    # CLAUDE.md §2's `R_anchor = Sigma_eps + J_U diag(sigma^2) J_U^T` says, and
+    # what Java does -- drops both terms. The stacked oracle sees it: 12/12
+    # trials off by 2e-4..9e-4 against a 1e-5 tolerance. See PORT_NOTES.md.
+    #
+    # Masking still works: an untrusted anchor has its `H` rows zeroed, so its
+    # `L` rows are zero, the congruence contributes nothing there, and the block
+    # stays exactly `r_large * I3` with zero cross-terms -- which is also what
+    # keeps it structurally decoupled for `update.py`'s condition proxy.
+    R = L @ Sigma @ L.T
+    R = R.at[build.anchor_row0:, build.anchor_row0:].add(R_anchor)
 
     return StackedMeasurement(H=H, z=z, R=R, L=L)
 

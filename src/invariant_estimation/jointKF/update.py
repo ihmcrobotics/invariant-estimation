@@ -120,6 +120,19 @@ class UpdateInfo(NamedTuple):
     was_applied : Array, scalar float
         ``1.0`` if the gain was applied, ``0.0`` if the update was skipped.
         Java `wasLastUpdateApplied`.
+    nis_per_row : Array, shape (k,)
+        Per-row ``ν_i² / S_ii``.  ``NaN`` when gated, same convention as `nis`.
+
+        The aggregate `nis` cannot localise a fault: the whole point of the Java
+        per-joint `jointKF_encNIS_<joint>` diagnostic is to say *which* encoder
+        went bad, and a single scalar over all rows cannot.  For a diagonal
+        channel (encoders, direct velocity) each row is an independent
+        ``chi²₁``, which is exactly what the NIS-consistency tests assert.
+
+        Note this is the per-row *marginal* statistic, not a decomposition of
+        `nis` — they agree only when ``S`` is diagonal.  For the correlated
+        stacked gyro measurement the marginals are still individually
+        interpretable, but they do not sum to `nis`.
     """
 
     nu: Array
@@ -127,6 +140,7 @@ class UpdateInfo(NamedTuple):
     nis: Array
     condition_proxy: Array
     was_applied: Array
+    nis_per_row: Array
 
 
 def joseph_update(
@@ -236,6 +250,7 @@ def joseph_update(
     # S) times 0.0 is still NaN.
     K = jnp.where(applied, K, jnp.zeros_like(K))
     nis = jnp.where(applied, nu @ cho_solve(factor, nu), jnp.nan)
+    nis_per_row = jnp.where(applied, nu ** 2 / jnp.diag(S), jnp.nan)
 
     x_new = x + K @ nu
     P_new = joseph_covariance(P, K, Hs, Rs)
@@ -252,4 +267,5 @@ def joseph_update(
         nis=nis,
         condition_proxy=condition_proxy,
         was_applied=was_applied,
+        nis_per_row=nis_per_row,
     )

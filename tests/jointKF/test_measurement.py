@@ -568,11 +568,34 @@ def test_inactive_anchor_rows_are_masked_not_removed():
     assert_all_close(z[r0 + 3:], np.zeros(3), 0.0, "untrusted anchor residual zeroed")
 
     R = np.asarray(sm.R)
-    assert_all_close(R[r0:r0 + 3, r0:r0 + 3], 4.0e-4 * np.eye(3), 0.0, "trusted anchor noise")
-    assert_all_close(R[r0 + 3:, r0 + 3:], PARAMS.r_large * np.eye(3), 0.0, "untrusted anchor -> R_LARGE")
+    L = np.asarray(sm.L)
+    Sigma = np.kron(np.eye(build.n_imus), np.eye(3)) * 0.0
+    for k in range(build.n_imus):
+        Sigma[3 * k:3 * k + 3, 3 * k:3 * k + 3] = np.asarray(build.gyro_sigma[k])
+
+    # A TRUSTED anchor's noise is its own slip term PLUS the base IMU's gyro
+    # noise, which it inherits by being written in terms of that IMU's measured
+    # rate (see test_stacked_oracle.py for the derivation, and PORT_NOTES.md for
+    # the 12/12 oracle failure that found it). So the congruence runs over the
+    # whole stacked `L` and the slip term is ADDED, not substituted.
+    want_trusted = 4.0e-4 * np.eye(3) + L[r0:r0 + 3] @ Sigma @ L[r0:r0 + 3].T
+    assert_all_close(R[r0:r0 + 3, r0:r0 + 3], want_trusted, 1.0e-15, "trusted anchor noise")
+
+    # An UNTRUSTED anchor is masked to exactly `r_large * I3` -- its `L` rows are
+    # zeroed, so the congruence adds nothing and the block is not merely close to
+    # `r_large * I3` but equal to it. That exactness is what keeps the row
+    # structurally decoupled for `update.py`'s condition proxy.
+    assert_all_close(R[r0 + 3:, r0 + 3:], PARAMS.r_large * np.eye(3), 0.0,
+                     "untrusted anchor -> R_LARGE")
     assert np.min(np.linalg.eigvalsh(R)) > 0.0, "masked R must stay strictly PD"
-    assert_all_close(R[:r0, r0:], np.zeros((r0, 3 * K)), 0.0,
-                     "gyro and anchor noise are independent sources")
+
+    # The gyro and anchor rows are NOT independent: a trusted anchor shares the
+    # base IMU's noise with every pair row that touches it. Treating them as
+    # independent is what the stacked oracle caught.
+    assert_all_close(R[:r0, r0:r0 + 3], L[:r0] @ Sigma @ L[r0:r0 + 3].T, 1.0e-15,
+                     "trusted anchor <-> pair cross-covariance")
+    assert_all_close(R[:r0, r0 + 3:], np.zeros((r0, 3)), 0.0,
+                     "untrusted anchor contributes no cross-covariance")
 
 
 def test_shapes_are_constant_across_gyros_and_trust_masks():
