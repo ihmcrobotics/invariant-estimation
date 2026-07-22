@@ -95,6 +95,13 @@ def test_the_gate_actually_fires_on_that_measurement():
     that names a row nobody rejected is decoration.  Feeding the same `(H, R, P)`
     through `joseph_update` must trip the `cond(S)` gate and leave `(x, P)`
     bit-identical.
+
+    Note the noise level.  Java's own scenario (`R = 1e-6 I`) gives
+    `cond(S) ~ 5.2e6`, **below** the port's `cond_s_max = 1e9` — Java calls
+    `describeSingularInnovation` directly and never claims the gate fires there.
+    Tightening `R` to `1e-12 I` is the same duplicated-row degeneracy at a level
+    the gate actually rejects, which is what makes this an end-to-end statement
+    rather than a restatement of the eigendecomposition.
     """
     build = stub_build(SHAPES[0])
     dim = build.dim
@@ -103,7 +110,11 @@ def test_the_gate_actually_fires_on_that_measurement():
     H[0] = np.sin(0.31 * (c + 1.0))
     H[1] = H[0]
     H[2] = np.cos(0.17 * (c + 2.0))
-    R = 1.0e-6 * np.eye(3)
+    R = 1.0e-12 * np.eye(3)
+
+    report = describe_singular_innovation(build, H, R, np.eye(dim), channel="stacked")
+    assert {r.row for r in report.rows} == {0, 1}
+    assert report.condition_number > PARAMS.cond_s_max
 
     state = JointKFState(x=jnp.zeros(dim), P=jnp.eye(dim))
     post, info = joseph_update(state, jnp.asarray(H), jnp.zeros(3), jnp.asarray(R), PARAMS)

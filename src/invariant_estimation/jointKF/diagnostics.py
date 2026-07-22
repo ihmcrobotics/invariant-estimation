@@ -182,7 +182,7 @@ class SingularInnovationReport(NamedTuple):
 
 def _state_name(build: JointKFBuild, index: int) -> str:
     """Name a state column: `q`, `q_dot`, or an axis of some IMU's bias."""
-    n, m = build.n_joints, build.n_imus
+    n = build.n_joints
     if index < 0:
         return "none"
     if index < n:

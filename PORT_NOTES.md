@@ -1005,3 +1005,61 @@ a retrace can only push the cache *above* one entry, so that direction survives 
 full-suite run while the equality did not. Mutation-checked: introducing a
 data-dependent Python branch on `carry.trusted_feet` raises
 `ConcretizationTypeError`, which is the failure this test exists to catch.
+
+---
+
+## G8 (part) — encoder NIS, the direct-velocity channel, singular-innovation attribution
+
+`velocity.py` (the optional direct-q̇ channel, default OFF) and `diagnostics.py`
+(`per_joint_nis`, `describe_singular_innovation`). 19 tests, 5.7 s — all pure
+linear algebra on `stub_build`, no MJX.
+
+Java dispatches the two channels on an exact-match label string
+(`"encoder"` vs `"encoderVelocity"`). Strings cannot cross a jit boundary, so the
+port carries the **observable** instead: separate fields in a `ChannelDiagnostics`
+struct, which makes it *structurally* impossible for the velocity channel to
+write into the position channel's NIS. The cross-talk guard tests that.
+
+### "NIS on the posterior" — CLAUDE.md §6's named trap — survives the Java tests
+
+Mutating `S` to be built from the *posterior* `P` rather than the prior left
+**both** 4000-trial chi-square tests green. The mechanism is arithmetic, not
+luck: the shift is `1.25/1.20 = +4.2%` of the mean, against a 4-sigma envelope of
+`4*sqrt(2/4000) = 8.9%`. The statistical test cannot resolve a bias half the size
+of its own envelope, and raising the trial count to fix that would need ~4x more
+samples.
+
+So the trap CLAUDE.md warns about is invisible to the class the suite provides
+for it. Closed with a deterministic test asserting `UpdateInfo.S` equals the
+prior innovation covariance to 1e-15 — which catches it immediately, because the
+quantity is exactly specified even though its statistical consequence is not.
+
+### The Java lag-inflation test exercises the smoother without constraining it
+
+Mutating `dhat` to a **raw** finite difference (no 5 Hz low-pass) passed all
+three phases of `lagInflationTracksMeasuredSlewExactly`. On a *noiseless*
+constant/ramp/constant signal, raw and smoothed finite differences agree — and
+the Java scenario is exactly that signal. But the smoother exists precisely
+because the measurement is noisy: raw, the FD variance `2 sigma^2/dt^2` inflates
+`R` by ~2 orders at quiet standing, which is the regime the channel exists for.
+Caught only by an added noisy-standing test, where the mutation inflates `R` by
+**519x**.
+
+### Recorded, not a bug
+
+Java's `testDiagnosticNamesTheDegenerateGyroPair` scenario (`R = 1e-6 I`, one
+duplicated row) yields `cond(S) ~ 5.2e6` — *below* `cond_s_max = 1e9`, so that
+measurement would be **accepted**, not gated. Java never claims otherwise (it
+calls `describeSingularInnovation` directly rather than through the filter), so
+the port is consistent with it; but it means the diagnostic's own scenario is not
+a gating scenario. An added test tightens `R` to `1e-12 I` to make the
+end-to-end statement the diagnostic is actually for.
+
+### Follow-ups requested by the agent (parent-owned files)
+
+- `UpdateInfo` should carry `nis_per_row`. The point of the encoder NIS
+  diagnostic is to localise a bad encoder to a *joint*, which the aggregate
+  scalar cannot do; the tests currently compute it themselves, which is a smell.
+- `filter.TickDiagnostics` publishes `encoder_nis` as a scalar and does not use
+  `ChannelDiagnostics`. The cross-talk observable only holds once the encoder
+  channel writes the encoder half and nothing else does — today nothing writes it.
