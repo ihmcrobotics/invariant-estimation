@@ -71,37 +71,12 @@ def _prior(shape, seed):
 
 
 # ---------------------------------------------------------------------------
-# The transition matrix (`JointLevelKFTransitionNoiseTest`, F half)
+# The transition matrix
 # ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize("shape", SHAPES, ids=[s["name"] for s in SHAPES])
-def test_build_f_structure_and_exactness(shape):
-    """`testBuildFStructureAndExactness`: identity blocks, one `dt·I` band, no coupling.
-
-    The bias↔joint blocks being exactly zero is the load-bearing part: the gyro
-    bias is observable only through the measurement (I6), never through the
-    dynamics.
-    """
-    n, m, dim = shape_dims(shape)
-    F = np.asarray(build_transition(stub_build(shape), PARAMS))
-    assert F.shape == (dim, dim)
-    assert_all_close(F[:n, :n], np.eye(n), 1.0e-12, "F_qq")
-    assert_all_close(F[n:2 * n, n:2 * n], np.eye(n), 1.0e-12, "F_qdqd")
-    assert_all_close(F[2 * n:, 2 * n:], np.eye(3 * m), 1.0e-12, "F_bb")
-    assert_all_close(F[:n, n:2 * n], DT * np.eye(n), 1.0e-12, "F_q_qd")
-    assert_all_close(F[n:2 * n, :n], np.zeros((n, n)), 1.0e-12, "F_qd_q")
-    assert_all_close(F[:2 * n, 2 * n:], np.zeros((2 * n, 3 * m)), 1.0e-12, "F joint->bias")
-    assert_all_close(F[2 * n:, :2 * n], np.zeros((3 * m, 2 * n)), 1.0e-12, "F bias->joint")
-
-
-def test_build_f_equals_i_plus_a_dt():
-    """`testBuildFEqualsIPlusADt`: `F == I(dim)` with `F[i, n+i] = dt`, tol 1e-12."""
-    shape = single_pair(6, 1, 5)                       # n=3, m=2
-    n, _, dim = shape_dims(shape)
-    expected = np.eye(dim)
-    expected[np.arange(n), n + np.arange(n)] = DT
-    F = build_transition(stub_build(shape), PARAMS)
-    assert_all_close(F, expected, 1.0e-12, "F")
+# `testBuildFStructureAndExactness` and `testBuildFEqualsIPlusADt` live in
+# `test_transition_noise.py`, which is where the Java suite puts them
+# (`JointLevelKFTransitionNoiseTest`). Only the port-specific exactness test is
+# kept here, next to the `build_transition` it constrains.
 
 
 def test_build_f_is_exact_for_any_dt():
