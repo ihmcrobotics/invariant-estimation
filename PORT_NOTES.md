@@ -1063,3 +1063,34 @@ end-to-end statement the diagnostic is actually for.
 - `filter.TickDiagnostics` publishes `encoder_nis` as a scalar and does not use
   `ChannelDiagnostics`. The cross-talk observable only holds once the encoder
   channel writes the encoder half and nothing else does — today nothing writes it.
+
+### G8 behaviour — mutation checks (completed after the agent was paused)
+
+| mutation | caught by |
+|---|---|
+| (a) NaN sanitisation removed from `update.py` | **NOT** by either behaviour file — only by `test_update.py::test_gradients_are_finite_through_a_non_finite_measurement[H]` |
+| (b) anchor block zeroed (base bias unobservable) | `test_whole_filter.py::test_stance_phase_bias_convergence` |
+| (c) stacked-measurement velocity columns zeroed | `test_bias_stays_small_with_zero_true_bias`, `test_covariance_embeds_kinematic_coupling` |
+
+Two of the three were caught by a *different* test than expected, and both
+discrepancies are worth keeping:
+
+**(a) The NaN sanitisation is load-bearing for gradients, not for values.** The
+forward pass is already safe without it, because `jnp.where(applied, ...)` selects
+the clean prior once the finiteness gate fires — so no NaN reaches `(x, P)` and
+every behavioural NaN-hardening assertion passes. What breaks is reverse-mode:
+the untaken branch of a `jnp.where` still propagates NaN into the cotangent
+(`NaN * 0 = NaN`), so the *gradient* goes non-finite. That matters here rather
+than being academic — CLAUDE.md §7 requires **no `stop_gradient`** between the
+ContactNet provider and either filter, so this filter is differentiated through
+during BPTT training. A behaviour-only test suite cannot constrain this.
+
+**(c) Velocity convergence does not require the gyro velocity channel.** The
+`test_velocity_converges` clause (including the `max|v_est| > 0.5 * peak` guard
+that exists specifically to check velocity is *observed*) still passes with the
+stacked measurement's `q_dot` columns zeroed: the double integrator plus encoder
+positions lets the filter infer velocity by differencing, with no gyro
+contribution at all. What actually fails is the bias estimate (which drifts to
+|b| ~ 1.8) and the cross-joint velocity correlation (the shared Jacobian is the
+only thing that could induce it). So the guard clause constrains observability of
+velocity *somehow*, not observability *through the gyros*.
