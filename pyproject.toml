@@ -24,7 +24,9 @@ docs = "invariant_estimation._docs:serve"
 docs-build = "invariant_estimation._docs:build"
 
 [dependency-groups]
-dev = ["pytest"]
+# zstandard decodes robotData.bsz for the Java-parity harness (replay/logsource.py).
+# Dev-only: the estimator itself never reads a log.
+dev = ["pytest", "zstandard"]
 docs = [
     "furo>=2025.12.19",
     "myst-parser>=5.1.0",

@@ -265,6 +265,22 @@ def default_params(**overrides: Any) -> JointKFParams:
 # Build-time name tables (plain Python -- invariant I7, no strings in jit)
 # ---------------------------------------------------------------------------
 
+def _ci_get(table: dict[str, float], name: str) -> float | None:
+    """Case-insensitive **exact** lookup, mirroring Java's per-joint sensor tables.
+
+    ``AlexSensorNoiseParameters`` keys its encoder-noise maps in lowercase and
+    looks up ``jointName.toLowerCase()``; the MuJoCo joint names arrive uppercase
+    (``LEFT_HIP_X``).  This folds both sides so the config author can write either
+    case.  Exact, not substring: these are per-joint measured values, so
+    ``LEFT_HIP_X`` must never inherit ``HIP_X``'s entry the way the rotor table
+    (`_substring_lookup`) deliberately does.
+    """
+    if not table:
+        return None
+    lowered = {str(k).lower(): v for k, v in table.items()}
+    return lowered.get(name.lower())
+
+
 def _substring_lookup(name: str, table: dict[str, float], default: float) -> float:
     """Case-insensitive **substring** match, Java `reflectedRotorInertiaForNameOrDefault`.
 
@@ -319,7 +335,7 @@ def encoder_var_for_name(name: str, cfg: dict[str, Any] | None = None) -> tuple[
     at boot").
     """
     cfg = cfg if cfg is not None else section("joint_kf")
-    std = cfg.get("encoder_pos_std", {}).get(name)
+    std = _ci_get(cfg.get("encoder_pos_std", {}), name)
     if std is None or not np.isfinite(std) or std <= 0.0:
         return cfg["encoder_var"], False
     return float(std) ** 2, True
@@ -385,6 +401,14 @@ class JointKFBuild(NamedTuple):
     dof_joint: Array                # (n,)  MJX DoF index of each filtered joint
     dof_nuisance: Array             # (n_nuisance,)  base 6 DoF + gap joints
     use_mass_matrix: bool           # False => scalar-CWNA fallback path
+
+    # -- anchor-chain gather indices ----------------------------------------
+    # DoFs of the unfiltered joints on the base->foot anchor chains, in
+    # `anchor_unfiltered_mask` column order. A SEPARATE set from `dof_nuisance`:
+    # Alex's ankles belong here but are off the root->filtered paths, so they are
+    # locked (not marginalised) in `M`. Empty tuple => fall back to the trailing
+    # slice of `dof_nuisance` (the pre-decoupling layout the fixtures build).
+    dof_anchor_unfiltered: Array = ()
 
     # -- derived ------------------------------------------------------------
     @property

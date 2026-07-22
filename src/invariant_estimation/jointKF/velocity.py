@@ -85,7 +85,7 @@ import numpy as np
 from jax import Array
 
 from ..config import section
-from .state import JointKFBuild, JointKFParams, JointKFState
+from .state import _ci_get, JointKFBuild, JointKFParams, JointKFState
 from .update import UpdateInfo, joseph_update
 
 __all__ = [
@@ -141,7 +141,7 @@ def velocity_var_for_name(
     """
     cfg = cfg if cfg is not None else section("joint_kf")
     table = lookup if lookup is not None else cfg.get("encoder_vel_std", {})
-    std = table.get(name)
+    std = _ci_get(table, name)
     if std is None or not np.isfinite(std) or std <= 0.0:
         return float(cfg["sigma_qd_unfiltered"]) ** 2, False
     return float(std) ** 2, True

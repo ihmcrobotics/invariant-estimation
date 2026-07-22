@@ -1227,3 +1227,162 @@ jit-cache one) was caught only by running the full suite in a different order.
    construction. Wiring them is a config task, not a code one.
 4. **The direct-velocity channel is default OFF** and has no config key for the
    drive corner frequency (it is a builder argument).
+
+---
+
+## Replay parity — `diag(Qa)` vs the 2026-07-17 Alex001 log
+
+`jointKF_QaDiag_<joint>` is a pure function of `q`, so it can be recomputed tick
+by tick with zero error accumulation. It was reading **14.4% high on the legs and
+14.4% LOW on the spine** — a stable, opposite-signed ratio that ruled out every
+scalar explanation. `alpha`, `tau_max` and the rotor table were byte-compared
+against `JointLevelKFPreFilter.java`; tick offset and `q` source were swept
+(<0.3%); `Lambda` was proved base-pose invariant to 9e-15. All of it lived in
+`M(q)`.
+
+### Root cause — Mecano freezes the lumped subtree inertia at construction
+
+`CompositeRigidBodyMassMatrixCalculator(input, frame, considerIgnoredSubtreesInertia)`
+defaults the flag to `true`, so ignored subtrees *are* composited rather than
+dropped — but `rootCompositeInertia.updateIgnoredSubtreeInertia()` is called from
+the **constructor and from nowhere else**. It stores
+`MultiBodySystemTools.computeSubtreeInertia(childJoint)` as a plain
+`SpatialInertia` in the parent's body-fixed frame, and `computeMassMatrix()` then
+reuses that stored value every tick (`bodyInertia = rigidBody.getInertia() +
+bodySubtreeInertia`). The ignored subtrees are therefore welded at whatever pose
+the robot model held **when the estimator was built** — on hardware, the
+freshly-constructed model, `q = 0`.
+
+On this log the arms sit near `(shoulder 0.71, elbow -1.91)` rad and the ankles
+near `-0.40` rad **from the first tick**, so `q = 0` is never the live pose.
+Evaluating `M` with the off-path joints held at zero instead of live collapses
+the error from 14.42% to 0.21%. Fitting a scale `s` on the off-path angles gives
+a sharp unique minimum at `s = 0`:
+
+| `q_ignored` | 0 | 0.05·q | 0.1·q | 0.25·q | 0.5·q | q |
+|---|---|---|---|---|---|---|
+| max rel err | **0.21%** | 1.59% | 3.09% | 7.06% | 11.68% | 14.42% |
+
+Freezing only the arms leaves 9.8%; only the ankles, 14.9% — both groups matter,
+and they push the spine and the legs in opposite directions, which is exactly the
+sign structure the log showed.
+
+`MjxModel.qpos` already reproduced this by construction (off-path joints keep
+`qpos0`); the defect was in `tests/replay/test_java_parity.py`, whose oracle
+filled all 29 hinges from the log. The behaviour is now documented as
+load-bearing at `MjxModel.qpos` rather than left as an incidental default.
+
+### Second, independent bug — the nuisance set was two different wrong sets
+
+Java marginalises the base plus *gap* joints, where a gap joint is on a
+`root -> filtered` path without being a filter state (`collectSpanningJoints`
+minus the filtered set). On Alex there are **no** gap joints, so the nuisance
+block is exactly the base 6 DoF. Two places disagreed:
+
+* `MjxModel.dof_nuisance` was `setdiff1d(range(nv), joint_dof)` — all 26
+  non-filtered DoFs. Off-path joints are *locked*, not marginalised;
+  eliminating them models the ankles and arms as free to accelerate. Worth
+  **58%** on `diag(Qa)` (at frozen `q`; 38% at live `q`, which is how it had been
+  measured before and why it looked merely "wrong family").
+* `build.py` appended the **anchor chain's** unfiltered joints (Alex's ankles) to
+  `dof_nuisance`, conflating two genuinely different sets: the ankles are
+  anchor-chain-unfiltered but off the root->filtered paths. Worth **1.7%**.
+
+The conflation was invisible to every unit test because the route-1 serial-chain
+fixture has *no* off-path joints — there, anchor-unfiltered and gap coincide.
+`build.py` now computes gap joints properly and publishes the anchor set
+separately as `JointKFBuild.dof_anchor_unfiltered`; `anchors.unfiltered_dof`
+prefers it and keeps the old trailing-slice read only as a fallback for
+hand-built fixtures.
+
+### Residual, and whether Java is right
+
+After both fixes, per joint over 1000 consecutive ticks: mean ratio within
+**0.07%** of 1, spread ~0.05%, worst tick 0.21%. Not reducible by a tick shift
+(the -1/0/+1 sweep moves the RMS between 0.039% and 0.086%), so it is sub-tick
+sampling of `q` between the log decimation and the filter's own rate.
+`QA_REL_TOL` in the replay suite dropped 0.15 -> 0.005.
+
+A 0.2% agreement across 9 joints and 400 ticks also settles the open question of
+whether `AlexRobotModel` and the log's `model.sdf` are the same description: at
+this level of agreement on a quantity that depends on every link mass, inertia
+tensor and joint origin in the legs and torso, they are.
+
+**Java is stale here, and knowingly reproducing that is a decision.** The
+physically correct lumped inertia would track the live off-path configuration;
+Mecano's is fixed at `q = 0`, so the Java filter's `Qa` is off by up to 14%
+whenever the arms are not at zero — which, on Alex, is always. This is a genuine
+(mild) bug in `JointLevelKFPreFilter`, not in Mecano: the calculator's contract
+is that ignored subtrees are static, and the estimator ignores subtrees that
+move. The port matches Java because the replay suite measures parity; if the
+Python filter is ever run as the primary estimator, feeding live off-path angles
+is the better model and this note is the record of why the two differ.
+
+---
+
+## Hardware-log parity harness (`tests/replay/`) and the encoder-noise config gap
+
+The `replay/` module reads a real SCS2 hardware log and compares this port
+against what the Java estimator *actually published* on that run — the
+acceptance test the whole port exists to pass. See `RUNNING.md` for how to point
+it at a log. It is two tiers; only tier 1 (stateless, exact) is built so far.
+
+### The encoder-noise gap this surfaced (a real fix, not just a test)
+
+`config/filter_cfg.yaml` shipped with `encoder_pos_std: {}` and
+`encoder_vel_std: {}` (both `TODO(Lucas)`), so **every filtered joint fell back
+to the scalar `encoder_var = 5e-5`** — an implied std of 7.1e-3 rad, which is
+15x–48x larger than the measured per-joint values. A filter under-trusting its
+encoders by 2–3 orders of magnitude in variance leans far too hard on the
+IMU/model side and exports a silently wrong `Sigma_q`.
+
+Both tables are now filled from `AlexSensorNoiseParameters.java` (Lucas,
+2026-07-15 — the authoritative source, not reverse-engineered from the log). The
+2026-07-17 Alex001 log then *validates* them exactly:
+
+* `jointKF_encR_<joint>` (the Java filter's per-joint position R) equals
+  `encoder_pos_std**2` to rtol 1e-3, and is constant across the whole 630 s run.
+* `jointKF_qdR_<joint>.min()` equals `encoder_vel_std**2` — the direct-velocity
+  channel's lag-inflated R bottoms out at its `sigma**2` floor when the joint's
+  measured slew passes through zero. (The channel was ON in this flight:
+  `jointKFUseDirectVelocityMeasurement = 1`.)
+
+`tests/replay/test_sensor_noise.py` locks both, and fails loudly if the config
+ever drifts back onto the fallback. The lookups (`state.encoder_var_for_name`,
+`velocity.velocity_var_for_name`) were made case-insensitive (`state._ci_get`) to
+match Java's `getEncoderPositionNoiseStandardDeviation` (`.toLowerCase()`),
+because the source table keys are lowercase and the MuJoCo joint names are upper.
+
+### IMU-mount convention
+
+`tests/replay/test_imu_mount.py` checks the one rotation most likely to be built
+wrong: the pelvis IMU mount (yawed +90 deg on Alex). The log publishes the
+applied gyro bias in both the IMU and pelvis frames, and `urdf2mjcf`'s
+`rpy -> quat` must map one onto the other. Residual 8e-19 vs a ~5e-3 signal —
+the fixed-axis convention is correct.
+
+### Model source
+
+The port converts the `model.sdf` that ships *inside each log directory*
+(`model/urdf2mjcf.py`), not a vendored MJCF: it is by construction the exact
+description that ran, and the vendored `alex_v1_full_body_mjx.xml` both is a
+different build and currently fails to compile (zero-eigenvalue inertias on the
+massless sensor frames). The 19 zero-mass IMU/ZED frames become inertia-less
+placeholder bodies (mass 1e-12); their contribution to `M(q)` is below float64
+noise (asserted).
+
+### Not built, and why
+
+* **Gravity-leveling gate vs log** — `invariantGravityUpdateActive` is
+  reproducible in principle (it is `enabled && isQuasiStatic(a, omega, ...)`), but
+  faithfully requires the *processed* body-frame specific force the sensor
+  pipeline produces, which the port does not replicate. A raw-accel approximation
+  reproduces it to only ~80%, which is not a clean oracle. The gravity path is
+  already covered by the 14 ported `GravityLevelingUpdaterTest` unit tests; a
+  log-based gate oracle waits on a specific-force replay (tier 2).
+* **Tier 2 free-running replay** — seed from Java's state, integrate, compare
+  trajectories. Deferred: the log carries only the covariance *diagonal* (via the
+  `_upperBound`/`_lowerBound` pairs), so a clean per-tick re-seed of `P` is
+  impossible; tier 2 is a divergence test, weaker than tier 1's per-module
+  localisation, and best built once the `diag(Qa)` and sensor-noise oracles are
+  green (they now are).
