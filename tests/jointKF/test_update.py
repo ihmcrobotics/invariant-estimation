@@ -136,7 +136,6 @@ def test_joseph_matches_short_form_at_this_gain():
 def test_encoder_pull_tiny_R():
     """Encoder-only, σ_enc → 0: posterior position is pulled onto the reading."""
     n, m = 5, 0
-    p = default_params()
     st = _prior(n, m)
     q_tilde = st.q_hat + 0.3
     z, H = meas.build_measurement(q_tilde, jnp.zeros((0, 3)), jnp.zeros((0, 3)),

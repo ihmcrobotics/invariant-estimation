@@ -13,6 +13,8 @@ dependencies = [
   "jaxlie",
   "ipython",
   "pyyaml",
+  "ruff",
+  "black"
 ]
 
 [project.scripts]
@@ -42,3 +44,6 @@ package-dir = { "" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff.lint]
+ignore = ["E401", "E402", "F401"]

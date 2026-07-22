@@ -499,3 +499,85 @@ Deleted three empty placeholder modules (`inEKF/filter.py`, `routing.py`,
 gravity entry point to `gravity_leveling_update` so the package re-export stops
 shadowing the `gravity_update` *module* — the same name collision that already
 forced `importlib` imports for `correct` in two test files.
+
+---
+
+## Scan body — `inEKF/filter.py`
+
+**Status:** green (`tests/inEKF/test_filter.py`, 15 tests). No Java analogue —
+the Java `InvariantEKF` is driven by the controller's tick, so there is nothing
+to port. This is the module the MJX integration (G9/G10) and BPTT both need, and
+it did not exist: `inEKF/filter.py` was one of the 0-byte placeholders.
+
+### The tick
+
+    propagate (IMU)  ->  contact FK update  ->  gravity leveling (gated)
+
+`make_step(ekf, kinematics)` builds the `lax.scan` body; `run(...)` scans it.
+Carry is `InEKFCarry(state, gravity_ref)` — the gravity reference has to be in
+the carry because the complementary filter is stateful across ticks.
+
+### The joint-KF boundary
+
+`JointFilterOutput(q, q_dot, sigma_q, sigma_q_dot)` — full covariance matrices,
+not diagonals: the joint KF's covariance is genuinely coupled through the mass
+matrix and `J Σ_q Jᵀ` needs the off-diagonals.
+
+`b̂` is deliberately **not** in it: the InEKF consumes already-bias-corrected IMU
+(I1), so that correction happens upstream.
+
+Routing honours the §6 forbidden edges — joint-KF outputs enter only on the
+correction side, always through a kinematic Jacobian:
+
+- `N^p_i = J_{C_i} Σ_q J_{C_i}ᵀ` — **used** (`contact_position_noise`).
+- `N^v_i = J_{Ċ_i} Σ_q̇ J_{Ċ_i}ᵀ` — implemented (`contact_velocity_noise`) but
+  **not consumed**. It is the noise on the contact *zero-velocity constraint*,
+  which is a separate measurement block with its own `H` rows stacked below the
+  position block; that constraint is an open design decision (§10), and
+  inventing it here would be unasked-for cleverness in the measurement model.
+  The covariance is carried across the boundary so landing it later is a change
+  in `step` only. `TODO(N^v / zero-velocity)` marks the call site.
+
+`test_joint_outputs_do_not_reach_the_propagation` asserts the forbidden edge
+structurally: inflating `Σ_q` by 7 orders leaves the *predicted* `(X, P)`
+bit-identical.
+
+### `ContactKinematics` — the `robot/` seam
+
+`(q, q̇) -> ContactFrames(y, J, J_dot)`, closed over at build time so it is static
+under `jit`. MJX implements it at G1; the tests fill it with a smooth analytic
+fixture. `test_fixture_kinematics_are_self_consistent` checks by autodiff that
+the fixture's `J` really is `∂y/∂q` — an inconsistent fixture would make the
+`J Σ_q Jᵀ` routing tests plausible-looking fiction.
+
+### I7 — the constant-graph proof
+
+Three tests, and this is the payoff for doing the scan body before MJX:
+
+- `test_jaxpr_is_identical_across_contact_masks` — 5 mask patterns
+  (`[1,1] [1,0] [0,1] [0,0] [0.5,0.25]`) trace to a byte-identical jaxpr.
+- `test_jaxpr_is_identical_across_gate_states` — open vs closed quasi-static gate.
+- `test_step_does_not_recompile_across_masks` — `_cache_size() == 1` after
+  cycling four mask patterns through the jitted step.
+
+This is the port's analogue of the two skipped Java allocation tests: *no
+recompilation IS no per-tick allocation*. G9 reuses it on the fused estimator.
+
+Masking follows §4 exactly: an untrusted contact keeps its rows but gets
+`R_LARGE = 1e12·I₃` **and** a zeroed residual — never a dropped row (shape
+change), never a zeroed `R` row (singular `S`, §6 trap).
+`test_masked_contact_matches_excluded_contact` checks the `R_LARGE → ∞` oracle:
+the masked contact's covariance block moves < 1e-6 while the trusted one moves
+> 1e-4.
+
+### Differentiability
+
+`test_scan_is_differentiable_through_contact_covariances` takes `jax.grad` of a
+10-tick scan w.r.t. the ContactNet Cholesky factors and asserts the gradient is
+finite **and non-zero** — a dead path would otherwise pass silently. Same for
+`Σ_q` through the joint boundary. This is the BPTT prerequisite for ContactNet.
+
+### Housekeeping
+
+`inEKF/__init__.py` had picked up duplicated import and `__all__` blocks; deduped
+and now asserted clean (75 names, no duplicates, all resolving).

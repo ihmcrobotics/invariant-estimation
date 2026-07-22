@@ -114,7 +114,8 @@ def test_gamma_grad_finite_at_zero(G):
 
 def test_exp_grad_finite_at_zero():
     N = 2
-    f = lambda xi: jnp.sum(g.exp_SEn3(xi, N) ** 2)
+    def f(xi): 
+        return jnp.sum(g.exp_SEn3(xi, N) ** 2)
     grad = jax.grad(f)(jnp.zeros(3 * N + 9))
     assert jnp.all(jnp.isfinite(grad))
 

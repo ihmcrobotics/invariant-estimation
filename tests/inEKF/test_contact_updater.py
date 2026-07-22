@@ -20,12 +20,12 @@ import importlib
 
 from invariant_estimation.inEKF import group as gr
 from invariant_estimation.inEKF import state as s
+from ._oracles import assert_symmetric, next_rotation_matrix, next_vector3d
 
 # `inEKF.__init__` re-exports the function `correct`, shadowing the module of the
 # same name — import the module explicitly.
 co = importlib.import_module("invariant_estimation.inEKF.correct")
 
-from ._oracles import assert_symmetric, next_rotation_matrix, next_vector3d
 
 CONTACTS = 1
 GROUP_SIZE = 6

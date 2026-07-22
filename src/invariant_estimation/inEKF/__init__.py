@@ -6,8 +6,10 @@ the joint-KF pre-filter outputs and external ContactNet covariances on the
 correction side only (see `CLAUDE.md` for the full design record).  The filter
 holds no trainable parameters — BPTT during training flows *through* it.
 
-Build order (one module per prompt): group -> state -> propagate -> correct ->
-contact -> filter.  Implemented so far: group, state, propagate, correct, contact.
+Build order: group -> state -> propagate -> correct -> contact -> gravity_update
+-> ekf -> filter.  All implemented; `filter.step`/`filter.run` are the scan body
+and trajectory driver.  Deferred by decision: reseed, contact trust (see
+PORT_NOTES.md).
 """
 from .contact import (
     apply_floor,
@@ -31,6 +33,20 @@ from .correct import (
     no_update_diagnostics,
     predicted_contact,
     rotate_measurement_covariance,
+)
+from .filter import (
+    ContactFrames,
+    ContactKinematics,
+    InEKFCarry,
+    InEKFInputs,
+    InEKFOutputs,
+    JointFilterOutput,
+    contact_position_noise,
+    contact_velocity_noise,
+    init_carry,
+    make_step,
+    mask_contact_noise,
+    run,
 )
 from .ekf import (
     InvariantEKF,
@@ -132,6 +148,19 @@ __all__ = [
     "contact_update",
     "rotate_measurement_covariance",
     "map_encoder_noise",
+    # scan body + trajectory driver
+    "JointFilterOutput",
+    "ContactFrames",
+    "ContactKinematics",
+    "InEKFInputs",
+    "InEKFCarry",
+    "InEKFOutputs",
+    "make_step",
+    "run",
+    "init_carry",
+    "contact_position_noise",
+    "contact_velocity_noise",
+    "mask_contact_noise",
     # EKF orchestrator (G5)
     "InvariantEKF",
     "create",
