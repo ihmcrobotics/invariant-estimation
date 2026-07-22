@@ -43,6 +43,7 @@ from typing import NamedTuple
 
 import numpy as np
 
+from invariant_estimation.jointKF.build import KinematicTree
 from invariant_estimation.model.mjx_model import MjxModel
 
 from ._oracles import SHAPES, java_hash_code
@@ -353,3 +354,37 @@ def fixture(name: str, *, armature: bool = True) -> ChainFixture:
 def all_fixtures(*, armature: bool = True) -> tuple[ChainFixture, ...]:
     """All four shapes, in `SHAPES` order."""
     return tuple(fixture(s["name"], armature=armature) for s in SHAPES)
+
+
+def kinematic_tree(fixture: ChainFixture) -> KinematicTree:
+    """Describe a `ChainFixture`'s MuJoCo model as a `build.KinematicTree`.
+
+    `build.py` is deliberately model-agnostic (it takes a plain tree, not an
+    `mjx.Model`), so this adapter is what lets the *real* build run on the *real*
+    fixture geometry.  Without it the anchor tests would have to hand-write both
+    the F/U split and the Jacobians, and the F/U split is precisely the thing
+    `build.py` got wrong once already (PORT_NOTES: "anchor chains root at the
+    base IMU").
+    """
+    mj = fixture.model.mj_model
+    hinge = [j for j in range(mj.njnt) if int(mj.jnt_type[j]) == 3]
+    free = [j for j in range(mj.njnt) if int(mj.jnt_type[j]) == 0]
+    base_dofs = np.concatenate(
+        [np.arange(mj.jnt_dofadr[j], mj.jnt_dofadr[j] + 6) for j in free]
+    ) if free else np.zeros(0, dtype=int)
+    import mujoco
+    site_body = {
+        mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_SITE, s): int(mj.site_bodyid[s])
+        for s in range(mj.nsite)
+    }
+    return KinematicTree(
+        joint_names=tuple(
+            mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_JOINT, j) for j in hinge
+        ),
+        joint_body=np.array([int(mj.jnt_bodyid[j]) for j in hinge]),
+        body_parent=np.array(mj.body_parentid, dtype=int),
+        joint_dof=np.array([int(mj.jnt_dofadr[j]) for j in hinge]),
+        base_dofs=base_dofs.astype(int),
+        site_body=site_body,
+        tau_max=np.full(len(hinge), np.nan),
+    )

@@ -848,3 +848,141 @@ Which frame `b_omega` lives in is **not** constrained by anything ported so far.
 The seam chose the **child site frame** for `relative_gyro_jacobian` (Java's
 `GeometricJacobianCalculator` convention, and `state.py` stores bias per-IMU in
 its own frame). The stacked oracle is what will actually decide it.
+
+---
+
+## G7 — stacked gyro measurement + stance anchors
+
+`jointKF/measure.py` (encoder rows + stacked pair rows + `L`) and
+`jointKF/anchors.py` (stance-anchor block, F/U split, masking). 171 tests green
+in `tests/jointKF`.
+
+### `b_omega` lives in each IMU's own measurement (site) frame — confirmed
+
+This was flagged as an open question after Phase 0b, and it is now settled by
+evidence rather than convention. `test_stacked_pair_rows_match_the_marginalized_raw_gyro_reference`
+composes the built `(H, z, R)` through `reference_update` and compares against
+`reference_marginalized`, which independently places `+I3` on each IMU's bias in
+that IMU's own frame and carries `omega_base` on a rotation column. They agree on
+both the single-pair shape and the two-pair shared-IMU star. Mutating the parent
+block to `-I3` or to `R^T` moves the posterior by **1.99** and **1.45** — O(1)
+signals, seven orders above tolerance.
+
+Tolerance there is 1e-8 rather than 1e-12, and the mechanism was found before the
+number was set (plan §4 lesson 2): the oracle's nuisance carries a *zero*
+information block, so `cond(Lambda) ~ sigma^-2`. Sweeping the gyro STD gives
+1e-2 -> 8e-11, 1e-3 -> 2e-8, 1e-4 -> 5e-7, 1e-5 -> 5e-4, 1e-6 -> 1e-2 — exactly
+`eps * cond`, i.e. the oracle's own arithmetic, not the port's error.
+
+### I6 coverage, corrected: anisotropy does NOT constrain the cross-block
+
+The earlier note in this file said the anisotropic-`Sigma` test was one of two
+things constraining invariant I6. **That was wrong**, and B1's per-shape mutation
+disproved it. For a *single* pair, `L Sigma L^T` **is** `Sigma_c + R Sigma_p R^T`
+— the per-pair block-diagonal form — at *any* anisotropy. So:
+
+- anisotropy constrains the **rotation** inside the congruence (it catches a
+  dropped or transposed `R_parent`, mutations c and d, at O(1));
+- only a **shared IMU** constrains the **cross-block**.
+
+Mutating `R_g` to block-diagonal fails exactly two tests, both on `SHAPES[3]`,
+the two-pair shared-middle-IMU star. **I6's cross-covariance rests on that single
+shape.** Delete it, or reduce the fixture to single pairs, and the invariant
+loses all coverage while the suite stays green.
+`test_isotropic_single_pair_cannot_constrain_i6` now asserts the blind spot
+itself, so it fails loudly if the fixture is ever isotropised further.
+
+### CONTRACT CONFLICT, found and fixed: `R_LARGE` vs `cond_s_max`
+
+CLAUDE.md §4 sets `R_LARGE = 1e12` for an inactive anchor and `cond_s_max = 1e9`
+for the conditioning gate. These are **mutually destructive**. An inactive
+anchor's `R` block is structurally decoupled (its `H` rows are zeroed), so its
+Cholesky diagonal is exactly `sqrt(R_LARGE)` and
+`cond(S) >= 1e12 / lambda_min(pair block) ~ 4e11` — an order above the gate.
+
+Consequence: **every tick with any foot in swing dropped the ENTIRE stacked
+update, gyro rows included.** The filter would have stopped updating for the
+whole of walking, reporting nothing worse than `was_applied = 0`. Java never
+meets this because its stacked measurement literally has no anchor rows when no
+foot is trusted; the fixed-shape port must say the same thing with a mask, and
+the two constants as configured cannot both hold.
+
+Fixed in `update.py` by computing the condition proxy over **informative rows
+only** (`diag(R) < 0.5 * r_large`). This is the gate's own semantics rather than
+a fudge: the gate exists to catch an `S` that inverts to a *huge* gain, and a row
+we have deliberately declared uninformative contributes gain `~1/R_LARGE ~ 0` —
+it is the safest row in the matrix, not the most dangerous. Deriving the mask
+from `R` rather than an added argument keeps the property true for any caller
+that follows the masking rule, with no plumbing to forget.
+
+Found because B2 recorded it as a `strict` xfail rather than working around it,
+so fixing it XPASSed and forced the marker's removal.
+
+### Mutation findings
+
+- **`sqrt(sigma)` instead of `sigma` in the anchor congruence** (a 10x inflation
+  of `R_anchor`) passed every other test in `test_bias_observability.py`. The
+  trace threshold and the tighter-vs-looser comparison constrain the
+  congruence's *presence*; neither constrains its *magnitude*. Closed with an
+  independent NumPy value oracle; now caught at 1.66e-1.
+- **`+I3` on the wrong IMU's bias columns** is NOT caught by the map's own gauge
+  tests, because `norm(R(imu <- W) beta) == norm(beta)` for *any* IMU. Only the
+  beyond-the-map structural tests (which the plan explicitly required) catch it.
+
+### Open, and the most likely Phase-3 mismatch source
+
+`R_anchor` omits the base IMU's own gyro noise and the anchor<->pair
+cross-covariance. After eliminating `omega_base` the anchor row *does* inherit
+`Sigma_base` and *is* correlated with every pair row through it. Java models
+neither, and CLAUDE.md §2 specifies `Sigma_eps + J_U diag(sigma^2) J_U^T`
+exactly, so the port follows the spec — but `Sigma_base ~ 1e-4` against
+`anchor_var = 4e-4` is not negligible. Expect this to show up when the Phase-3
+stacked oracle runs with feet active.
+
+Also open: anchor masking is applied in both `measure.build_stacked` and
+`anchors.anchor_block` (idempotent, but ownership should collapse to one side),
+and two `AnchorBlock` definitions now exist.
+
+---
+
+## Phase 3 — the tick (`jointKF/filter.py`)
+
+`predict -> encoder update -> stacked gyro/anchor update`, plus a `lax.scan`.
+7 tests. No single Java class corresponds: the Java suite exercises the
+orchestration behaviourally (G8), so what is tested here is the wiring the port
+must get right *because* it is fixed-shape and pure — the parts that have no Java
+analogue because Java simply reshapes.
+
+Three decisions live in this file rather than being distributed, because no
+single module can see them:
+
+1. **The trusted-feet mask is delayed by exactly one tick.** The contact signal
+   derives from the same sensors the filter is about to consume, so using *this*
+   tick's mask would correlate the gating decision with the measurement it gates
+   through the shared noise — biasing the very bias estimate the anchor exists to
+   make observable. Carrying it in the scan state is also what keeps it a value
+   rather than a Python-level decision (I7).
+
+2. **Encoders and the gyro/anchor stack are two sequential Joseph updates, not
+   one concatenated block.** Algebraically equivalent when the noises are
+   independent (they are), but completely different *under gating*: one stacked
+   update means a single ill-conditioned gyro row throws the encoders away too. A
+   foot in swing, or a NaN on one IMU, must cost only the channel that went bad.
+   The `cond(S)` gate makes this behavioural, not numerical.
+
+3. **Model quantities are arguments, not an internal `RobotModel` call.** Keeps
+   the filter simulator-free (matching the InEKF's seam discipline), and leaves
+   the caller free to evaluate once per tick, batch under `vmap`, or precompute —
+   which matters because MJX tracing cost grows sharply with chain depth.
+
+### Mutation checks
+
+| mutation | caught by |
+|---|---|
+| drop the one-tick delay (use this tick's contact) | 2 tests |
+| merge the two channels into one stacked update | `test_a_nan_gyro_does_not_cost_the_encoder_update` |
+
+The second is the one worth noting: with a merged update, a NaN on a single IMU
+silently costs the encoder update as well, and *nothing else in the suite
+notices* — the state stays finite and PSD, it is simply less informed than it
+should be.

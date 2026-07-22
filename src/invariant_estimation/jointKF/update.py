@@ -196,8 +196,32 @@ def joseph_update(
     S = 0.5 * (S + S.T)
     factor = cho_factor(S)
 
+    # -- condition proxy, over INFORMATIVE rows only -------------------------
+    # A row deliberately masked to `R_LARGE` (an inactive stance anchor,
+    # CLAUDE.md §4) is structurally decoupled: its `H` row is zero, so `S` is
+    # block-diagonal there and its Cholesky diagonal is exactly `sqrt(R_LARGE)`.
+    # Counting it would make `cond(S) ~ R_LARGE / lambda_min(pair block) ~ 4e11`,
+    # far above `cond_s_max = 1e9` — so the gate would drop the ENTIRE stacked
+    # update, gyro rows included, on every tick any foot is in swing. That is to
+    # say: the filter would stop updating for the whole of walking.
+    #
+    # Java never meets this because its stacked measurement literally has no
+    # anchor rows when no foot is trusted; the fixed-shape port has to say the
+    # same thing with a mask, and `R_LARGE` and `cond_s_max` are otherwise
+    # mutually destructive as configured.
+    #
+    # Excluding them is not a fudge, it is the gate's own semantics: the gate
+    # exists to catch an `S` that inverts to a HUGE gain, and a row we have
+    # declared uninformative contributes gain ~1/R_LARGE ~ 0. It is the safest
+    # row in the matrix, not the most dangerous. Deriving the mask from `R`
+    # rather than an extra argument keeps this true for any caller that follows
+    # the masking rule, with no plumbing to forget.
     diag = jnp.abs(jnp.diag(factor[0]))
-    condition_proxy = (jnp.max(diag) / jnp.min(diag)) ** 2
+    informative = jnp.diag(Rs) < 0.5 * params.r_large
+    any_informative = jnp.any(informative)
+    d_max = jnp.max(jnp.where(informative, diag, -jnp.inf))
+    d_min = jnp.min(jnp.where(informative, diag, jnp.inf))
+    condition_proxy = jnp.where(any_informative, (d_max / d_min) ** 2, 1.0)
 
     # K = P Hᵀ S⁻¹  ⟺  S Kᵀ = (P Hᵀ)ᵀ   (S symmetric)
     K = cho_solve(factor, PHt.T).T                   # (dim, k)
