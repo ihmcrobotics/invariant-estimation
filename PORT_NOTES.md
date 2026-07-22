@@ -741,3 +741,37 @@ This is JOINTKF_PORT_PLAN §4 lesson 1 in its purest form: the other tests
 *exercise* `R_g` without *constraining* its structure. Any future change to the
 fixture that isotropises the noise, or that drops the two-pair shape, silently
 removes all coverage of invariant I6.
+
+### The armature double-add is undetectable by the Java suite as written
+
+CLAUDE.md §6 names the double-add (rotor inertia in the MJCF `armature` *and*
+added again post-Schur) as the trap `process.py` must retire. Mutation-checking
+it produced the uncomfortable answer that the Java class cannot see it.
+
+Mechanism. The Java random chain has no name matching the rotor table, so every
+joint takes the `ROTOR_INERTIA_DEFAULT = 0.005` floor, and the fixture's `M` is
+well-conditioned (`lambda_min(Lambda) ~ 14`). Doubling a 0.005 diagonal is then a
+~0.036% perturbation of `Lambda`; since `Qa ~ Lambda^-2`, `Qa` moves ~0.07%
+— i.e. **7e-4 relative, an order of magnitude below the map's own `relTol =
+3e-3`**. The double-add is arithmetically invisible at the tolerance the test
+ships with.
+
+Closed two ways:
+
+1. A second parametrised pass over a `near_singular_fixture` — a light
+   articulated mode plus `rotor = 0.167`, the real Alex `KNEE` value rather than
+   the unmatched-name default. This is the regime the rotor term exists *for*:
+   distal joints whose link-side apparent inertia is ~8e-4 while their
+   drivetrains reflect 0.05-0.07.
+2. Tolerances tightened from the map's `3e-3` (CLAUDE.md §5 explicitly permits
+   this — the loosening existed because Java compares LU against Cholesky, while
+   this port has a single inversion path).
+
+Verified: with both in place the true double-add fails the primary value oracle
+at 6.28e-8 against a 3.1e-10 tolerance, a ~200x margin.
+
+API consequence in `process.py`: `rotor=` defaults to the sentinel
+`ROTOR_IN_MASS_MATRIX` ("`M` already carries it, add nothing"), and `None` is
+*rejected* rather than aliased to it — so "M carries the rotor" and "I forgot to
+pass the rotor" cannot be spelled the same way. Adding the term requires naming
+it at the call site.
