@@ -247,8 +247,22 @@ def test_velocity_converges(scene):
     `max |v_est| > 0.5 * AMP * OMEGA` floor (measured after a 500-tick warmup) is
     what says the velocity is *observed* rather than merely small.
 
-    Mutation-checked: zeroing the `q_dot` columns of the stacked gyro Jacobian
-    leaves the position tracking test green and fails this one on both clauses.
+    What this test does and does not constrain (JOINTKF_PORT_PLAN §4 lesson 3 —
+    both answers came from actually running the mutations, and the first one is
+    not what the class's name suggests):
+
+    * it DOES constrain the *direction* of the gyro velocity path: flipping the
+      sign of the `q_dot` columns of the stacked `H` fails the tracking clause at
+      4.6e-1 against 3e-2, while `test_position_tracks_trajectory` stays green.
+    * it does NOT constrain that path's *existence*.  Zeroing those same columns
+      leaves BOTH clauses green — at 0.5 Hz the encoder channel alone infers
+      velocity through the Van Loan `dt^2/2 Qa` cross block well within 3e-2, and
+      excites it well past `0.5*peak`.  Zeroing the Van Loan cross block instead
+      also leaves both clauses green.  What actually catches a dead gyro velocity
+      path is `test_bias_stays_small_with_zero_true_bias` (the bias absorbs the
+      whole relative-gyro signal, |b| -> 1.8) and the second half of
+      `test_covariance_embeds_kinematic_coupling` (cross-joint velocity
+      correlation collapses to exactly 0).
     """
     n = scene.fixture.n
     warmup, total = 500, 3000
@@ -275,6 +289,11 @@ def test_bias_stays_small_with_zero_true_bias(scene):
     the differenced pair rows have no reason to move the bias at all, and any
     systematic motion of it means the gyro model and the Jacobian disagree —
     the residual is being explained by a fictitious bias instead of by `q_dot`.
+
+    That makes this — not `test_velocity_converges` — the test that constrains
+    the *existence* of the gyro `q_dot` path: mutation-checked by zeroing the
+    `q_dot` columns of the stacked `H`, which leaves position and velocity
+    tracking green and drives |b| to 1.8 rad/s here.
     """
     n = scene.fixture.n
     _q, _qd, xs, _Ps = roll(scene, 1500)
@@ -332,9 +351,15 @@ def test_transient_non_finite_input_recovers(scene):
     and still pass this test — which is why `test_filter.py` asserts the
     independence directly.
 
-    Mutation-checked: removing the `jnp.where(finite, ...)` sanitisation in
-    `update.py` makes the bad window produce an all-NaN `x` and `P` on the very
-    first poisoned tick.
+    Mutation-checked, with a correction worth recording.  Removing ONLY the
+    `jnp.where(finite, ...)` sanitisation in `update.py` leaves this test green:
+    the whole-carry `jnp.where(applied, x_new, x)` at the end of `joseph_update`
+    is a *select*, not arithmetic, so it restores the prior even when the
+    not-taken branch is NaN.  The two guards are independently sufficient.  Drop
+    both — the sanitisation and the `finite &` clause of `applied` — and this
+    test fails at tick 100 with all 18 state entries non-finite.  So what it
+    constrains is "a NaN must not reach the carry", not any one implementation
+    of that.
     """
     n = scene.fixture.n
     clean, bad, recover = 100, 5, 1000
