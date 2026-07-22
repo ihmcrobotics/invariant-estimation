@@ -626,3 +626,78 @@ New file **`DESIGN_DECISIONS.md`**, linked from the README: deliberate choices
 whose *symptoms* look like bugs (no contact mask, first-order `Q_d`, no reseed,
 no contact-trust port, unapplied `N^v`). Each entry records what / why / what it
 costs / which test guards it.
+
+---
+
+## G6-G8 — joint KF port (`JOINTKF_PORT_PLAN.md`)
+
+### Phase 0 — frozen contracts
+
+`TEST_SUITE_MAP.md` vendored into the repo. `config/filter_cfg.yaml` `joint_kf:`
+now carries the full Java tuning table (`JointLevelKFPreFilter.java:70-200`),
+cross-checked against the map's constants table — that table is the acceptance
+checksum for the config, so a mismatch fails the port, not the test
+(`tests/test_config.py::test_test_locked_values_match_the_java_suite`).
+
+**Breaking layout change: bias is per-IMU, not per-pair.** `m` = distinct IMUs,
+`dim = 2n + 3m`. Invariant I6 requires the exact `L Sigma L^T` cross-covariance
+on the shared-base-IMU star, and `testBiasColumnsOfHgAreExactlyL` asserts the
+bias columns of `H_g` ARE `L`, bit-identically. Under a per-pair layout two pairs
+sharing an IMU carry two independent copies of one physical bias, the shared-IMU
+cross terms vanish, and the G7 stacked oracle cannot pass. The five Rev.1 jointKF
+modules and their tests were deleted rather than adapted: they were built to the
+locked-base design and lack the Schur complement, `Lambda_eff`, the Gram-form
+`Qa`, stance anchors and the `cond(S)` gate.
+
+### Model seam: MJX, not a hand-rolled CRB
+
+CLAUDE.md §2 already specifies MJX for production, so a hand-rolled CRB would be
+a throwaway — and worse, it would make the G3 armature-equivalence oracle a
+tautology (the same hand writing both sides). Two conventions verified
+empirically against mujoco 3.10 and asserted in `tests/model/`:
+
+1. A floating base's free joint occupies DoF `0..5`; hinges follow in joint
+   order. The Schur nuisance gather depends on this.
+2. `dof_armature` folds into `qM` as an **exact diagonal add on the hinge DoFs
+   alone** — `M(armature) - M(armature=0) == diag(armature)` exactly, touching
+   neither `M_bb` nor `M_jb`.
+
+(2) is why `Lambda_eff = Lambda + diag(rotor)` falls out of the Schur complement
+for free, and therefore why adding rotor inertia *again* post-Schur would
+double-count the drivetrain (CLAUDE.md §6). Production takes the armature path;
+`JointKFBuild.rotor_inertia` is informational only.
+
+API note: mujoco 3.10 changed the signature to `mj_fullM(model, data, dst)`.
+
+### Contradiction inside `TEST_SUITE_MAP.md` — resolved in favour of the shapes
+
+The map's prose says `n = child_index - parent_index - 1`, but its own shape
+table says `singlePair(10, 1, 9) -> n = 8`, i.e. `n = child - parent`. The two
+disagree for every shape. **The shape table wins**: it is what the Java fixtures
+actually construct, so it is what the ported tests must reproduce, and the prose
+formula would change every state dimension in the suite (8->7, 4->3, 3->2).
+Verified by inspection: IMUs sit on `joints.get(i).getSuccessor()`, so the joints
+strictly between the two IMU links are `parent+1 .. child`, which is
+`child - parent` joints. Pinned by
+`tests/jointKF/test_build.py::test_joints_between_matches_the_java_shape_table`.
+
+### Bug found in `build.py` by its own test: anchor chains root at the base IMU
+
+First implementation rooted the base->foot anchor chain at the **world**. It must
+root at the **base IMU's body**: the anchor asserts a stance foot's absolute
+angular rate is ~zero, and that rate is `omega_baseIMU + J(baseIMU->foot) q_dot`,
+with the base IMU's own rate read back by the `+I3` bias column. Rooting at the
+world drags every joint between world and base IMU into the unfiltered `U` split,
+inflating `R_anchor` with velocities the anchor equation never referenced.
+
+Java `singlePairFootBeyondIMUs(10, 1, 5, 9)` pins it exactly: `F` = joints 2..5,
+`U` = joints 6..9, and joints 0..1 appear in **neither**. Caught by
+`test_anchor_chain_splits_filtered_from_unfiltered_joints`; mutation-checked by
+reverting the root and confirming two tests fail.
+
+### Mutation checks (JOINTKF_PORT_PLAN §4 — mandatory at every phase gate)
+
+- cycle check disabled -> `test_cycle_in_the_pair_graph_is_rejected` fails.
+- anchor chain re-rooted at the world -> 2 tests fail.
+
+Both confirm the assertions discriminate rather than merely pass.
