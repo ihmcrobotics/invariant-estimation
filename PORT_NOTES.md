@@ -1145,3 +1145,85 @@ consequence is over-trusting the anchor, which feeds the base gyro-bias estimate
 the downstream InEKF integrates directly into orientation — the exact quantity
 `SIGMA_QD_UNFILTERED`'s "erring large is safe, erring small is not" comment warns
 about.
+
+---
+
+## Phase 5 — sign-off
+
+`uv run pytest -q`: **592 passed**, 0 failed (~5.7 min). Baseline before this work
+was 459. `tests/jointKF` + `tests/model` contribute 288 collected tests from 154
+test functions (the rest is parametrisation over the four fixture shapes).
+
+### Gate status
+
+| gate | status |
+|---|---|
+| G1 model layer | green — 65 tests, six independent-route checks |
+| G2-G5 InEKF | green (pre-existing, unchanged) |
+| G6 joint-KF linear-algebra core | green |
+| G7 measurement + anchors | green |
+| G8 behaviour | green |
+| Phase 3 decisive stacked oracle | green, both halves |
+| G9 pipeline, G10 sim/eval | not started (plan §9) |
+
+### Ported Java classes
+
+`JointLevelKFStateTest`, `PredictTest`, `UpdateTest`, `MeasurementTest`,
+`TransitionNoiseTest`, `MassMatrixNoiseTest`, `RotorAndGramTest`,
+`StandingStabilityTest`, `BiasObservabilityTest`, `EncoderNISConsistencyTest`,
+`DirectVelocityMeasurementTest`, `SingularInnovationDiagnosticTest`,
+`StackedOracleTest`, `FilterTest`, `TrajectoryTest`, plus
+`testHotPathStaysFinite`.
+
+**Skipped as documented:** both `*AllocationTest` allocation tests (JVM
+`ThreadMXBean`). Their analogue here is the constant-graph check — no
+recompilation IS the port's "no per-tick allocation" — measured by comparing the
+lowered program rather than a cache counter.
+
+### The pattern worth carrying forward
+
+Eleven tests in this port were found to pass against wrong implementations. They
+are individually documented above; collectively they have a shape:
+
+**This suite reliably verifies that a term is PRESENT and reliably fails to
+verify that it is RIGHT.** The recurring mechanisms are
+
+* **algebraic degeneracy in the fixture** — isotropic `Sigma` makes
+  `R Sigma R^T = Sigma`, so a block-diagonal `R_g` is an identity, not an
+  approximation; a well-conditioned `Lambda` with the 0.005 default rotor makes
+  the armature double-add a 7e-4 perturbation;
+* **statistical envelopes wider than the bias** — "NIS on the posterior" shifts
+  the mean 4.2% against an 8.9% envelope, so 4000 trials cannot see it;
+* **noiseless deterministic scenarios** — the lag-inflation test's
+  constant/ramp/constant signal cannot distinguish a smoothed finite difference
+  from a raw one, because the smoother only matters under noise;
+* **oracles that share the implementation's assumption** — the Joseph reference
+  KF also uses Joseph form, so the short form matches it exactly at the optimal
+  gain;
+* **two spellings of one quantity** — `mass_matrix` vs `evaluate()`, one tested
+  and one used.
+
+Three of these are traps the repo-root `CLAUDE.md` §6 names explicitly (the
+armature double-add, block-diagonal `R_g`, NIS on the posterior) and **the Java
+suite cannot detect any of them as written**. Naming a trap in prose is not the
+same as testing for it; that gap is the single most useful thing this port found.
+
+Practical consequence for future work: when adding a test here, state what it
+*constrains*, not what it exercises, and mutate the source to confirm — the
+`CONTRACT_CARD.md` §8 discipline. It caught ten of the eleven; the eleventh (the
+jit-cache one) was caught only by running the full suite in a different order.
+
+### Carried forward, unresolved
+
+1. **XLA compile time vs kinematic depth** — ~1.3 s to jit a 4-link chain, ~240 s
+   at 10 links, isolated to `mjx.kinematics`. A live risk for G9/G10 against full
+   Alex. `lax.scan` over bodies rather than MJX's unrolled per-level tracing is
+   the likely lever.
+2. **`alpha_overrides` are calibrated for Alex's 9 filtered joints**; any other
+   robot takes the 0.15 default and will surface through the `QA_MAX` tripwire,
+   by design.
+3. **`encoder_pos_std`, `encoder_vel_std`, `gyro_sigma` sidecars are empty** —
+   every joint currently takes the loud fallback, which `build.py` warns about at
+   construction. Wiring them is a config task, not a code one.
+4. **The direct-velocity channel is default OFF** and has no config key for the
+   drive corner frequency (it is a builder argument).
