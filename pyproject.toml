@@ -14,7 +14,9 @@ dependencies = [
   "ipython",
   "pyyaml",
   "ruff",
-  "black"
+  "black",
+  "mujoco>=3.10.0",
+  "mujoco-mjx>=3.10.0",
 ]
 
 [project.scripts]

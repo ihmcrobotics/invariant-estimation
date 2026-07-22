@@ -1,75 +1,42 @@
 """
-jointKF — linear joint-chain Kalman filter (pre-filter).
+jointKF — joint-space Kalman pre-filter (CLAUDE.md §1 deliverable 1, gates G6-G8).
 
-A bias-augmented EKF that fuses joint encoders with distributed-IMU relative
-angular velocity, producing honest joint estimates and covariances for the
-downstream InEKF / ContactNet (see `CLAUDE.md` for the full design record).
+A bias-augmented filter over ``x = [q ; q_dot ; b_omega]`` that fuses joint
+encoders with a *stacked* distributed-IMU relative-gyro measurement and stance
+anchors, producing honest joint estimates and covariances for the downstream
+InEKF (see `CLAUDE.md` in this package for the design record, and the repo-root
+`CLAUDE.md` for the authoritative spec).
 
-Typical use
------------
->>> from invariant_estimation.jointKF import init_state, default_params, run, SensorInputs
->>> state0 = init_state(n_joints, n_pairs)
->>> params = default_params(dt=1e-3)
->>> final, states, infos = run(state0, params, sensor_seq, robot)   # robot: RobotModel
+Bias is **per-IMU** (`m` = distinct IMUs), not per-pair — invariant I6 requires
+the exact ``L Sigma L^T`` cross-covariance on the shared-base-IMU star, and the
+bias columns of ``H_g`` must *be* the mixing operator ``L``.
 
-The pipeline (state → noise → predict → measurement → update → filter) is laid out
-one concern per module; `filter.step` / `filter.run` are the usual entry points.
-The robot dynamics seam is `invariant_estimation.robot.RobotModel`, re-exported here.
+Being ported per `JOINTKF_PORT_PLAN.md`; `state.py` is the frozen contract.
 """
 from ..robot import RobotModel
-from .filter import SensorInputs, run, step
-from .measurement import (
-    build_H,
-    build_measurement,
-    build_z,
-    relative_gyro_measurement,
-)
-from .noise import (
-    acceleration_cov_diag,
-    acceleration_cov_mass,
-    build_F,
-    build_process_noise,
-    build_Q_d,
-    build_R,
-)
-from .predict import predict
 from .state import (
+    SEAM_MAP,
+    JointKFBuild,
     JointKFParams,
     JointKFState,
+    alpha_for_name,
     default_params,
+    encoder_var_for_name,
     init_state,
+    rotor_inertia_for_name,
     split_x,
 )
-from .update import UpdateInfo, update
 
 __all__ = [
-    # state + params
     "JointKFState",
     "JointKFParams",
+    "JointKFBuild",
     "init_state",
     "default_params",
     "split_x",
-    # noise / model builders
-    "build_F",
-    "build_Q_d",
-    "build_process_noise",
-    "build_R",
-    "acceleration_cov_diag",
-    "acceleration_cov_mass",
-    # predict
-    "predict",
-    # measurement
-    "relative_gyro_measurement",
-    "build_z",
-    "build_H",
-    "build_measurement",
-    # update
-    "update",
-    "UpdateInfo",
-    # filter (entry points)
-    "SensorInputs",
-    "step",
-    "run",
-    # robot seam
+    "rotor_inertia_for_name",
+    "alpha_for_name",
+    "encoder_var_for_name",
+    "SEAM_MAP",
     "RobotModel",
 ]
