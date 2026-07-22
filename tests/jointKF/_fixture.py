@@ -119,6 +119,11 @@ def chain_geometry(shape: dict, *, armature: bool = True, seed: int = CHAIN_SEED
 
     sites = list(shape["imus"]) + [C - 1]            # IMU sites, then the foot site
     n_sites = len(sites)
+    # Principal moments must obey the triangle inequality or MuJoCo refuses the
+    # model; parameterising them as pairwise sums of positive numbers (the
+    # "inertia of a point-mass triple" form) satisfies it by construction.
+    half = rng.uniform(0.005, 0.03, size=(C, 3))
+    diag = np.stack([half[:, 1] + half[:, 2], half[:, 2] + half[:, 0], half[:, 0] + half[:, 1]], axis=1)
     return ChainGeometry(
         link_pos=rng.uniform(-0.25, 0.25, size=(C, 3)),
         link_quat=np.stack([_quat(rng) for _ in range(C)]),
@@ -126,7 +131,7 @@ def chain_geometry(shape: dict, *, armature: bool = True, seed: int = CHAIN_SEED
         mass=rng.uniform(0.5, 3.0, size=C),
         com=rng.uniform(-0.08, 0.08, size=(C, 3)),
         inertia_quat=np.stack([_quat(rng) for _ in range(C)]),
-        inertia_diag=rng.uniform(0.01, 0.05, size=(C, 3)),
+        inertia_diag=diag,
         armature=np.array([ROTOR_CYCLE[i % len(ROTOR_CYCLE)] for i in range(C)]) if armature
         else np.zeros(C),
         site_link=np.array(sites, dtype=int),

@@ -139,6 +139,114 @@ def van_loan_blocks(qa: np.ndarray, dt: float) -> dict[str, np.ndarray]:
     }
 
 
+def reference_marginalized(
+    mu_x: np.ndarray,
+    P_xx: np.ndarray,
+    *,
+    n: int,
+    imu_bias_col,
+    raw_gyro: np.ndarray,
+    imu_omega_base_rot: np.ndarray,
+    imu_joint_jacobian: np.ndarray,
+    imu_sigma: np.ndarray,
+    foot_joint_jacobian: np.ndarray | None = None,
+    anchor_var: float = 4.0e-4,
+) -> tuple[np.ndarray, np.ndarray]:
+    r"""THE decisive oracle — `JointLevelKFStackedOracleTest.referenceMarginalized`.
+
+    The stacked *relative*-gyro update must equal a reference KF that measures
+    **raw** per-IMU gyros with block-diagonal (independent) noise, over a state
+    augmented with a nuisance base angular velocity, and then marginalises that
+    nuisance out.  This is the one place a wrong answer is not locally detectable
+    by any single component: `measure.py`, `anchors.py` and `update.py` can each
+    be individually plausible and still not compose.
+
+    Why the two agree at all
+    ------------------------
+    Differencing two IMUs to form `omega_child - R omega_parent` is exactly what
+    you get by writing both raw measurements in terms of a shared unknown
+    `omega_base` and eliminating it.  Eliminating a variable you hold **no**
+    prior on (the improper `gamma -> infinity` limit) is precisely marginalisation
+    in the information form, which is why the nuisance block enters as a zero
+    information block rather than a large-covariance one.  That also means the
+    correlations the differencing induces between pairs sharing an IMU are not a
+    modelling choice — they are forced, and reproducing them is what invariant I6
+    (`R_g = L Sigma L^T`, never block-diagonal) is about.
+
+    Parameters
+    ----------
+    mu_x, P_xx
+        Prior over `x = [q ; q_dot ; b_omega]`, dimension `dim`.
+    imu_bias_col : callable
+        `imu -> ` first bias column of that IMU.
+    raw_gyro : (n_imus, 3)
+        Raw per-IMU gyro readings.
+    imu_omega_base_rot : (n_imus, 3, 3)
+        `R(base measurement frame -> IMU measurement frame)` — the nuisance
+        columns. The base IMU's own block is the identity.
+    imu_joint_jacobian : (n_imus, 3, n)
+        Absolute angular Jacobian base->IMU link, expressed in the IMU frame
+        (all-zero for the base IMU itself).
+    imu_sigma : (n_imus, 3, 3)
+        Independent per-IMU gyro measurement covariance — deliberately
+        **block-diagonal** here, because the correlation must emerge from the
+        marginalisation rather than be assumed.
+    foot_joint_jacobian : (n_active_feet, 3, n) or None
+        `J_leg` base->foot in the base frame, for each ACTIVE stance foot. Each
+        contributes a near-zero absolute-rate constraint with `+I3` on the
+        nuisance and `R = anchor_var * I3`.
+
+    Returns
+    -------
+    (mu_post, P_post)
+        The posterior over `x` alone, with the nuisance integrated out.
+    """
+    mu_x = np.asarray(mu_x, dtype=float)
+    P_xx = np.asarray(P_xx, dtype=float)
+    dim = mu_x.shape[0]
+    D = dim + 3                                   # augmented with omega_base
+    n_imus = raw_gyro.shape[0]
+    feet = np.zeros((0, 3, n)) if foot_joint_jacobian is None else np.asarray(foot_joint_jacobian, float)
+
+    M = 3 * n_imus + 3 * len(feet)
+    H = np.zeros((M, D))
+    z = np.zeros(M)
+    R = np.zeros((M, M))
+
+    for k in range(n_imus):
+        r = 3 * k
+        z[r:r + 3] = raw_gyro[k]
+        H[r:r + 3, n:2 * n] = imu_joint_jacobian[k]          # q_dot columns
+        col = imu_bias_col(k)
+        H[r:r + 3, col:col + 3] = np.eye(3)                  # bias enters as +I
+        H[r:r + 3, dim:] = imu_omega_base_rot[k]             # nuisance columns
+        R[r:r + 3, r:r + 3] = imu_sigma[k]
+
+    for f in range(len(feet)):
+        r = 3 * n_imus + 3 * f
+        H[r:r + 3, n:2 * n] = feet[f]
+        H[r:r + 3, dim:] = np.eye(3)
+        R[r:r + 3, r:r + 3] = anchor_var * np.eye(3)
+        # z stays 0: a trusted stance foot has ~zero absolute angular rate.
+
+    # Information form. The nuisance gets a ZERO information block -- the
+    # improper prior -- which is what makes this the gamma -> infinity limit
+    # rather than merely a very diffuse one.
+    P_inv = np.linalg.inv(P_xx)
+    Lam = np.zeros((D, D))
+    Lam[:dim, :dim] = P_inv
+    R_inv = np.linalg.inv(R)
+    Lam += H.T @ R_inv @ H
+
+    eta = np.zeros(D)
+    eta[:dim] = P_inv @ mu_x
+    eta += H.T @ R_inv @ z
+
+    Sigma = np.linalg.inv(Lam)
+    mu = Sigma @ eta
+    return mu[:dim], Sigma[:dim, :dim]
+
+
 def nis_quadratic_form(nu, S) -> float:
     """NIS as the quadratic form `nu^T S^-1 nu`, on the PRIOR residual and `S`.
 

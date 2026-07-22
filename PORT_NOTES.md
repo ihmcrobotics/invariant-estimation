@@ -701,3 +701,43 @@ reverting the root and confirming two tests fail.
 - anchor chain re-rooted at the world -> 2 tests fail.
 
 Both confirm the assertions discriminate rather than merely pass.
+
+### I6 is invisible on three of the four shapes — what actually constrains it
+
+The decisive stacked oracle (`reference_marginalized` in `tests/jointKF/_oracles.py`)
+was validated before any agent depended on it: for a single pair it reduces to
+the relative-gyro update with `R_g = Sigma_child + R Sigma_parent R^T` to 7.7e-12
+in the mean and 1.9e-10 in the covariance. That confirms the marginalisation is
+the right oracle — differencing two IMUs *is* elimination of a shared unknown
+`omega_base` held under an improper prior, so the information-form limit is
+forced, not chosen.
+
+Measuring the I6 trap (block-diagonal `R_g` instead of the exact `L Sigma L^T`)
+then produced a result worth recording:
+
+| configuration | max deviation, exact vs block-diagonal |
+|---|---|
+| single pair, **isotropic** `Sigma = 1e-4 I` | **2.6e-20** (machine noise) |
+| single pair, anisotropic `Sigma` | 1.3e-04 |
+| two pairs sharing the middle IMU | 1.7e-04 (a whole cross-block zeroed) |
+
+The reason is algebraic: for isotropic `Sigma = sigma^2 I`,
+`R Sigma R^T = sigma^2 R R^T = sigma^2 I` **exactly**, so the rotation cancels and
+block-diagonal is not an approximation but an identity. The fixture's default IMU
+covariance is `1e-4 I3`, and three of the four `SHAPES` are single-pair — so on
+those three shapes the block-diagonal implementation is not merely hard to
+distinguish, it is *numerically indistinguishable*.
+
+Only two things in the suite genuinely constrain I6:
+
+1. `testMeasurementNoiseUsesGyroMeasurementCovariance`, which sets deliberately
+   ANISOTROPIC gyro covariances (parent `diag(4e-4, 1e-6, 2.5e-5)`, child
+   `diag(9e-4, 1.6e-5, 4.9e-6)`) — that anisotropy is the whole point of the
+   test, not incidental realism.
+2. `SHAPES[3]`, the two-pair shared-middle-IMU star, where a block-diagonal `R_g`
+   drops an entire off-diagonal block rather than perturbing one.
+
+This is JOINTKF_PORT_PLAN §4 lesson 1 in its purest form: the other tests
+*exercise* `R_g` without *constraining* its structure. Any future change to the
+fixture that isotropises the noise, or that drops the two-pair shape, silently
+removes all coverage of invariant I6.

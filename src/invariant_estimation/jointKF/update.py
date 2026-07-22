@@ -66,6 +66,35 @@ from jax.scipy.linalg import cho_factor, cho_solve
 from .state import JointKFParams, JointKFState
 
 
+def joseph_covariance(P: Array, K: Array, H: Array, R: Array) -> Array:
+    r"""``P⁺ = (I − KH) P (I − KH)ᵀ + K R Kᵀ``, symmetrised.
+
+    Exposed as its own function because it is the only part of the update that is
+    correct for an **arbitrary** gain, and therefore the only part a test can
+    constrain independently: at the optimal ``K`` the short form ``(I − KH) P`` is
+    algebraically identical, so no test driven through `joseph_update` can tell
+    the two apart.  Feed this a deliberately suboptimal ``K`` and they diverge —
+    which is exactly the regime the filter enters whenever ``H`` is a linearised
+    Jacobian or the conditioning gate has zeroed the gain.
+
+    Parameters
+    ----------
+    P : Array, shape (dim, dim)
+        Prior covariance.
+    K : Array, shape (dim, k)
+        The gain **actually applied** — not necessarily the optimal one.
+    H : Array, shape (k, dim)
+    R : Array, shape (k, k)
+
+    Returns
+    -------
+    Array, shape (dim, dim)
+    """
+    IKH = jnp.eye(P.shape[0], dtype=P.dtype) - K @ H
+    P_new = IKH @ P @ IKH.T + K @ R @ K.T
+    return 0.5 * (P_new + P_new.T)
+
+
 class UpdateInfo(NamedTuple):
     r"""Per-update diagnostics — part of the seam surface, not optional logging.
 
@@ -185,9 +214,7 @@ def joseph_update(
     nis = jnp.where(applied, nu @ cho_solve(factor, nu), jnp.nan)
 
     x_new = x + K @ nu
-    IKH = jnp.eye(P.shape[0], dtype=P.dtype) - K @ Hs
-    P_new = IKH @ P @ IKH.T + K @ Rs @ K.T
-    P_new = 0.5 * (P_new + P_new.T)
+    P_new = joseph_covariance(P, K, Hs, Rs)
 
     # Bit-identity when gated: `K = 0` makes the algebra an identity, but not
     # necessarily the floating-point evaluation of it.
