@@ -1386,3 +1386,59 @@ noise (asserted).
   impossible; tier 2 is a divergence test, weaker than tier 1's per-module
   localisation, and best built once the `diag(Qa)` and sensor-noise oracles are
   green (they now are).
+
+## G9 — the fused estimator step (`pipeline/main_estimator.py`)
+
+G9 fuses the two already-validated filters into one constant-XLA-graph `lax.scan`
+body: joint KF (at the carry's `q̂_prev`) → `(q̂, q̇̂, Σ_q, Σ_q̇, b̂)` → the boundary
+→ InEKF → pelvis pose. The only genuinely new code is `_boundary`: bias-correct
+the base gyro in the IMU frame (I1), rotate IMU→body (`R_mount`), route the full
+`Σ_q`/`Σ_q̇` (never diagonalised). Gate: `tests/pipeline/test_main_estimator.py`
+(9 green) — the jaxpr-constancy proof (I7) + a `_cache_size()==1` no-recompile
+check + five scenarios (static equilibrium, no-contact yaw integration, free fall,
+poisoned-encoder recovery, bias-correction wiring), all against a synthetic
+floating-base biped MJX model.
+
+### Deviations and decisions (DoD §8)
+
+* **The build guide's premise was stale.** `~/Documents/g910_guide.md` says to
+  fuse two Tier-2 replay drivers `replay/{jointkf,inekf}_driver.py`; those files
+  do not exist (the harness is Tier-1 stateless, `tests/replay/`). The real
+  assembly patterns are `tests/jointKF/_fixture.py::kinematic_tree` (the
+  mj_model→`KinematicTree` adapter, generalised here as `kinematic_tree_from_mj`)
+  and `tests/inEKF/test_filter.py` (the contact-FK closure + jaxpr-constancy
+  pattern). The guide's `jkf.step(..., vel_ch)` 6th arg and `SensorInputs.velocity`
+  field also do not exist — the direct-velocity channel is not wired into the
+  current `jointKF.filter.step`, so the fused step does not use it.
+* **G9 gate is synthetic, not the hardware replay.** The guide's stronger "diff
+  the fused step against `jointKF_*`/`invariantFilter*` on the log" gate needs the
+  9GB Alex001 log + `ihmc-log` skill (CI-excluded). Deferred to the same Tier-2
+  replay above; the synthetic scenarios are the self-contained gate.
+* **Landmine #1 (Q_bb=0) is wired.** `build_fused_estimator(imu_bias_process_var
+  =0.0)` overrides the config's test-locked `1e-4` at the fusion boundary (flight
+  value; config value would make the joint-KF bias ~200× too noisy).
+* **Landmine #2 (contact measurement-noise floor) is a socket, default off.**
+  `contact_meas_var` (default `0.0` = current port behaviour) adds an isotropic
+  floor to `Σ_q` before the InEKF contact update, standing in for flight's
+  `ConstantContactMeasurementNoiseProvider`. It affects velocity/position, not
+  roll/pitch; wiring the flight value waits on the Tier-2 velocity check.
+* **`R_mount` unverified for real Alex.** The synthetic model's base IMU is
+  axis-aligned, so `R_mount=I`. Real Alex is a +90° pelvis-IMU yaw; the frame
+  step (`_boundary`) MUST be cross-checked against `invariantRootAngularVelocityBody*`
+  on the log before trusting fused velocity/position. Roll/pitch are `R_mount`-robust.
+* **Benign one-time recompile fixed by `device_put`.** The init carry mixes device
+  commitment (contacts `d0` come off an MJX-FK `einsum`, committed; `jnp.eye`/`zeros`
+  leaves uncommitted), which forced a second `fused_step` compile with an identical
+  jaxpr but a different `Argument mapping`. `init_fused_carry` now `device_put`s the
+  whole carry to one device, so it is a single executable. This is not an I7
+  violation (contact/gate flips do not recompile); it is sharding bookkeeping.
+* **`J_dot = 0` in the contact-FK closure.** The InEKF velocity-noise term
+  (`N^v = J_Ċ Σ_q̇ J_Ċᵀ`) is deferred, same as the standalone `inEKF/filter.py`
+  TODO; `Σ_q̇` is carried through the boundary so adding it later is local.
+
+### G10 remains
+
+Not built: the MJX sim env, the ONNX→Flax policy port (≤1e-6 oracle), the
+closed-loop scan + vmap, and NIS/NEES consistency bands (`eval/consistency.py`).
+`FusedOutputs` already emits the joint-KF `TickDiagnostics` and InEKF
+`InEKFOutputs` (with per-tick NIS) the consistency evaluation reads.

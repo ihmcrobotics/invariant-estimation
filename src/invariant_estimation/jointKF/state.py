@@ -408,7 +408,7 @@ class JointKFBuild(NamedTuple):
     # Alex's ankles belong here but are off the root->filtered paths, so they are
     # locked (not marginalised) in `M`. Empty tuple => fall back to the trailing
     # slice of `dof_nuisance` (the pre-decoupling layout the fixtures build).
-    dof_anchor_unfiltered: Array = ()
+    dof_anchor_unfiltered: Array 
 
     # -- derived ------------------------------------------------------------
     @property
