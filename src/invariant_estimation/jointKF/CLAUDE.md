@@ -7,26 +7,56 @@ ContactNet appear only at the boundary.
 
 ---
 
+> ## ⚠️ Rev. 1 superseded — read this first
+>
+> **Everything below the "Design Document" heading describes the Rev. 1 design,
+> which has been REPLACED.** It is kept because its rationale (§0 the P-A
+> commitment, §4 Joseph form, §6 output routing, §8 principles) is still correct
+> and still load-bearing. But three of its concrete claims are now wrong, and
+> following them would reintroduce bugs the port has already fixed:
+>
+> | Rev. 1 says | Reality (Rev. 2) |
+> |---|---|
+> | `b_ω` is per **IMU pair**, `m` = pairs | `b_ω` is per **IMU**, `m` = distinct IMUs. Invariant I6 needs the exact `LΣLᵀ` on the shared-base-IMU star; per-pair bias gives two copies of one physical bias and the shared-IMU cross-terms vanish. |
+> | `Q_a = σ_τ² M(q)⁻²` (locked base) | `Qa = Λ_eff⁻¹ Σ_τ Λ_eff⁻ᵀ` with the **Schur complement** `Λ = M_jj − M_jb M_bb⁻¹ M_bj`. The free base recoils, so `Λ ⪯ M_jj` and the locked-base form understates the noise. Per-joint `σ_τ,i = α_i τ_max,i`, never a scalar (I9). |
+> | Measurement is per-pair `[0 | J | I₃]` | One **stacked** measurement over all pairs plus **stance anchors**, with `R_g = L Σ Lᵀ`. Block-diagonal `R_g` is wrong. |
+>
+> The authoritative spec is the repo-root `CLAUDE.md`; the behavioural contract is
+> `TEST_SUITE_MAP.md`; every reconciliation and deviation is in `PORT_NOTES.md`.
+
 ## Implementation status (resume here)
 
-| file              | status | notes |
-|-------------------|--------|-------|
-| `state.py`        | ✅ done (+tests) | `JointKFState` (q̂, q̇̂, b_ω, P), `JointKFParams`, `init_state`, `default_params`. State is `x = [q ; q̇ ; b_ω] ∈ R^{2n+3m}`. |
-| `../robot.py`     | ✅ seam (adapter TODO) | `RobotModel` Protocol: `mass_matrix(q)` + `relative_gyro_jacobian(q) -> (m,3,n)`. IsaacLab adapter implementing it is TODO. No simulator import. |
-| `noise.py`        | ✅ done (+tests) | `build_F`, `build_Q_d` / `build_process_noise` (diagonal or `σ_τ² M⁻²`), `build_R`. Takes `M` as a raw array (`M=None` → diagonal early-dev `Q_a`). |
-| `predict.py`      | ✅ done (+tests) | `predict(state, params, M=None)`: `x⁻ = F x`, `P⁻ = F P Fᵀ + Q_d` (symmetrized). Raw-array `M`; `split_x` helper added to `state.py`. |
-| `measurement.py`  | ✅ done (+tests) | `relative_gyro_measurement` (vmap differencing), `build_z`, `build_H`, `build_measurement`. Isolates the EKF nonlinearity; takes raw `J_omega (m,3,n)` from `robot.relative_gyro_jacobian`. |
-| `update.py`       | ✅ done (+tests) | `update(state, z, H, R) -> (state⁺, UpdateInfo{ν, S})`. **Joseph form**; Cholesky gain solve. Reuses `noise.build_R` + `state.split_x`. |
-| `filter.py`       | ✅ done (+tests) | `SensorInputs`; `step(state, params, sensors, robot=None)` (predict→update, resolves `robot → M`/`J_omega`); `run(...)` scans a trajectory, returns `(final, states, infos)`. |
+Ported per `JOINTKF_PORT_PLAN.md`. Gates **G1, G6, G7, G8** and the decisive
+stacked oracle are green — 288 tests in `tests/jointKF` + `tests/model`, 592 in
+the full suite.
 
-**Package is feature-complete.** Remaining work is external: the IsaacLab adapter
-implementing `RobotModel`, and the InEKF/ContactNet consumers of the outputs.
+| file | status | notes |
+|---|---|---|
+| `state.py` | ✅ | **The frozen contract.** `JointKFState(x, P)`, `JointKFParams`, `JointKFBuild`, `init_state`, the name tables, and `SEAM_MAP` (Java test hook → Python callable, invariant I10). |
+| `build.py` | ✅ | Graph resolution: every name → index, in plain Python (I7). Union-find acyclicity; rejects self-pairs and same-link pairs. Fixes `K_max` for the filter's lifetime (I2). |
+| `process.py` | ✅ | Schur → `Λ_eff` → Gram `Qa = Y Yᵀ` → Van Loan. `QA_MAX` is a **tripwire that surfaces, never a scaler**. `rotor=` defaults to a sentinel meaning "`M` already carries it" — see the double-add trap. |
+| `predict.py` | ✅ | `build_transition` (`F = I + A dt`, exact — `A` is nilpotent), `predict(state, F, Q)`. Takes `F`/`Q` as arguments, so no dependency on `process.py`. |
+| `update.py` | ✅ | `joseph_update` with masked `K`. The `cond(S)` gate is computed over **informative rows only**; NIS is on the **prior** `P` and prior residual. |
+| `measure.py` | ✅ | Encoder rows, stacked pair rows, and the mixing operator `L`. `R = L Σ Lᵀ` over the **whole** stack, anchors included. |
+| `anchors.py` | ✅ | Stance anchors, F/U split, `R_anchor` congruence, `R_LARGE` masking. The only absolute observation of gyro bias in the filter. |
+| `velocity.py` | ✅ | Optional direct-q̇ channel with lag inflation. **Default OFF.** |
+| `diagnostics.py` | ✅ | `per_joint_nis`, `describe_singular_innovation` (the observable, not Java's message text). |
+| `filter.py` | ✅ | The tick and the `lax.scan`. Owns the one-tick trusted-feet delay and the two-independent-channels decision. |
+| `../model/mjx_model.py` | ✅ | The `RobotModel` adapter — **MJX**, not IsaacLab (repo-root `CLAUDE.md` §2). |
+
+**Remaining:** G9 (`pipeline/main_estimator.py`, the fused joint-KF → InEKF step)
+and G10 (`sim/`, `eval/`). The ContactNet socket (repo-root `CLAUDE.md` §7) has
+its second injection point ready — `anchors.anchor_noise` takes `sigma_eps` as an
+argument with no `stop_gradient`.
 
 **Precision:** the whole package runs in **float64** — `invariant_estimation/__init__.py`
 sets `jax_enable_x64=True` at import (process-global; affects any importer).
 
-Tests live in `tests/jointKF/test_<name>.py` (159 passing). Run:
-`uv run pytest tests/jointKF -q`.
+Run: `uv run pytest tests/jointKF -q`.
+
+**Before changing anything here, read `PORT_NOTES.md`.** Eleven tests in this port
+have been found to pass against wrong implementations; the mutation checks that
+found them are recorded, and the traps they cover are not obvious from the code.
 
 ## Standing conventions
 

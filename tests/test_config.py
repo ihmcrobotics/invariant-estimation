@@ -95,8 +95,17 @@ def test_joint_kf_params_come_from_config():
     cfg = config.section("joint_kf")
     params = jks.default_params()
     assert params.dt == cfg["dt"]
-    assert params.sigma_omega == cfg["sigma_omega"]
     assert params.sigma_tau == cfg["sigma_tau"]
+    assert params.encoder_var == cfg["encoder_var"]
+    assert params.qa_max == cfg["qa_max"]
+    assert params.anchor_var == cfg["anchor_var"]
+    assert params.init_pos_var == cfg["init"]["pos_var"]
+
+
+def test_joint_kf_unknown_override_is_rejected():
+    """A typo'd override must fail loudly rather than be silently dropped."""
+    with pytest.raises(TypeError, match="unknown JointKFParams field"):
+        jks.default_params(sigma_omega=1.0)
 
 
 def test_explicit_arguments_override_config():
@@ -104,6 +113,7 @@ def test_explicit_arguments_override_config():
     assert s.default_params(1, gyro_var=0.5).gyro_var == 0.5
     assert gu.default_gravity_params(pitch_var=0.25).pitch_var == 0.25
     assert jks.default_params(dt=0.002).dt == 0.002
+    assert jks.default_params(qa_max=1.0e9).qa_max == 1.0e9
 
 
 # ---------------------------------------------------------------------------
@@ -143,3 +153,79 @@ def test_test_locked_values_match_the_java_suite():
     assert gravity["gates"]["norm_tol"] == 0.05
     assert gravity["gates"]["rot_tol"] == 0.15
     assert gravity["gates"]["horiz_tol"] == 0.5
+
+    # jointLevel — TEST_SUITE_MAP.md §"Filter constants the tests mirror".
+    jkf = config.section("joint_kf")
+    assert jkf["dt"] == 1.0e-3
+    assert jkf["sigma_accel"] == 50.0
+    assert jkf["sigma_tau"] == 5.0
+    assert jkf["qa_max"] == 900.0
+    assert jkf["encoder_var"] == 5.0e-5
+    assert jkf["sigma_qd_unfiltered"] == 0.1
+    assert jkf["anchor_var"] == 4.0e-4
+    assert jkf["rotor_inertia_default"] == 0.005
+    assert jkf["target_qdd_std"] == 20.0
+    assert jkf["alpha_default"] == 0.15
+    assert jkf["sigma_gyro_floor"] == 1.0e-6
+    assert jkf["sigma_gyro_floor_trace"] == 3.0e-6
+    assert jkf["cond_s_max"] == 1.0e9
+    assert jkf["imu_bias_process_var"] == 1.0e-4
+    assert jkf["lag_slew_smoothing_hz"] == 5.0
+    assert jkf["init"] == {"pos_var": 1.0e-6, "vel_var": 1.0, "bias_var": 2.5e-3}
+
+    # Rotor-inertia table — locked by testRotorInertiaTableLookup (tol 0.0).
+    rotor = jkf["rotor_inertia"]
+    assert rotor["HIP_X"] == 0.062
+    assert rotor["HIP_Y"] == 0.167
+    assert rotor["KNEE"] == 0.167
+    assert rotor["ANKLE_Y"] == 0.07
+    assert rotor["ANKLE_X"] == 0.05
+    assert rotor["SPINE"] == 0.062
+
+
+def test_rotor_inertia_lookup_matches_java_table():
+    """`JointLevelKFRotorAndGramTest.testRotorInertiaTableLookup`, tol 0.0.
+
+    Substring match, case-insensitive, 0.005 default for an unmatched joint.
+    """
+    for name, expected in [
+        ("LEFT_HIP_X", 0.062),
+        ("RIGHT_HIP_Y", 0.167),
+        ("left_knee_y", 0.167),          # case-insensitive
+        ("LEFT_ANKLE_Y", 0.070),
+        ("LEFT_ANKLE_X", 0.050),
+        ("SPINE_Z", 0.062),
+        ("SOME_UNKNOWN_JOINT", 0.005),   # default floor
+    ]:
+        assert jks.rotor_inertia_for_name(name) == expected, name
+
+
+def test_alpha_lookup_falls_back_to_default():
+    """Calibrated per-joint alphas by substring; unlisted joints hit the default.
+
+    The fallback is deliberate: an unlisted filtered joint must surface via the
+    QA_MAX tripwire, not silently inherit a calibrated neighbour's value.
+    """
+    assert jks.alpha_for_name("LEFT_HIP_X") == 6.01544e-2
+    assert jks.alpha_for_name("RIGHT_KNEE_Y") == 2.49771e-2
+    assert jks.alpha_for_name("SPINE_Z") == 5.61133e-2
+    # LEFT/RIGHT pairs agree to ~0.2% — the legs are physically identical, so
+    # that symmetry is what validates the 2026-07-10 calibration measurement.
+    for left, right in [("LEFT_HIP_X", "RIGHT_HIP_X"), ("LEFT_KNEE_Y", "RIGHT_KNEE_Y")]:
+        a, b = jks.alpha_for_name(left), jks.alpha_for_name(right)
+        assert abs(a - b) / a < 0.12, f"{left} vs {right}: {a} vs {b}"
+    # Unlisted joint -> the loud default, never a calibrated neighbour's value.
+    assert jks.alpha_for_name("LEFT_WRIST_Z") == 0.15
+    assert jks.alpha_for_name("SOME_UNKNOWN_JOINT") == 0.15
+
+
+def test_encoder_var_reports_unwired_joints():
+    """An unwired joint takes the 5e-5 fallback and says so.
+
+    That fallback is 2-4 orders ABOVE the hardware-measured per-joint variances,
+    so a joint silently on it badly under-trusts its encoder — `build.py` must be
+    able to name every such joint at boot (Java parity).
+    """
+    var, wired = jks.encoder_var_for_name("ANY_UNWIRED_JOINT")
+    assert var == 5.0e-5
+    assert wired is False

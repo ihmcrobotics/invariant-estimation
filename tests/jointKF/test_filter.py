@@ -1,191 +1,247 @@
-"""Tests for joint_kf/filter.py — the predict→update orchestrator + scan.
+"""The filter tick and the scan — `jointKF/filter.py`.
 
-Also verifies the package-wide float64 setting from invariant_estimation/__init__.
+No single Java class corresponds to this file: the Java suite exercises the
+orchestration through `JointLevelKFFilterTest` and `JointLevelKFTrajectoryTest`
+(gate G8, behavioural) rather than structurally. What is tested here is the
+wiring the port has to get right *because* it is fixed-shape and pure — the
+things that have no Java analogue because Java simply reshapes:
+
+* the one-tick delay on the trusted-feet mask (CLAUDE.md §4 phase ordering),
+* that the two channels gate independently, so a bad gyro does not cost the
+  encoders,
+* and the constant-graph property (I7).
+
+On what the graph tests prove. Traced arrays cannot change a jaxpr, so equality
+across contact patterns is nearly automatic; what these genuinely catch is a
+data-dependent branch, which raises at trace time. The load-bearing assertion is
+that the *lowered program* is identical across contact patterns — i.e. no
+recompilation — which is the port's analogue of the Java allocation guard
+(CLAUDE.md §3, "Skip"). Stated as what it proves, not what one might hope
+(JOINTKF_PORT_PLAN §4 lesson 3).
 """
-from functools import partial
-
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
-from invariant_estimation import robot as robot_mod
-from invariant_estimation.jointKF import measurement as meas
-from invariant_estimation.jointKF import noise
-from invariant_estimation.jointKF.filter import SensorInputs, run, step
-from invariant_estimation.jointKF.predict import predict
-from invariant_estimation.jointKF.state import default_params, init_state
-from invariant_estimation.jointKF.update import update
+from invariant_estimation.jointKF import anchors as anchors_mod, measure
+from invariant_estimation.jointKF.build import build_joint_kf
+from invariant_estimation.jointKF.filter import (
+    FilterCarry,
+    ModelInputs,
+    SensorInputs,
+    init_carry,
+    run,
+    step,
+)
+from invariant_estimation.jointKF.state import default_params
+
+from . import _fixture as fx
+from ._fixture import kinematic_tree
+from ._oracles import SHAPES, assert_positive_semidefinite, assert_symmetric
+
+SHAPE = SHAPES[0]
 
 
-# (n_joints, n_pairs), including the encoder-only edge case m = 0.
-SHAPES = [(6, 2), (1, 1), (4, 0), (12, 3)]
+@pytest.fixture(scope="module")
+def scene():
+    """A real MJX chain with one anchor slot, and one tick of consistent motion."""
+    f = fx.fixture(SHAPE["name"])
+    tree = kinematic_tree(f)
+    build = build_joint_kf(
+        tree,
+        imu_sites=list(f.imu_names),
+        pairs=[tuple(p) for p in f.pairs],
+        foot_sites=[f.foot_site],
+    )
+    params = default_params()
+    motion = f.apply_consistent_motion(np.zeros(f.n), np.zeros(f.n))
+    q = jnp.asarray(motion.q, dtype=jnp.float64)
+    J_rel, R_rel = measure.pair_frames(f.model, q)
+    ev = f.model.evaluate(q)
+    # `anchor_jacobians` indexes into `ev.J_ang` / `ev.site_rot`, which are in
+    # `model.site_names` order -- IMU sites first, then the foot.
+    names = list(f.model.site_names)
+    jac = anchors_mod.anchor_jacobians(
+        build, ev.J_ang, ev.site_rot,
+        base_site=names.index(f.imu_names[build.base_imu]),
+        foot_sites=np.array([names.index(f.foot_site)]),
+    )
+    # The fixture MJCF carries `armature`, so `ev.M` already includes the rotor
+    # inertia pre-Schur -- which is why `filter.step` passes the
+    # ROTOR_IN_MASS_MATRIX sentinel and never adds it again (CLAUDE.md §6).
+    model = ModelInputs(J_rel=J_rel, R_rel=R_rel, anchor_jac=jac, M=ev.M)
+    return f, build, params, model, motion
 
 
-class DummyRobot:
-    """A minimal RobotModel: SPD diagonal mass matrix, q-dependent gyro Jacobian."""
-
-    def __init__(self, n, m):
-        self.n = n
-        self.m = m
-
-    def mass_matrix(self, q):
-        return jnp.diag(1.0 + 0.5 * jnp.sin(q))          # SPD (entries in [0.5, 1.5])
-
-    def relative_gyro_jacobian(self, q):
-        # (m, 3, n), smoothly q-dependent and deterministic.
-        base = jnp.cos(jnp.outer(jnp.arange(3 * self.m), q) + q.sum())
-        return base.reshape(self.m, 3, self.n)
-
-
-def _sensors(n, m, t=0):
+def sensors_for(build, motion, contact):
+    n_u = build.anchor_unfiltered_mask.shape[1]
     return SensorInputs(
-        q_tilde=0.1 * jnp.arange(1.0, n + 1.0) + t,
-        omega_a=jnp.ones((m, 3)) * (1 + t),
-        omega_b=1.5 * jnp.ones((m, 3)) * (1 + t),
-        R_ba=jnp.broadcast_to(jnp.eye(3), (m, 3, 3)),
+        encoders=jnp.asarray(motion.q, dtype=jnp.float64),
+        gyros=jnp.asarray(motion.gyro, dtype=jnp.float64),
+        qd_unfiltered=jnp.zeros(n_u, dtype=jnp.float64),
+        contact=jnp.asarray(contact, dtype=jnp.float64),
     )
 
 
-def _sensor_seq(n, m, T):
-    """Stack T per-step SensorInputs into a leading-time pytree."""
-    steps = [_sensors(n, m, t) for t in range(T)]
-    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *steps)
+# ---------------------------------------------------------------------------
+# The tick
+# ---------------------------------------------------------------------------
+
+def test_one_tick_keeps_the_covariance_symmetric_psd(scene):
+    f, build, params, model, motion = scene
+    carry = init_carry(build, params, jnp.asarray(motion.q))
+    carry, diag = step(carry, sensors_for(build, motion, [1.0]), model, build, params)
+
+    P = np.asarray(carry.state.P)
+    assert np.all(np.isfinite(np.asarray(carry.state.x)))
+    assert_symmetric(P, 1.0e-9, "P after one tick")
+    assert_positive_semidefinite(P, "P after one tick")
+
+
+def test_trusted_feet_are_delayed_by_exactly_one_tick(scene):
+    """The mask is written at the end of step k and read at the start of k+1.
+
+    Using *this* tick's contact would correlate the gating decision with the
+    measurement it gates, through the shared sensor noise — which biases the very
+    bias estimate the anchor exists to make observable. The delay is the fix, and
+    it is invisible unless asserted directly.
+    """
+    f, build, params, model, motion = scene
+    carry = init_carry(build, params, jnp.asarray(motion.q))
+    assert float(carry.trusted_feet[0]) == 0.0, "feet start untrusted"
+
+    # Tick 0 reports contact; the anchor must NOT yet be active this tick.
+    carry, diag0 = step(carry, sensors_for(build, motion, [1.0]), model, build, params)
+    assert float(diag0.active_anchors) == 0.0
+    assert float(carry.trusted_feet[0]) == 1.0, "mask carried forward"
+
+    # Tick 1 now sees it.
+    carry, diag1 = step(carry, sensors_for(build, motion, [0.0]), model, build, params)
+    assert float(diag1.active_anchors) == 1.0
+    assert float(carry.trusted_feet[0]) == 0.0, "release also delayed"
+
+
+def test_a_nan_gyro_does_not_cost_the_encoder_update(scene):
+    """Channels gate independently — the reason they are two Joseph updates.
+
+    A single stacked block would mean one bad IMU throws the encoders away too.
+    That is a behavioural difference, not a numerical one, and it is exactly what
+    `testTransientNonFiniteInputRecovers` cares about.
+    """
+    f, build, params, model, motion = scene
+    carry = init_carry(build, params, jnp.asarray(motion.q))
+    s = sensors_for(build, motion, [0.0])
+    s = s._replace(gyros=s.gyros.at[0].set(jnp.nan))
+
+    carry, diag = step(carry, s, model, build, params)
+    assert float(diag.stacked_applied) == 0.0, "poisoned gyro update must be skipped"
+    assert float(diag.encoder_applied) == 1.0, "encoders must survive it"
+    assert np.all(np.isfinite(np.asarray(carry.state.x))), "no NaN may propagate"
+    assert np.all(np.isfinite(np.asarray(carry.state.P)))
+
+
+def test_recovery_is_automatic_after_a_bad_window(scene):
+    """No latch: once the input is clean again the channel applies immediately."""
+    f, build, params, model, motion = scene
+    carry = init_carry(build, params, jnp.asarray(motion.q))
+    bad = sensors_for(build, motion, [0.0])
+    bad = bad._replace(gyros=bad.gyros.at[0].set(jnp.nan))
+    good = sensors_for(build, motion, [0.0])
+
+    for _ in range(5):
+        carry, diag = step(carry, bad, model, build, params)
+        assert float(diag.stacked_applied) == 0.0
+    carry, diag = step(carry, good, model, build, params)
+    assert float(diag.stacked_applied) == 1.0, "gate latched — it must not"
 
 
 # ---------------------------------------------------------------------------
-# float64
+# Constant graph (I7)
 # ---------------------------------------------------------------------------
 
-def test_float64_is_active():
-    assert jnp.zeros(1).dtype == jnp.float64
-    st = init_state(4, 2)
-    assert st.P.dtype == jnp.float64
+def test_step_compiles_to_one_program_across_contact_patterns(scene):
+    """The constant-graph property (I7), measured by the LOWERED program.
+
+    What this proves: the compiled executable is byte-identical whichever feet
+    are on the ground, so a touchdown cannot trigger a recompilation inside a
+    vmapped/scanned MJX rollout.  That is the port's analogue of the Java
+    allocation guard, which is skipped as JVM-specific (CLAUDE.md §3).
+
+    What it does NOT prove: that the masks are *correct*.  Traced arrays cannot
+    change a jaxpr, so structural equality here is close to automatic; the real
+    failure it catches is a data-dependent branch, which raises at trace time
+    (JOINTKF_PORT_PLAN §4 lesson 3 — state what a test proves).
+
+    Measured by comparing `lower(...).as_text()` rather than `_cache_size()`.
+    The jit cache is a global LRU: running the full suite evicts this entry and
+    `_cache_size()` reads 0, so an assertion on it fails without any retrace
+    having occurred.  It measures a shared resource other tests pollute, which is
+    a property of the test session, not of the code under test.
+    """
+    f, build, params, model, motion = scene
+    jstep = jax.jit(lambda c, s: step(c, s, model, build, params))
+
+    carry = init_carry(build, params, jnp.asarray(motion.q))
+    programs = set()
+    for contact in ([0.0], [1.0], [0.0], [1.0]):
+        sensors = sensors_for(build, motion, contact)
+        programs.add(jstep.lower(carry, sensors).as_text())
+        carry, _ = jstep(carry, sensors)
+
+    assert len(programs) == 1, (
+        f"contact pattern changed the compiled program ({len(programs)} distinct)"
+    )
+    # A retrace would push the cache above one entry; eviction can only take it
+    # below, so this direction stays meaningful under a full-suite run.
+    assert jstep._cache_size() <= 1, "a contact pattern triggered a retrace"
 
 
-# ---------------------------------------------------------------------------
-# step
-# ---------------------------------------------------------------------------
+def test_run_scans_a_trajectory(scene):
+    """`run` over 50 ticks: finite, PSD, and one compiled tick regardless of length."""
+    f, build, params, model, motion = scene
+    ticks = 50
+    s1 = sensors_for(build, motion, [1.0])
+    contact = np.zeros((ticks, build.n_anchors))
+    contact[20:] = 1.0                                  # a touchdown mid-trajectory
+    traj = SensorInputs(
+        encoders=jnp.tile(s1.encoders, (ticks, 1)),
+        gyros=jnp.tile(s1.gyros, (ticks, 1, 1)),
+        qd_unfiltered=jnp.tile(s1.qd_unfiltered, (ticks, 1)),
+        contact=jnp.asarray(contact),
+    )
+    models = jax.tree.map(lambda a: jnp.broadcast_to(a, (ticks,) + a.shape), model)
 
-@pytest.mark.parametrize("n, m", SHAPES)
-def test_step_matches_manual_compose(n, m):
-    p = default_params()
-    robot = DummyRobot(n, m)
-    st = init_state(n, m, q0=0.2 * jnp.arange(1.0, n + 1.0))
-    sensors = _sensors(n, m)
+    carry = init_carry(build, params, jnp.asarray(motion.q))
+    final, diag = run(carry, traj, models, build, params)
 
-    out, info = step(st, p, sensors, robot)
-
-    # Manual predict → update with the same resolved arrays.
-    M = robot.mass_matrix(st.q_hat)
-    pred = predict(st, p, M)
-    J = robot.relative_gyro_jacobian(pred.q_hat)
-    z, H = meas.build_measurement(sensors.q_tilde, sensors.omega_a,
-                                  sensors.omega_b, sensors.R_ba, J, n)
-    R = noise.build_R(p, n, m)
-    out_ref, info_ref = update(pred, z, H, R)
-
-    assert jnp.allclose(out.x, out_ref.x)
-    assert jnp.allclose(out.P, out_ref.P)
-    assert jnp.allclose(info.nu, info_ref.nu)
-    assert jnp.allclose(info.S, info_ref.S)
-
-
-@pytest.mark.parametrize("n, m", SHAPES)
-def test_step_no_robot_uses_diagonal_and_zero_jacobian(n, m):
-    p = default_params()
-    st = init_state(n, m)
-    sensors = _sensors(n, m)
-
-    out, _ = step(st, p, sensors, robot=None)
-
-    pred = predict(st, p, None)                          # diagonal Q_a
-    z, H = meas.build_measurement(sensors.q_tilde, sensors.omega_a,
-                                  sensors.omega_b, sensors.R_ba,
-                                  jnp.zeros((m, 3, n)), n)
-    R = noise.build_R(p, n, m)
-    out_ref, _ = update(pred, z, H, R)
-    assert jnp.allclose(out.x, out_ref.x)
-    assert jnp.allclose(out.P, out_ref.P)
+    P = np.asarray(final.state.P)
+    assert np.all(np.isfinite(np.asarray(final.state.x)))
+    assert_symmetric(P, 1.0e-9, "P after 50 ticks")
+    assert_positive_semidefinite(P, "P after 50 ticks")
+    # Anchors switch on one tick AFTER contact is reported (phase ordering).
+    active = np.asarray(diag.active_anchors)
+    assert active[20] == 0.0 and active[21] == 1.0
 
 
-# ---------------------------------------------------------------------------
-# run / scan
-# ---------------------------------------------------------------------------
+def test_covariance_stays_bounded_over_the_scan(scene):
+    """A measurement-free-ish run must not let P run away (Java testCovarianceBounded)."""
+    f, build, params, model, motion = scene
+    ticks = 200
+    s1 = sensors_for(build, motion, [1.0])
+    traj = SensorInputs(
+        encoders=jnp.tile(s1.encoders, (ticks, 1)),
+        gyros=jnp.tile(s1.gyros, (ticks, 1, 1)),
+        qd_unfiltered=jnp.tile(s1.qd_unfiltered, (ticks, 1)),
+        contact=jnp.ones((ticks, build.n_anchors)),
+    )
+    models = jax.tree.map(lambda a: jnp.broadcast_to(a, (ticks,) + a.shape), model)
+    carry = init_carry(build, params, jnp.asarray(motion.q))
+    initial_trace = float(jnp.trace(carry.state.P))
+    final, _ = run(carry, traj, models, build, params)
+    final_trace = float(jnp.trace(final.state.P))
 
-@pytest.mark.parametrize("n, m", SHAPES)
-def test_run_matches_python_loop(n, m):
-    p = default_params()
-    robot = DummyRobot(n, m)
-    T = 5
-    seq = _sensor_seq(n, m, T)
-    st0 = init_state(n, m)
-
-    final, states, infos = run(st0, p, seq, robot)
-
-    # Python-loop reference.
-    carry = st0
-    xs, Ps, nus = [], [], []
-    for t in range(T):
-        sensors = jax.tree_util.tree_map(lambda a: a[t], seq)
-        carry, info = step(carry, p, sensors, robot)
-        xs.append(carry.x)
-        Ps.append(carry.P)
-        nus.append(info.nu)
-
-    assert jnp.allclose(final.x, carry.x)
-    assert jnp.allclose(final.P, carry.P)
-    assert jnp.allclose(states.x, jnp.stack(xs))
-    assert jnp.allclose(states.P, jnp.stack(Ps))
-    assert jnp.allclose(infos.nu, jnp.stack(nus))
-
-
-@pytest.mark.parametrize("n, m", SHAPES)
-def test_run_trajectory_shapes(n, m):
-    p = default_params()
-    robot = DummyRobot(n, m)
-    T = 4
-    D = 2 * n + 3 * m
-    dz = n + 3 * m
-    final, states, infos = run(init_state(n, m), p, _sensor_seq(n, m, T), robot)
-    assert states.q_hat.shape == (T, n)
-    assert states.q_dot_hat.shape == (T, n)
-    assert states.b_omega.shape == (T, 3 * m)
-    assert states.P.shape == (T, D, D)
-    assert infos.nu.shape == (T, dz)
-    assert infos.S.shape == (T, dz, dz)
-    assert final.P.shape == (D, D)
-
-
-@pytest.mark.parametrize("n, m", SHAPES)
-def test_run_covariance_psd_along_trajectory(n, m):
-    p = default_params()
-    robot = DummyRobot(n, m)
-    _, states, _ = run(init_state(n, m), p, _sensor_seq(n, m, 6), robot)
-    for P in states.P:
-        assert jnp.allclose(P, P.T, atol=1e-9)
-        eig = jnp.linalg.eigvalsh(P)
-        assert eig.min() >= -1e-9 * jnp.maximum(eig.max(), 1.0)
-
-
-def test_run_jit_matches_eager():
-    n, m = 6, 2
-    p = default_params()
-    robot = DummyRobot(n, m)
-    seq = _sensor_seq(n, m, 5)
-    st0 = init_state(n, m)
-
-    final_e, states_e, infos_e = run(st0, p, seq, robot)
-    run_jit = jax.jit(partial(run, robot=robot))
-    final_j, states_j, infos_j = run_jit(st0, p, seq)
-
-    assert jnp.allclose(final_e.P, final_j.P)
-    assert jnp.allclose(states_e.x, states_j.x)
-    assert jnp.allclose(infos_e.S, infos_j.S)
-
-
-# ---------------------------------------------------------------------------
-# robot seam
-# ---------------------------------------------------------------------------
-
-def test_dummy_robot_satisfies_protocol():
-    assert isinstance(DummyRobot(4, 2), robot_mod.RobotModel)
+    assert np.isfinite(final_trace)
+    assert final_trace <= initial_trace * 10.0 + 1.0, (
+        f"trace grew {initial_trace:.3e} -> {final_trace:.3e}"
+    )

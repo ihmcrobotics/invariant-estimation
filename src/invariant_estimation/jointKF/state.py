@@ -1,291 +1,463 @@
 """
-joint_kf/state.py
-=================
-State and parameter types for the linear joint-chain Kalman filter.
+jointKF/state.py
+================
+The **frozen contract** for the joint-space KF (CLAUDE.md §1 deliverable 1, gates
+G6-G8).  Every other module in this package -- and every ported test -- builds
+against the layout, parameter names, and index helpers defined here.
 
-The filter operates on the bias-augmented joint state
+State layout (locked by `JointLevelKFStateTest.testXOrdering`)
+-------------------------------------------------------------
+::
 
-    x = [q ; q_dot ; b_omega]  ∈ R^{2n + 3m}
+    x = [ q (n) ; q_dot (n) ; b_omega (3m) ]  in R^{2n + 3m}
 
-where
+    n = number of FILTERED joints (the union of 1-DoF joints on the IMU-pair
+        chains -- fixed at build time, so `dim` is static)
+    m = number of DISTINCT IMUs
 
-    n  = number of 1-DoF joints,
-    m  = number of IMU pairs being fused,
-    b_omega = residual *relative* gyro bias, one 3-vector per IMU pair.
+**`m` is per-IMU, not per-pair.**  This is the breaking change from the
+superseded Rev.1 design and it is not cosmetic: invariant I6 requires the exact
+`L Sigma L^T` cross-covariance on the stacked gyro measurement over a
+shared-base-IMU star, and the bias columns of `H_g` must *be* the mixing operator
+`L` (`testBiasColumnsOfHgAreExactlyL` asserts this bit-identically).  With
+per-pair bias, two pairs sharing an IMU carry two independent copies of one
+physical bias, the shared-IMU cross terms vanish, and the G7 stacked oracle
+cannot pass.
 
-`b_omega` is the *fine residual* bias left over after the per-IMU Mahony
-filter (the upstream coarse absolute-bias attenuator).  Because Mahony has
-already removed the bulk of the bias, `b_omega` is modeled with a TIGHT
-random-walk noise and a TIGHT initial covariance — otherwise the two
-estimators fight over the same error and produce a slow oscillation.
-
-The covariance P ∈ R^{(2n+3m) × (2n+3m)} tracks uncertainty over x.  Its
-marginal blocks feed the downstream InEKF measurement model and ContactNet:
-
-    Sigma_q   := P[0:n,     0:n  ]   → InEKF position FK noise  N = J_C Σ_q J_C.T
-    Sigma_qd  := P[n:2n,   n:2n ]   → kinematic part of contact-velocity noise
-    Sigma_b   := P[2n:,    2n:  ]   → residual-bias marginal (ContactNet feature)
+Bias lives here and **only** here -- invariant I1.  The InEKF state stays pure
+SE_{N+2}(3) and consumes bias-corrected `omega_bar, a_bar`.
 
 Design notes
 ------------
-* JointKFState is a NamedTuple so it is a valid JAX pytree with no extra
-  registration.  This lets jax.lax.scan carry it as loop state without any
-  static-field issues.
+* `JointKFState` is a NamedTuple, hence a JAX pytree with no registration, so
+  `jax.lax.scan` carries it directly.
 
-* n_joints and n_pairs are NOT stored in the state.  Array shapes encode
-  them implicitly; storing them would make the struct non-pytree-safe with
-  jit unless marked static everywhere.
+* `n` and `m` are NOT stored in the state -- array shapes encode them.  Storing
+  them would make the struct non-pytree-safe under jit unless marked static
+  everywhere.
 
-* b_omega is stored FLAT, shape (3m,), so that the stacked state vector `x`
-  is a plain concatenation and the P block layout is contiguous.  Use the
-  `b_omega_pairs` property for a per-pair (m, 3) view.
+* `b_omega` is stored FLAT `(3m,)` so the stacked vector `x` is a plain
+  concatenation and the `P` block layout is contiguous.  `b_omega_imus` gives the
+  `(m, 3)` view.
 
-* JointKFParams holds the scalar constants that are fixed for the lifetime of
-  a filter run.  noise.py / update.py reference this type when building Q and
-  R.  IMU pairing topology and selection matrices S_ab are NOT here — they are
-  deferred to measurement.py; JointKFParams carries only scalars for now.
+* `JointKFBuild` holds everything resolved from **names** -- index arrays, masks,
+  per-joint parameter vectors.  Name-table resolution happens once, in plain
+  Python, at build time (invariant I7: no strings and no data-dependent shapes
+  inside jit).  The jitted step closes over a `JointKFBuild`.
+
+* Every "skip"/"gate"/"anchor active" decision is a fixed-shape float mask, never
+  a Python branch or a reshape (CLAUDE.md §4).
+
+Pure-function discipline (invariant I10)
+----------------------------------------
+Both filters are pure functions over an explicit `(x, P)` carry.  The Java
+suite's `*ForTest` seams then cost nothing -- they are just these sub-functions
+called directly.  `TEST_SUITE_MAP.md` §"Test seams" is the required public
+surface; the mapping is recorded in `SEAM_MAP` below so a ported test can be read
+against the Java one without guessing.
 """
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax.numpy as jnp
+import numpy as np
 from jax import Array
 
 from ..config import section
 
+# ---------------------------------------------------------------------------
+# Seam map: Java test hook  ->  Python callable. Part of the public surface
+# (invariant I10), kept here so a ported test reads 1:1 against the Java one.
+# ---------------------------------------------------------------------------
+SEAM_MAP: dict[str, str] = {
+    "initialize":                        "jointKF.filter.initialize",
+    "predict":                           "jointKF.predict.predict",
+    "josephUpdate":                      "jointKF.update.joseph_update",
+    "setStateForTest":                   "JointKFState(x=..., P=...)  (pure carry)",
+    "getStateVector":                    "JointKFState.x",
+    "getCovariance":                     "JointKFState.P",
+    "getStateDimension":                 "JointKFBuild.dim",
+    "getTransitionMatrix":               "jointKF.predict.build_transition",
+    "getProcessNoise":                   "jointKF.process.build_process_noise",
+    "getEncoderJacobian":                "jointKF.measure.encoder_jacobian",
+    "getEncoderNoise":                   "jointKF.measure.encoder_noise",
+    "buildStackedMeasurementForTest":    "jointKF.measure.build_stacked",
+    "getStackedMeasurementJacobian":     "StackedMeasurement.H",
+    "getStackedMeasurementResidual":     "StackedMeasurement.z",
+    "getStackedMeasurementNoise":        "StackedMeasurement.R",
+    "getStackedRowForPair":              "JointKFBuild.stacked_row_for_pair",
+    "getMixingOperator":                 "StackedMeasurement.L",
+    "getPairParentBiasColumn":           "JointKFBuild.pair_parent_bias_col",
+    "getPairChildBiasColumn":            "JointKFBuild.pair_child_bias_col",
+    "getPairVelocityColumns":            "JointKFBuild.pair_velocity_cols",
+    "getBiasBlockColumn":                "JointKFBuild.bias_col",
+    "getJointStateIndex":                "JointKFBuild.joint_index",
+    "getNumberOfPairs":                  "JointKFBuild.n_pairs",
+    "getNumberOfFilteredJoints":         "JointKFBuild.n_joints",
+    "getNumberOfIMUs":                   "JointKFBuild.n_imus",
+    "getActiveAnchorCountForTest":       "JointKFBuild-shaped mask sum in Diagnostics",
+    "setTrustedFeetForTest":             "trusted_feet mask argument to build_stacked",
+    "isUsingMassMatrixProcessNoise":     "JointKFBuild.use_mass_matrix",
+    "updateProcessNoiseFromMassMatrixForTest": "jointKF.process.acceleration_covariance",
+    "reflectedRotorInertiaForNameOrDefault":   "jointKF.state.rotor_inertia_for_name",
+    "getAngularVelocityBiasInIMUFrame":  "JointKFState.b_omega_imus[i]",
+    "describeSingularInnovation":        "Diagnostics.degenerate_row_attribution",
+}
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
 class JointKFState(NamedTuple):
-    """Sufficient statistic for the bias-augmented joint-chain KF.
+    """Sufficient statistic for the bias-augmented joint KF: the `(x, P)` carry.
 
     Attributes
     ----------
-    q_hat : Array, shape (n,)
-        Filtered joint position estimate [rad].
-    q_dot_hat : Array, shape (n,)
-        Filtered joint velocity estimate [rad/s].
-    b_omega : Array, shape (3m,)
-        Residual relative gyro bias, one 3-vector per IMU pair, stored flat.
-    P : Array, shape (2n+3m, 2n+3m)
-        Full joint error covariance.
-        Block structure (n joints, m IMU pairs):
+    x : Array, shape (2n + 3m,)
+        Stacked mean `[q ; q_dot ; b_omega]`.  Stored stacked rather than as
+        three fields because every seam the Java suite exposes
+        (`getStateVector`, `setStateForTest`, `josephUpdate`) operates on the
+        stacked vector, and `P`'s blocks are indexed against it.
+    P : Array, shape (2n + 3m, 2n + 3m)
+        Full error covariance::
+
             P = [[ P_qq    P_q_qd   P_q_b  ],
                  [ P_qd_q  P_qdqd   P_qd_b ],
                  [ P_b_q   P_b_qd   P_bb   ]]
-        where P_qq = Sigma_q is the marginal used downstream in N = J_C Σ_q J_C.T.
+
+        `P_qq` is `Sigma_q`, the marginal the InEKF contact update pushes forward
+        as `N = J_C Sigma_q J_C^T`.
     """
-    q_hat: Array      # (n,)
-    q_dot_hat: Array  # (n,)
-    b_omega: Array    # (3m,)
-    P: Array          # (2n+3m, 2n+3m)
 
-    @property
-    def n_joints(self) -> int:
-        """Number of joints, inferred from the `q_hat` shape."""
-        return self.q_hat.shape[0]
+    x: Array
+    P: Array
 
-    @property
-    def n_pairs(self) -> int:
-        """Number of IMU pairs m, inferred from the `b_omega` shape (3m,)."""
-        return self.b_omega.shape[0] // 3
+    # -- segment views ------------------------------------------------------
+    def q(self, n: int) -> Array:
+        """Joint positions `q`, shape (n,)."""
+        return self.x[..., :n]
 
-    @property
-    def sigma_q(self) -> Array:
-        r"""Marginal position covariance $\Sigma_q$, shape (n, n).
+    def q_dot(self, n: int) -> Array:
+        """Joint velocities `q_dot`, shape (n,)."""
+        return self.x[..., n:2 * n]
 
-        Top-left block of P; what the InEKF measurement model needs for FK
-        noise propagation:
+    def b_omega(self, n: int) -> Array:
+        """Per-IMU gyro bias, flat, shape (3m,)."""
+        return self.x[..., 2 * n:]
 
-            N = J_C @ sigma_q @ J_C.T
+    def b_omega_imus(self, n: int) -> Array:
+        """Per-IMU view of the gyro bias, shape (m, 3).
+
+        The Java seam `getAngularVelocityBiasInIMUFrame(imu)` is row `imu` of
+        this: the bias is *stored* in each IMU's own measurement frame, so no
+        rotation is applied on read.
         """
-        n = self.n_joints
+        return self.b_omega(n).reshape(-1, 3)
+
+    # -- covariance marginals ----------------------------------------------
+    def sigma_q(self, n: int) -> Array:
+        r"""Marginal position covariance $\Sigma_q$, shape (n, n) -- InEKF FK noise."""
         return self.P[:n, :n]
 
-    @property
-    def sigma_q_dot(self) -> Array:
+    def sigma_q_dot(self, n: int) -> Array:
         """Marginal velocity covariance, shape (n, n).
 
-        Middle block P[n:2n, n:2n].  Note the explicit 2n upper bound: P now
-        carries the bias block after the velocity block, so an open-ended
-        slice would incorrectly fold the bias rows/cols into this marginal.
+        Note the explicit `2n` upper bound: `P` carries the bias block after the
+        velocity block, so an open-ended slice would fold bias rows/cols in.
         """
-        n = self.n_joints
         return self.P[n:2 * n, n:2 * n]
 
-    @property
-    def sigma_b(self) -> Array:
-        """Marginal residual-bias covariance, shape (3m, 3m).
-
-        Bottom-right block P[2n:, 2n:].  Its diagonal is a ContactNet trust
-        feature; the whole block stays tight by construction (see module docstring).
-        """
-        n = self.n_joints
+    def sigma_b(self, n: int) -> Array:
+        """Marginal bias covariance, shape (3m, 3m)."""
         return self.P[2 * n:, 2 * n:]
-
-    @property
-    def b_omega_pairs(self) -> Array:
-        """Per-pair view of the residual bias, shape (m, 3)."""
-        return self.b_omega.reshape(self.n_pairs, 3)
-
-    @property
-    def x(self) -> Array:
-        """Stacked state vector [q ; q_dot ; b_omega], shape (..., 2n+3m).
-
-        Concatenates on the last axis, so this also works on a batched/stacked
-        state (e.g. a `jax.lax.scan` trajectory with a leading time axis), not
-        only a single 1-D state.
-        """
-        return jnp.concatenate([self.q_hat, self.q_dot_hat, self.b_omega], axis=-1)
 
 
 def split_x(x: Array, n_joints: int) -> tuple[Array, Array, Array]:
-    """Inverse of `JointKFState.x`: split [q ; q_dot ; b_omega] into its parts.
+    """Split `[q ; q_dot ; b_omega]` into its three segments.
 
-    Reconstructs the three state segments from a stacked vector, so the filter
-    steps (predict / update) that operate on `x` can rebuild a JointKFState
-    without duplicating the slice arithmetic.  `b_omega` is the remainder, so
-    `n_pairs` is not needed.
-
-    Parameters
-    ----------
-    x : Array, shape (2n+3m,)
-        Stacked state vector.
-    n_joints : int
-        Number of joints n.
-
-    Returns
-    -------
-    (q_hat, q_dot_hat, b_omega) : tuple of Array, shapes (n,), (n,), (3m,)
+    `b_omega` is the remainder, so `m` is not needed.
     """
     n = n_joints
-    return x[:n], x[n:2 * n], x[2 * n:]
+    return x[..., :n], x[..., n:2 * n], x[..., 2 * n:]
 
 
 # ---------------------------------------------------------------------------
-# Parameters
+# Parameters -- scalars, straight from config/filter_cfg.yaml
 # ---------------------------------------------------------------------------
 
 class JointKFParams(NamedTuple):
-    """Fixed parameters for the joint KF — constant across a filter run.
+    """Scalar tunables, constant for a filter run.  See `config/filter_cfg.yaml`.
 
-    These are passed into `predict()` and `update()` rather than stored in the
-    mutable state.  Keeping them separate makes it straightforward to
-    JIT-compile the filter step with params as a static argument or a traced
-    pytree depending on the use case.
-
-    Attributes
-    ----------
-    sigma_enc : float
-        Encoder position measurement noise std dev [rad].
-        Builds the encoder block of R:  R_enc = sigma_enc^2 * I_n.
-
-    sigma_omega : float
-        Relative-gyro measurement noise std dev [rad/s] for the IMU block of R
-        (R_omega).  This is the *Mahony-cleaned* relative-gyro covariance —
-        smaller than a raw gyro because the per-IMU pre-filter already
-        attenuated bias and noise.  One scalar shared across pairs for now.
-
-    sigma_tau : float
-        Torque-space process-noise std dev [N·m].  The physically-correct
-        acceleration process noise is the mass-matrix sandwich
-        Q_a = sigma_tau^2 * M(q)^{-2}, built in noise.py.  This is the eventual
-        replacement for the `sigma_acc` diagonal stand-in once M(q) shaping is
-        switched on.
-
-    sigma_acc : float
-        Joint acceleration process noise std dev [rad/s^2], used as the
-        EARLY-DEV diagonal substitute for Q_a (Q_a = sigma_acc^2 * I_n).  Lets
-        the InEKF / ContactNet be validated before mass-matrix coupling is
-        wired up.  Ignored once noise.py uses the M(q)-weighted Q_a.
-
-    sigma_b : float
-        Residual relative-bias random-walk std dev [rad/s].  Builds the bias
-        block of Q_d:  Q_d^{bb} = sigma_b^2 * dt * I_3m.  Keep TIGHT — b_omega
-        is only the leftover after Mahony, so a loose value lets the two
-        estimators fight over the same error.
-
-    dt : float
-        Filter timestep [s].  Used in predict.py for F and Q_d.
+    Everything name-resolved (per-joint alpha, rotor inertia, encoder variance,
+    per-IMU gyro Sigma) lives in `JointKFBuild`, not here -- those are arrays
+    produced by build-time name matching, and keeping them out of this struct is
+    what lets the jitted step treat `JointKFParams` as a plain pytree of scalars.
     """
 
-    sigma_enc: float    # [rad]
-    sigma_omega: float  # [rad/s]   — Mahony-cleaned relative-gyro std (R_omega)
-    sigma_tau: float    # [N·m]     — torque-space process noise (Q_a = σ_τ² M⁻²)
-    sigma_acc: float    # [rad/s^2] — early-dev diagonal Q_a substitute
-    sigma_b: float      # [rad/s]   — residual-bias random walk (keep TIGHT)
-    dt: float           # [s]
+    dt: float                       # [s]
+    # measurement
+    encoder_var: float              # [rad^2] fallback per-joint encoder variance
+    sigma_gyro_floor: float         # [(rad/s)^2] per-axis floor
+    sigma_gyro_floor_trace: float   # floor engages below this trace
+    # process
+    sigma_accel: float              # [rad/s^2] scalar-CWNA fallback
+    sigma_tau: float                # [N.m] fallback torque STD
+    target_qdd_std: float           # [rad/s^2] alpha-equalization target
+    alpha_default: float
+    qa_max: float                   # [(rad/s^2)^2] TRIPWIRE, never a scaler
+    rotor_inertia_default: float
+    imu_bias_process_var: float     # [(rad/s)^2/s]
+    # conditioning
+    cond_s_max: float
+    # initial covariance
+    init_pos_var: float
+    init_vel_var: float
+    init_bias_var: float
+    # stance anchors
+    anchor_var: float               # Sigma_eps -- ContactNet injection point
+    sigma_qd_unfiltered: float      # [rad/s]
+    # direct velocity channel
+    direct_velocity_enabled: bool
+    lag_slew_smoothing_hz: float    # [Hz]
+    # masking
+    r_large: float                  # inactive-anchor R (never zero the rows)
 
 
-# ---------------------------------------------------------------------------
-# Initialisation helpers
-# ---------------------------------------------------------------------------
+def default_params(**overrides: Any) -> JointKFParams:
+    """Build `JointKFParams` from the `joint_kf` config section.
 
-def init_state(
-    n_joints: int,
-    n_pairs: int,
-    q0: Array | None = None,
-) -> JointKFState:
-    """Construct a zeroed-out initial JointKFState.
+    Any field may be overridden by keyword so a test or a sweep needn't touch the
+    file::
 
-    Parameters
-    ----------
-    n_joints : int
-        Number of 1-DoF joints (n).
-    n_pairs : int
-        Number of IMU pairs being fused (m).  May be 0 (encoder-only fallback,
-        no bias block).
-    q0 : Array of shape (n,), optional
-        Initial joint position seed (e.g. from the first encoder reading).
-        Defaults to zeros.
-
-    Returns
-    -------
-    JointKFState
-        q_hat     = q0 (or zeros)
-        q_dot_hat = zeros
-        b_omega   = zeros, shape (3m,)
-        P         = diagonal diffuse prior on [q, q_dot], TIGHT on b_omega
-    """
-    q_hat = q0 if q0 is not None else jnp.zeros(n_joints)
-    q_dot_hat = jnp.zeros(n_joints)
-    b_omega = jnp.zeros(3 * n_pairs)
-
-    # Diffuse prior on the joint state: large variance on position, very large
-    # on velocity — both shrink quickly once encoder / IMU measurements arrive.
-    p_q = 1.0      # [rad^2]   — roughly ±1 rad uncertainty at init
-    p_qd = 10.0    # [rad/s]^2 — roughly ±3 rad/s uncertainty at init
-    # TIGHT prior on the residual bias: Mahony has already removed the bulk, so
-    # b_omega starts near zero with little uncertainty (see module docstring).
-    p_b = 1e-6     # [rad/s]^2 — ±1e-3 rad/s, deliberately tight
-
-    P = jnp.diag(
-        jnp.concatenate([
-            jnp.full(n_joints, p_q),
-            jnp.full(n_joints, p_qd),
-            jnp.full(3 * n_pairs, p_b),
-        ])
-    )
-
-    return JointKFState(q_hat=q_hat, q_dot_hat=q_dot_hat, b_omega=b_omega, P=P)
-
-
-def default_params(dt: float | None = None) -> JointKFParams:
-    """Default parameters for a 1 kHz humanoid joint KF.
-
-    All values come from the ``joint_kf`` section of ``config/filter_cfg.yaml``
-    — the single place tuning numbers live.  These are starting-point values,
-    NOT tuned constants: match them to the encoder spec, the Mahony-cleaned gyro
-    noise, and the dynamics roughness you expect.
-
-    Parameters
-    ----------
-    dt : float, optional
-        Filter timestep [s].  ``None`` takes the configured value (1 kHz).
+        default_params(dt=2.0e-3, qa_max=1e9)
     """
     cfg = section("joint_kf")
-    return JointKFParams(
-        sigma_enc=jnp.deg2rad(cfg["sigma_enc_deg"]).item(),
-        sigma_omega=cfg["sigma_omega"],         # [rad/s] Mahony-cleaned rel-gyro
-        sigma_tau=cfg["sigma_tau"],             # [N·m] torque-space process noise
-        sigma_acc=cfg["sigma_acc"],             # [rad/s^2] early-dev diagonal Q_a
-        sigma_b=cfg["sigma_b"],                 # [rad/s] residual bias — TIGHT
-        dt=cfg["dt"] if dt is None else dt,
+    values = dict(
+        dt=cfg["dt"],
+        encoder_var=cfg["encoder_var"],
+        sigma_gyro_floor=cfg["sigma_gyro_floor"],
+        sigma_gyro_floor_trace=cfg["sigma_gyro_floor_trace"],
+        sigma_accel=cfg["sigma_accel"],
+        sigma_tau=cfg["sigma_tau"],
+        target_qdd_std=cfg["target_qdd_std"],
+        alpha_default=cfg["alpha_default"],
+        qa_max=cfg["qa_max"],
+        rotor_inertia_default=cfg["rotor_inertia_default"],
+        imu_bias_process_var=cfg["imu_bias_process_var"],
+        cond_s_max=cfg["cond_s_max"],
+        init_pos_var=cfg["init"]["pos_var"],
+        init_vel_var=cfg["init"]["vel_var"],
+        init_bias_var=cfg["init"]["bias_var"],
+        anchor_var=cfg["anchor_var"],
+        sigma_qd_unfiltered=cfg["sigma_qd_unfiltered"],
+        direct_velocity_enabled=cfg["direct_velocity_enabled"],
+        lag_slew_smoothing_hz=cfg["lag_slew_smoothing_hz"],
+        r_large=cfg["r_large"],
     )
+    unknown = set(overrides) - set(values)
+    if unknown:
+        raise TypeError(f"unknown JointKFParams field(s): {sorted(unknown)}")
+    values.update(overrides)
+    return JointKFParams(**values)
+
+
+# ---------------------------------------------------------------------------
+# Build-time name tables (plain Python -- invariant I7, no strings in jit)
+# ---------------------------------------------------------------------------
+
+def _substring_lookup(name: str, table: dict[str, float], default: float) -> float:
+    """Case-insensitive **substring** match, Java `reflectedRotorInertiaForNameOrDefault`.
+
+    The Java table is keyed on fragments like ``"HIP_X"`` matched against a full
+    joint name like ``"LEFT_HIP_X"``.  Longest key first, so ``ANKLE_Y`` is not
+    shadowed by a hypothetical ``ANKLE``, and the match is order-independent
+    rather than dict-insertion-order dependent.
+    """
+    upper = name.upper()
+    for key in sorted(table, key=len, reverse=True):
+        if key.upper() in upper:
+            return table[key]
+    return default
+
+
+def rotor_inertia_for_name(name: str, cfg: dict[str, Any] | None = None) -> float:
+    """Reflected rotor inertia `n^2 J_rotor` for a joint, by name substring.
+
+    Locked by `JointLevelKFRotorAndGramTest.testRotorInertiaTableLookup`:
+    ``LEFT_HIP_X -> 0.062``, ``RIGHT_HIP_Y -> 0.167``, ``left_knee_y -> 0.167``
+    (case-insensitive), ``LEFT_ANKLE_Y -> 0.070``, ``LEFT_ANKLE_X -> 0.050``,
+    ``SPINE_Z -> 0.062``, ``SOME_UNKNOWN_JOINT -> 0.005``.
+
+    NOTE (CLAUDE.md §6, the armature double-add trap): production takes these
+    values from the MJCF `armature`, which MuJoCo folds into `qM` *pre*-Schur.
+    That is algebraically identical to adding them post-Schur, so doing BOTH
+    counts the drivetrain twice.  Use this lookup to *populate* the MJCF, or to
+    check the equivalence oracle -- never as a second additive term.
+    """
+    cfg = cfg if cfg is not None else section("joint_kf")
+    return _substring_lookup(name, cfg["rotor_inertia"], cfg["rotor_inertia_default"])
+
+
+def alpha_for_name(name: str, cfg: dict[str, Any] | None = None) -> float:
+    """Per-joint unmodeled-torque fraction `alpha_i`, by name substring.
+
+    Falls back to `alpha_default` (0.15) for an unlisted joint -- deliberately,
+    so an unlisted filtered joint surfaces via the `QA_MAX` tripwire rather than
+    silently taking a calibrated neighbour's value.
+    """
+    cfg = cfg if cfg is not None else section("joint_kf")
+    return _substring_lookup(name, cfg["alpha_overrides"], cfg["alpha_default"])
+
+
+def encoder_var_for_name(name: str, cfg: dict[str, Any] | None = None) -> tuple[float, bool]:
+    """Per-joint encoder position VARIANCE, and whether the lookup was wired.
+
+    Returns `(variance, wired)`.  `wired=False` means the joint fell back to
+    `encoder_var` (5e-5), which is 2-4 orders ABOVE the hardware-measured values
+    -- the joint will badly under-trust its encoder.  `build.py` logs every
+    unwired joint loudly at build time (Java parity: "watch jointKF_encR_<joint>
+    at boot").
+    """
+    cfg = cfg if cfg is not None else section("joint_kf")
+    std = cfg.get("encoder_pos_std", {}).get(name)
+    if std is None or not np.isfinite(std) or std <= 0.0:
+        return cfg["encoder_var"], False
+    return float(std) ** 2, True
+
+
+# ---------------------------------------------------------------------------
+# Build -- everything resolved from names, once, before jit
+# ---------------------------------------------------------------------------
+
+class JointKFBuild(NamedTuple):
+    """Static structure + per-joint/per-IMU parameter arrays.
+
+    Produced by `jointKF.build.build_joint_kf(...)` and closed over by the jitted
+    step.  Nothing here is traced and nothing here changes shape during a run
+    (invariants I2, I7).
+
+    Index conventions
+    -----------------
+    ``q``      of joint i  -> state index ``i``
+    ``q_dot``  of joint i  -> state index ``n + i``
+    ``b_omega`` of IMU k   -> state indices ``2n + 3k .. 2n + 3k + 3``
+
+    Masks, not branches
+    -------------------
+    `pair_velocity_mask` and `anchor_*` are fixed-shape float masks.  An inactive
+    anchor keeps its rows but gets `R_LARGE * I3`; its rows are never zeroed,
+    which would make `S` singular (CLAUDE.md §6).
+    """
+
+    # -- static dimensions (plain ints; static under jit) -------------------
+    n_joints: int
+    n_imus: int
+    n_pairs: int
+    n_anchors: int                  # K_max, fixed for the filter lifetime
+
+    # -- names, for diagnostics and build-time reporting only ---------------
+    joint_names: tuple[str, ...]
+    imu_names: tuple[str, ...]
+
+    # -- IMU pair topology --------------------------------------------------
+    pair_parent: Array              # (n_pairs,) int   IMU ordinal
+    pair_child: Array               # (n_pairs,) int   IMU ordinal
+    pair_velocity_mask: Array       # (n_pairs, n) float  1.0 on chain joints
+    base_imu: int                   # ordinal of the base IMU (the star centre)
+
+    # -- stance anchors -----------------------------------------------------
+    anchor_filtered_mask: Array     # (n_anchors, n) float  F split: chain & state
+    anchor_unfiltered_mask: Array   # (n_anchors, n_unfiltered) float  U split
+    anchor_imu: Array               # (n_anchors,) int  IMU whose bias the anchor pins
+
+    # -- per-joint parameter vectors (name-resolved at build) ---------------
+    alpha: Array                    # (n,)
+    tau_max: Array                  # (n,)  effort limits from the URDF
+    sigma_tau: Array                # (n,)  alpha_i * tau_max_i, fallback SIGMA_TAU
+    rotor_inertia: Array            # (n,)  informational; MJCF armature is the live path
+    encoder_var: Array              # (n,)
+    encoder_wired: tuple[bool, ...] # which joints got a real per-joint value
+
+    # -- per-IMU noise ------------------------------------------------------
+    gyro_sigma: Array               # (m, 3, 3)  floored at build
+
+    # -- mass-matrix gather indices (I7: resolved here, not in jit) ---------
+    dof_joint: Array                # (n,)  MJX DoF index of each filtered joint
+    dof_nuisance: Array             # (n_nuisance,)  base 6 DoF + gap joints
+    use_mass_matrix: bool           # False => scalar-CWNA fallback path
+
+    # -- derived ------------------------------------------------------------
+    @property
+    def dim(self) -> int:
+        """State dimension `2n + 3m`."""
+        return 2 * self.n_joints + 3 * self.n_imus
+
+    def joint_index(self, i: int) -> int:
+        """State index of joint `i`'s position (Java `getJointStateIndex`)."""
+        return i
+
+    def velocity_index(self, i: int) -> int:
+        """State index of joint `i`'s velocity."""
+        return self.n_joints + i
+
+    def bias_col(self, imu: int) -> int:
+        """First state index of IMU `imu`'s bias (Java `getBiasBlockColumn`)."""
+        return 2 * self.n_joints + 3 * imu
+
+    def pair_parent_bias_col(self, pair: int) -> int:
+        """Java `getPairParentBiasColumn`."""
+        return self.bias_col(int(self.pair_parent[pair]))
+
+    def pair_child_bias_col(self, pair: int) -> int:
+        """Java `getPairChildBiasColumn`."""
+        return self.bias_col(int(self.pair_child[pair]))
+
+    def pair_velocity_cols(self, pair: int) -> tuple[int, ...]:
+        """Velocity state columns pair `pair` observes (Java `getPairVelocityColumns`)."""
+        on = np.nonzero(np.asarray(self.pair_velocity_mask[pair]) > 0.0)[0]
+        return tuple(self.n_joints + int(i) for i in on)
+
+    def stacked_row_for_pair(self, pair: int) -> int:
+        """First stacked-measurement row of pair `pair` (Java `getStackedRowForPair`)."""
+        return 3 * pair
+
+    @property
+    def anchor_row0(self) -> int:
+        """First stacked row of the anchor block: anchors follow all pair rows."""
+        return 3 * self.n_pairs
+
+    @property
+    def n_stacked_rows(self) -> int:
+        """Total stacked-measurement rows: `3*(n_pairs + n_anchors)`, always."""
+        return 3 * (self.n_pairs + self.n_anchors)
+
+
+# ---------------------------------------------------------------------------
+# Initialisation
+# ---------------------------------------------------------------------------
+
+def init_state(build: JointKFBuild, params: JointKFParams, q0: Array | None = None) -> JointKFState:
+    """Seed `(x, P)` -- Java `initialize()`.
+
+    Locked by `JointLevelKFStateTest`:
+
+    * `q` is seeded from the encoders (`testQ0Seed`), `q_dot` and `b_omega` from
+      zero (`testXOrdering`, exact 0.0).
+    * `P` is diagonal with `pos_var=1e-6`, `vel_var=1.0`, `bias_var=2.5e-3`
+      (`testMarginalBlocksMatchP`, tol 1e-12).
+    * The prior-confidence ordering `pos < bias < vel` (`testPriorConfidenceOrdering`)
+      is intent, not coincidence: encoders are trusted at init, velocity is
+      genuinely unknown, bias sits between.
+    """
+    n, m = build.n_joints, build.n_imus
+    q = jnp.zeros(n, dtype=jnp.float64) if q0 is None else jnp.asarray(q0, dtype=jnp.float64)
+    if q.shape != (n,):
+        raise ValueError(f"q0 must have shape ({n},), got {q.shape}")
+
+    x = jnp.concatenate([q, jnp.zeros(n, dtype=jnp.float64), jnp.zeros(3 * m, dtype=jnp.float64)])
+    P = jnp.diag(jnp.concatenate([
+        jnp.full(n, params.init_pos_var, dtype=jnp.float64),
+        jnp.full(n, params.init_vel_var, dtype=jnp.float64),
+        jnp.full(3 * m, params.init_bias_var, dtype=jnp.float64),
+    ]))
+    return JointKFState(x=x, P=P)
