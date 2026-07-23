@@ -221,8 +221,75 @@ joint_kf:
 
   # Per-joint sidecars, filled from the robot's sensor spec. Empty => every joint
   # takes the fallback above and the build logs it loudly (Java parity).
-  encoder_pos_std: {}             # TODO(Lucas): 2026-07-15 hardware PSD values
-  encoder_vel_std: {}             # TODO(Lucas): direct-velocity channel
+  #
+  # These are the MEASURED hardware values from AlexSensorNoiseParameters.java
+  # (Lucas, 2026-07-15): 1-sigma STD (rad, rad/s) recovered from the white-noise
+  # floor of each joint's PSD on a walking run. Keys are case-insensitive
+  # (_ci_get) so they match the uppercase MuJoCo joint names. VERIFIED against the
+  # 2026-07-17 Alex001 log: jointKF_encR_<joint> == encoder_pos_std^2 to 1e-3, and
+  # jointKF_qdR_<joint>.min == encoder_vel_std^2 (see tests/replay/test_sensor_noise.py).
+  # These replace the scalar encoder_var = 5e-5, whose variance sat 2-4 orders
+  # ABOVE these values -- i.e. the port was badly UNDER-trusting every encoder.
+  encoder_pos_std:
+    LEFT_HIP_X: 2.3658e-4
+    LEFT_HIP_Z: 1.4440e-4
+    LEFT_HIP_Y: 2.2421e-4
+    LEFT_KNEE_Y: 4.6622e-4
+    LEFT_ANKLE_Y: 2.4479e-4
+    LEFT_ANKLE_X: 2.1057e-4
+    RIGHT_HIP_X: 1.4415e-4
+    RIGHT_HIP_Z: 3.6155e-4
+    RIGHT_HIP_Y: 5.6403e-4
+    RIGHT_KNEE_Y: 7.0633e-4
+    RIGHT_ANKLE_Y: 4.4325e-4
+    RIGHT_ANKLE_X: 1.9309e-4
+    SPINE_Z: 3.1443e-4
+    NECK_Z: 6.3184e-4
+    NECK_Y: 2.2057e-4
+    LEFT_SHOULDER_Y: 2.4415e-4
+    LEFT_SHOULDER_X: 1.8224e-4
+    LEFT_SHOULDER_Z: 3.3964e-4
+    LEFT_ELBOW_Y: 5.6109e-5
+    LEFT_WRIST_Z: 6.5983e-5
+    LEFT_WRIST_X: 5.2112e-4
+    LEFT_GRIPPER_Z: 4.6276e-4
+    RIGHT_SHOULDER_Y: 2.2909e-4
+    RIGHT_SHOULDER_X: 1.1006e-4
+    RIGHT_SHOULDER_Z: 2.2854e-4
+    RIGHT_ELBOW_Y: 1.8934e-4
+    RIGHT_WRIST_Z: 7.4601e-4
+    RIGHT_WRIST_X: 6.9042e-4
+    RIGHT_GRIPPER_Z: 2.2666e-4
+  encoder_vel_std:
+    LEFT_HIP_X: 2.7388e-3
+    LEFT_HIP_Z: 8.5087e-3
+    LEFT_HIP_Y: 3.3682e-3
+    LEFT_KNEE_Y: 4.6834e-3
+    LEFT_ANKLE_Y: 4.1465e-2
+    LEFT_ANKLE_X: 4.2801e-2
+    RIGHT_HIP_X: 3.1572e-3
+    RIGHT_HIP_Z: 2.2270e-3
+    RIGHT_HIP_Y: 3.6120e-3
+    RIGHT_KNEE_Y: 4.5619e-3
+    RIGHT_ANKLE_Y: 5.2432e-2
+    RIGHT_ANKLE_X: 5.2262e-2
+    SPINE_Z: 2.5867e-3
+    NECK_Z: 1.80018e-1
+    NECK_Y: 2.8471e-1
+    LEFT_SHOULDER_Y: 4.5082e-3
+    LEFT_SHOULDER_X: 5.2483e-3
+    LEFT_SHOULDER_Z: 2.0720e-2
+    LEFT_ELBOW_Y: 5.6969e-3
+    LEFT_WRIST_Z: 1.7073e-2
+    LEFT_WRIST_X: 1.8061e-2
+    LEFT_GRIPPER_Z: 1.8687e-2
+    RIGHT_SHOULDER_Y: 7.7030e-3
+    RIGHT_SHOULDER_X: 7.9124e-3
+    RIGHT_SHOULDER_Z: 1.2367e-2
+    RIGHT_ELBOW_Y: 7.4557e-3
+    RIGHT_WRIST_Z: 2.4120e-2
+    RIGHT_WRIST_X: 2.7025e-2
+    RIGHT_GRIPPER_Z: 1.8505e-2
   gyro_sigma: {}                  # TODO(Lucas): AlexSensorNoiseParameters
 
 numerics:

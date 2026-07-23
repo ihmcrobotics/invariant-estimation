@@ -330,10 +330,31 @@ def build_joint_kf(
             len(default_alpha), cfg["alpha_default"], ", ".join(default_alpha),
         )
 
+    # -- mass-matrix nuisance set: base + GAP joints ------------------------
+    # A gap joint lies on a root->filtered path without being a filter state
+    # (Java `collectSpanningJoints` minus the filtered set). It must be
+    # marginalised, because it genuinely accelerates between the base and a
+    # filtered joint.
+    #
+    # This is NOT the same set as the anchor chain's unfiltered joints, and
+    # conflating them was a real bug: on Alex the ankles are unfiltered members
+    # of the base->foot anchor chain but are OFF the root->filtered paths, so
+    # Java locks them into the composited inertia while the old code eliminated
+    # them. Worth 1.7% on diag(Qa) against the hardware log. The two sets
+    # coincide on a serial chain, which is why the unit fixtures never saw it.
+    spanning: set[int] = set()
+    for j in filtered:
+        for body in _ancestors(tree, int(tree.joint_body[j])):
+            spanning.update(k for k in range(len(tree.joint_names))
+                            if int(tree.joint_body[k]) == body)
+    gap_cols = sorted(spanning - set(filtered))
     nuisance = np.concatenate([
         np.asarray(tree.base_dofs, dtype=int),
-        np.array([tree.joint_dof[j] for j in unfiltered_cols], dtype=int),
-    ]) if len(unfiltered_cols) or len(tree.base_dofs) else np.zeros(0, dtype=int)
+        np.array([tree.joint_dof[j] for j in gap_cols], dtype=int),
+    ]) if len(gap_cols) or len(tree.base_dofs) else np.zeros(0, dtype=int)
+    anchor_unfiltered_dof = np.array(
+        [tree.joint_dof[j] for j in unfiltered_cols], dtype=int
+    )
 
     return JointKFBuild(
         n_joints=n,
@@ -359,4 +380,5 @@ def build_joint_kf(
         dof_joint=np.array([tree.joint_dof[j] for j in filtered], dtype=int),
         dof_nuisance=nuisance,
         use_mass_matrix=use_mass_matrix,
+        dof_anchor_unfiltered=anchor_unfiltered_dof,
     )

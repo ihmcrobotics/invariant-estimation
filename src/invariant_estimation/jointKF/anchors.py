@@ -176,20 +176,30 @@ class AnchorBlock(NamedTuple):
 def unfiltered_dof(build: JointKFBuild) -> np.ndarray:
     """DoF indices of the unfiltered anchor-chain joints, in mask-column order.
 
-    `build.py` builds ``dof_nuisance = [base DoFs] ++ [unfiltered chain joints]``
-    with the second group in the same (sorted) order as
-    ``anchor_unfiltered_mask``'s columns, so the trailing ``n_u`` entries are
-    exactly what ``J_U``'s column gather needs.
+    `build.py` publishes these as ``dof_anchor_unfiltered``, in the same (sorted)
+    order as ``anchor_unfiltered_mask``'s columns, which is exactly what ``J_U``'s
+    column gather needs.
 
-    Kept as a named helper rather than inlined at the call site because the
-    coupling to `build.py`'s concatenation order is invisible otherwise — and a
+    These used to be read off the tail of ``dof_nuisance``, which happened to
+    hold them only because `build.py` appended the anchor chain's unfiltered
+    joints to the mass-matrix nuisance set. That coupling was wrong on Alex (the
+    ankles are anchor-chain-unfiltered but *off* the root->filtered paths, so
+    they must be locked in ``M``, not marginalised); the tail slice survives here
+    only as a fallback for fixtures that build a `JointKFBuild` by hand.
+
+    Kept as a named helper rather than inlined at the call site because a
     silently mis-ordered gather would put the ankle's Jacobian column under the
     hip's velocity noise, inflating ``R_anchor`` by the wrong amount in a way no
     shape check would catch.
     """
     n_u = int(np.asarray(build.anchor_unfiltered_mask).shape[1])
+    if not n_u:
+        return np.zeros(0, dtype=int)
+    explicit = np.asarray(build.dof_anchor_unfiltered, dtype=int).reshape(-1)
+    if explicit.size:
+        return explicit
     dof = np.asarray(build.dof_nuisance, dtype=int)
-    return dof[len(dof) - n_u:] if n_u else dof[:0]
+    return dof[len(dof) - n_u:]
 
 
 def anchor_jacobians(

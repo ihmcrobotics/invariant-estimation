@@ -209,7 +209,16 @@ class MjxModel:
 
         joint_dof = mj_model.jnt_dofadr[joint_ids].astype(int)
         joint_qpos = mj_model.jnt_qposadr[joint_ids].astype(int)
-        dof_nuisance = np.setdiff1d(np.arange(mj_model.nv), joint_dof).astype(int)
+        # Nuisance = the *considered but unfiltered* DoFs: the floating base, plus
+        # the "gap" hinges that lie on a root->filtered-joint path without being
+        # filter states.  NOT "everything that is not filtered": off-path joints
+        # (Alex's ankles, arms, neck) are LOCKED by Java's considered-subsystem,
+        # not marginalised, and eliminating them models them as free to
+        # accelerate -- worth 58% on diag(Qa) against the hardware log.
+        dof_nuisance = np.concatenate([
+            _base_dofs(mj_model),
+            np.array(sorted(_gap_dofs(mj_model, joint_ids)), dtype=int),
+        ]).astype(int)
 
         n = len(joint_names)
         mask = np.zeros((len(pair_sites), n), dtype=float)
@@ -267,6 +276,16 @@ class MjxModel:
         gap joints at zero) -- the estimator never needs a base pose, since every
         quantity it consumes is either base-invariant (`M`, the joint blocks of
         `qM`) or a *relative* site quantity where the base cancels.
+
+        **Off-path joints stay at `qpos0`, and that is load-bearing, not a
+        shortcut.**  Mecano composites an ignored subtree's inertia into its
+        parent exactly once, in `CompositeRigidBodyMassMatrixCalculator`'s
+        *constructor* (`updateIgnoredSubtreeInertia`), and never refreshes it --
+        so the Java filter's `M(q)` sees the ankles, arms and head welded at the
+        configuration the robot model was **constructed** in, which is `q = 0`.
+        Feeding live off-path angles here would be more physical but would stop
+        matching Java: on the 2026-07-17 Alex001 log it moves `diag(Qa)` by up to
+        14% (`tests/replay/test_java_parity.py`).
         """
         q = jnp.asarray(q, dtype=jnp.float64)
         if q.shape[-1] == self.nq:
@@ -443,6 +462,43 @@ def _ancestors(mj_model: mujoco.MjModel, body: int) -> list[int]:
         if b == 0:
             return chain
         b = int(mj_model.body_parentid[b])
+
+
+def _base_dofs(mj_model: mujoco.MjModel) -> np.ndarray:
+    """DoF indices of the floating base -- the non-hinge joints at the tree root."""
+    return np.array(
+        [
+            d
+            for j in range(mj_model.njnt)
+            if int(mj_model.jnt_type[j]) != _MJ_JNT_HINGE
+            for d in range(
+                int(mj_model.jnt_dofadr[j]),
+                int(mj_model.jnt_dofadr[j]) + (6 if int(mj_model.jnt_type[j]) == 0 else 1),
+            )
+        ],
+        dtype=int,
+    )
+
+
+def _gap_dofs(mj_model: mujoco.MjModel, joint_ids: np.ndarray) -> set[int]:
+    """DoFs of hinges on a root->filtered path that are not themselves filtered.
+
+    Java's `collectSpanningJoints`: walk from each filtered joint up to the
+    floating base, collecting every joint passed.  What is collected but not
+    filtered is a *gap* joint and gets marginalised with the base; what is never
+    collected is off-path and stays locked inside the composited inertia.
+    """
+    filtered = set(int(i) for i in joint_ids)
+    spanning: set[int] = set()
+    joint_of_body: dict[int, list[int]] = {}
+    for j in range(mj_model.njnt):
+        joint_of_body.setdefault(int(mj_model.jnt_bodyid[j]), []).append(j)
+    for i in filtered:
+        for body in _ancestors(mj_model, int(mj_model.jnt_bodyid[i])):
+            for j in joint_of_body.get(body, ()):
+                if int(mj_model.jnt_type[j]) == _MJ_JNT_HINGE:
+                    spanning.add(j)
+    return {int(mj_model.jnt_dofadr[j]) for j in spanning - filtered}
 
 
 def _path_joints(mj_model: mujoco.MjModel, body_a: int, body_b: int) -> set[int]:

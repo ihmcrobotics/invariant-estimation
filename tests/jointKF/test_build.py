@@ -212,15 +212,34 @@ def test_zero_gyro_sigma_is_floored_at_build(caplog):
 
 
 def test_nuisance_dofs_are_the_base_six_plus_gap_joints():
-    """The Schur nuisance set. Getting this wrong changes Lambda, hence Qa."""
+    """The Schur nuisance set. Getting this wrong changes Lambda, hence Qa.
+
+    A **gap** joint lies on a `root -> filtered` path without being a filter
+    state, exactly Java's `collectSpanningJoints` minus the filtered set. In this
+    fixture the pair brackets joints 2..5, so joints **0 and 1** are the gap: the
+    base cannot reach a filtered joint without passing through them, and they
+    genuinely accelerate, so they must be marginalised.
+
+    Joints 6..9 are a different animal. They are unfiltered members of the
+    base->foot *anchor* chain, but they hang BELOW every filtered joint and are
+    therefore off the root->filtered paths. Java locks them into the composited
+    ignored-subtree inertia; marginalising them models them as free to
+    accelerate and shrinks `Lambda`. This test previously asserted exactly that
+    wrong set -- on Alex (where joints 6..9 are the ankles) it cost 1.7% on
+    `diag(Qa)` against the hardware log. The two sets coincide on a chain with no
+    off-path joints, which is why nothing else here noticed.
+    """
     tree = serial_chain(10)
     b = build_joint_kf(tree, ["imu_after_1", "imu_after_5"], [(0, 1)],
                        foot_sites=["foot_after_9"])
     nuisance = np.asarray(b.dof_nuisance)
     assert list(nuisance[:6]) == list(range(6)), "floating base's 6 DoF come first"
-    # joints 6..9 are gap joints -> DoF 12..15 (hinge j has DoF j+6)
-    assert sorted(nuisance[6:]) == [12, 13, 14, 15]
+    # joints 0..1 are the gap joints -> DoF 6..7 (hinge j has DoF j+6)
+    assert sorted(nuisance[6:]) == [6, 7]
     assert list(np.asarray(b.dof_joint)) == [8, 9, 10, 11]   # joints 2..5
+    # ...and the anchor chain's unfiltered joints (6..9) are published separately,
+    # in anchor_unfiltered_mask column order, NOT folded into the nuisance set.
+    assert list(np.asarray(b.dof_anchor_unfiltered)) == [12, 13, 14, 15]
 
 
 def test_empty_chain_is_rejected():

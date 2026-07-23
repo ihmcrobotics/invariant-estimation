@@ -100,10 +100,14 @@ def _chain_q(chain: ChainFixture, q: np.ndarray) -> np.ndarray:
 def test_convention_floating_base_owns_the_first_six_dofs(chain):
     """Free joint = joint 0, DoFs 0..5; hinges follow in joint order, one DoF each.
 
-    `dof_nuisance` is built as "everything that is not a filtered joint" and is
-    *documented* as "base 6 + gap joints" (`CLAUDE.md` §2).  Those two agree only
-    under this layout, and the Schur complement silently marginalises the wrong
-    coordinates if it ever changes.
+    `dof_nuisance` is "base 6 + gap joints" (`CLAUDE.md` §2), where a gap joint
+    lies on a `root -> filtered` path without being a filter state.  Every
+    `SHAPES` entry puts its IMUs so that the only unfiltered hinges are *above*
+    the filtered span, so here -- and only here -- "base + gap" coincides with
+    "everything that is not filtered", which is why the last assertion holds.  It
+    does not hold on Alex, whose ankles hang below the filtered span and are
+    locked rather than marginalised; `tests/jointKF/test_build.py` covers that
+    case with a foot site beyond the IMUs.
     """
     m = chain.model.mj_model
     assert m.jnt_type[0] == 0, "joint 0 must be the free joint (mjJNT_FREE == 0)"
