@@ -92,6 +92,8 @@ __all__ = [
     "ALEX_EXTRA_SITES",
     "alex_site_names",
     "build_alex_fused_estimator",
+    "alex_spec_from_urdf",
+    "build_alex_fused_estimator_from_urdf",
 ]
 
 
@@ -146,6 +148,38 @@ def build_alex_fused_estimator(spec, **overrides) -> "FusedEstimator":
         base_imu=0, base_body_site="base_body", effort_limits=spec.effort_limits,
         **overrides,
     )
+
+
+def alex_spec_from_urdf(urdf_path):
+    """`AlexModelSpec` from a standalone `.urdf` (the config rotor table + Alex sites).
+
+    The URDF analogue of `convert_log_model`: reads the file, writes the rotor
+    inertia into `armature`, and adds the `base_body`/sole `extra_sites`.
+    """
+    import pathlib
+
+    from ..config import load_config
+    from ..model.urdf2mjcf import urdf_to_mjcf
+
+    jk = load_config()["joint_kf"]
+    return urdf_to_mjcf(
+        pathlib.Path(urdf_path).read_text(),
+        rotor_inertia=jk["rotor_inertia"],
+        rotor_inertia_default=jk["rotor_inertia_default"],
+        extra_sites=ALEX_EXTRA_SITES,
+    )
+
+
+def build_alex_fused_estimator_from_urdf(urdf_path, **overrides) -> "FusedEstimator":
+    """Build the Alex fused estimator directly from a standalone URDF file.
+
+    The production path when the model comes from a `.urdf` (the RL training body
+    `alex_with_imus.urdf`) rather than a log's `model.sdf`. Verified in
+    `tests/replay/test_fused_real_model.py` to reproduce the Java-model `R_mount`
+    and site FK bit-for-bit — the permanent lock on the training↔hardware
+    cross-check. `**overrides` pass through to `build_fused_estimator`.
+    """
+    return build_alex_fused_estimator(alex_spec_from_urdf(urdf_path), **overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -357,9 +391,20 @@ def build_fused_estimator(
     # R_mount = ᴮR_S at qpos0. When base_body_site is the IMU site (synthetic case)
     # this is exactly I. When it is the pelvis body (real Alex) it carries the
     # +90° mount yaw. Auto-computed from FK unless the caller pins it.
+    #
+    # Computed with plain MuJoCo, NOT `model.site_poses` (MJX): it is a build-time
+    # constant, and running it through MJX would trace `mjx.kinematics` over the
+    # whole model — minutes for the deep-hand training URDF (PORT_NOTES G1). Plain
+    # `mj_kinematics` at qpos0 is instant and gives the identical rotations.
     if R_mount is None:
-        _, rot0 = model.site_poses(jnp.zeros(model.n_joints, dtype=jnp.float64))
-        R_mount = jnp.asarray(rot0[base_body_ord].T @ rot0[base_site], dtype=jnp.float64)
+        import mujoco
+
+        d = mujoco.MjData(model.mj_model)
+        mujoco.mj_kinematics(model.mj_model, d)
+        sid = np.asarray(model.site_ids)
+        Rb = d.site_xmat[sid[base_body_ord]].reshape(3, 3)
+        Rs = d.site_xmat[sid[base_site]].reshape(3, 3)
+        R_mount = jnp.asarray(Rb.T @ Rs, dtype=jnp.float64)
     else:
         R_mount = jnp.asarray(R_mount, dtype=jnp.float64)
 

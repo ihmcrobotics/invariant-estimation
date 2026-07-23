@@ -51,7 +51,7 @@ filters were live and fully instrumented (`jointKFNumberOfIMUs=8`,
 3. `zstandard`, which `uv sync` installs as a dev dependency.
 
 **Caching.** The first run decodes from `robotData.bsz` (9.3 GB compressed,
-131 GB uncompressed) and memoises to `<log_dir>/.parity-cache/*.npz`, falling
+131 GB uncompressed) and memorizes to `<log_dir>/.parity-cache/*.npz`, falling
 back to `$TMPDIR` when the log store is read-only. Later runs are ~1 s.
 
 ### Gotchas specific to log parity

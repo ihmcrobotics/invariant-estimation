@@ -28,6 +28,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import os
+import pathlib
+
 import jax
 import jax.numpy as jnp
 
@@ -50,6 +53,22 @@ def alex_fused(log_dir):
         extra_sites=me.ALEX_EXTRA_SITES,
     )
     return me.build_alex_fused_estimator(spec)
+
+
+def _alex_urdf_path() -> pathlib.Path:
+    """The RL training body with IMUs. Override with $ALEX_URDF."""
+    return pathlib.Path(
+        os.environ.get("ALEX_URDF", str(pathlib.Path.home() / "Documents" / "alex_with_imus.urdf"))
+    )
+
+
+@pytest.fixture(scope="module")
+def alex_urdf_fused():
+    """The fused estimator built from the standalone RL training URDF."""
+    p = _alex_urdf_path()
+    if not p.exists():
+        pytest.skip(f"no Alex URDF at {p} (set $ALEX_URDF)")
+    return me.build_alex_fused_estimator_from_urdf(p)
 
 
 def test_assembles_on_the_real_model(alex_fused):
@@ -113,3 +132,54 @@ def test_R_mount_matches_the_java_inekf_bias_frame(alex_fused, log_dir, ihmclog_
     ref_b = w.stack(bias_b)
     rms = float(np.sqrt(np.mean(np.sum((pred_b - ref_b) ** 2, axis=1))))
     assert rms < 1e-9, f"R_mount disagrees with Java's IMU->pelvis frame: RMS {rms:.2e}"
+
+
+# ---------------------------------------------------------------------------
+# The RL training URDF (alex_with_imus.urdf) vs the Java/hardware model.
+# Locks in the training↔hardware cross-check: the unified model must reproduce
+# the Java model's frames and kinematics bit-for-bit on everything the estimator
+# uses. (The models differ only in distal hand inertia — a diag(Qa) shift we
+# deliberately accept, not a kinematic/frame difference — so these are exact.)
+# ---------------------------------------------------------------------------
+
+def test_urdf_assembles_like_the_java_model(alex_urdf_fused):
+    f = alex_urdf_fused
+    assert f.n_joints == 9 and f.build.n_imus == 8 and f.n_contacts == 2
+    assert f.build.anchor_unfiltered_mask.shape[1] == 4
+    assert list(f.model.dof_nuisance) == list(range(6))
+
+
+def test_urdf_R_mount_is_bit_identical_to_java(alex_urdf_fused, alex_fused):
+    """The IMU mounts (incl. the +90° pelvis yaw) match the hardware model exactly."""
+    Rn, Rj = np.asarray(alex_urdf_fused.R_mount), np.asarray(alex_fused.R_mount)
+    assert np.linalg.norm(Rn - Rj) < 1e-12
+    yaw = np.degrees(np.arctan2(Rn[1, 0], Rn[0, 0]))
+    assert abs(yaw - 90.0) < 1.0
+
+
+def test_urdf_site_fk_is_bit_identical_to_java(alex_urdf_fused, alex_fused):
+    """Foot + IMU site FK agrees with the Java model at random leg configs.
+
+    Uses plain MuJoCo on the two underlying models (no jit) — fast, and the
+    kinematic chains are identical so the difference is numerical zero.
+    """
+    import mujoco
+
+    mn, mj = alex_urdf_fused.model.mj_model, alex_fused.model.mj_model
+    sites = list(me.ALEX_IMU_SITES) + list(me.ALEX_FOOT_SITES)
+
+    def fk(m, q):
+        d = mujoco.MjData(m)
+        for j, v in q.items():
+            d.qpos[m.jnt_qposadr[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, j)]] = v
+        mujoco.mj_kinematics(m, d)
+        return np.array(
+            [d.site_xpos[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, s)] for s in sites]
+        )
+
+    rng = np.random.default_rng(0)
+    worst = 0.0
+    for _ in range(5):
+        q = {j: float(rng.uniform(-0.8, 0.8)) for j in FILTERED_JOINTS}
+        worst = max(worst, float(np.abs(fk(mn, q) - fk(mj, q)).max()))
+    assert worst < 1e-9, f"URDF vs Java site FK diverged: {worst:.2e} m"

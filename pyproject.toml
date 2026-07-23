@@ -53,4 +53,4 @@ package-dir = { "" = "src"}
 where = ["src"]
 
 [tool.ruff.lint]
-ignore = ["E401", "E402", "F401"]
+ignore = ["E401", "E402", "F401", "E702"]
