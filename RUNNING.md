@@ -69,6 +69,53 @@ back to `$TMPDIR` when the log store is read-only. Later runs are ~1 s.
 - **Variable indices shift between builds.** Always resolve YoVariables by name
   from that log's own handshake, never by index.
 
+## The fused estimator (G9)
+
+`pipeline/main_estimator.py` runs the joint KF and the InEKF back to back as one
+constant-XLA-graph `lax.scan` body (`fused_step`). Two entry points:
+
+```python
+from invariant_estimation.pipeline import main_estimator as me
+
+# Synthetic / bring-up: build on any MjxModel (see tests/pipeline).
+fused = me.build_fused_estimator(model, imu_sites=..., pairs=..., foot_sites=...,
+                                 base_imu=0, base_body_site="pelvis_body")
+
+# Real Alex, from the log's model.sdf (topology + frames baked in):
+from invariant_estimation.model.urdf2mjcf import convert_log_model
+from invariant_estimation.config import load_config
+jk = load_config()["joint_kf"]
+spec  = convert_log_model(LOG, rotor_inertia=jk["rotor_inertia"],
+                          rotor_inertia_default=jk["rotor_inertia_default"],
+                          extra_sites=me.ALEX_EXTRA_SITES)   # adds body + sole sites
+fused = me.build_alex_fused_estimator(spec)
+
+carry = me.init_fused_carry(fused, q0=...)                   # device-committed carry
+carry, outputs = me.run_fused(fused, carry, sensors_over_time)   # lax.scan
+```
+
+Test gates:
+
+```bash
+uv run pytest tests/pipeline -q              # 9 synthetic scenarios + I7 jaxpr-constancy
+uv run pytest tests/replay/test_fused_real_model.py -q   # real Alex + R_mount parity (skips w/o log)
+```
+
+**Two landmines are surfaced as arguments**, defaulting to their flight/current
+values: `imu_bias_process_var=0.0` (flight; the config's `1e-4` is a test-locked
+unit value that makes the fused bias ~200× too noisy) and `contact_meas_var=0.0`
+(the current port; set to the flight `1e-4` floor to add the InEKF contact
+measurement-noise the port otherwise lacks — affects velocity/position, not
+roll/pitch).
+
+**Frames — the one place a G9 bug hides.** Three distinct frames: the base IMU
+site (gyro/accel source + joint-KF anchor), the body frame `B` = `base_body_site`
+(the pelvis *root* body, what the InEKF's `R` and `invariantRootAngularVelocityBody`
+mean), and `R_mount = ᴮR_S` (auto-computed; a +90° yaw on Alex). Verified against
+the Java InEKF to 1e-18. **Caveat for a full trajectory replay:** the real InEKF
+consumes a *Mahony-prefiltered* pelvis gyro, not the raw `gyroscope_pelvis_imu`
+(see `PORT_NOTES.md` "G9 — real model").
+
 ## Exploring a log by hand
 
 The `ihmc-log` skill's CLI is the tool for this; it needs no JVM and no SCS2.
@@ -104,8 +151,10 @@ src/invariant_estimation/
   model/mjx_model.py            the MJX adapter implementing RobotModel
   inEKF/                        the invariant filter (G2–G5, complete)
   jointKF/                      the joint-space pre-filter (G6–G8)
+  pipeline/main_estimator.py    the fused joint-KF→InEKF step (G9); ALEX_* topology
   replay/logsource.py           hardware-log reader for the parity harness
-tests/replay/                   Java parity — the acceptance test
+tests/pipeline/                 G9 synthetic scenarios + I7 jaxpr-constancy
+tests/replay/                   Java parity — the acceptance test (incl. fused real-model)
 ```
 
 Authoritative design docs: `CLAUDE.md` (spec, invariants I1–I10, gates G1–G10),

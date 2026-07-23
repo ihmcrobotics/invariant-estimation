@@ -1436,9 +1436,57 @@ floating-base biped MJX model.
   (`N^v = J_Ċ Σ_q̇ J_Ċᵀ`) is deferred, same as the standalone `inEKF/filter.py`
   TODO; `Σ_q̇` is carried through the boundary so adding it later is local.
 
+### G9 on the real Alex model (2026-07-23) — wired and frame-verified
+
+`fused_step` now runs on the actual 2026-07-17 Alex001 model (the log's own
+`model.sdf`), not just the synthetic biped. `build_alex_fused_estimator` +
+`ALEX_*` in `main_estimator.py` encode the topology; `tests/replay/
+test_fused_real_model.py` is the gate (skips without the log). Three things fell
+out, one of them a real bug fix:
+
+* **Resolved the `imu_pairs: []` TODO (CLAUDE.md §2b).** The IMU set is *forced*
+  by two facts from the log: `jointKFNumberOfIMUs = 8`, and the pair-chain union
+  must equal the 9 logged `FILTERED_JOINTS` (spine + legs, no arms/head). The only
+  set that satisfies both is a **star on `pelvis_imu`** paired with `torso_imu`
+  and each leg's `hip_x / thigh / shin` IMUs. Verified: it reproduces exactly the
+  9 filtered joints, `dof_nuisance` is base-6-only (no gap joints — matches the
+  `diag(Qa)` parity harness), and the ankles fall out as the 4-joint unfiltered
+  anchor split. The leg IMUs give overlapping chains (`hip_x ⊂ thigh ⊂ shin`) —
+  the redundant shared-base-IMU measurement the `LΣLᵀ` star (I6) is for.
+
+* **Fixed a frame bug in the fused step's body-frame model.** The first cut used
+  the base *IMU site* as the InEKF body frame `B`. That is only correct when the
+  IMU sits at the body origin with no rotation (true for the synthetic fixture,
+  false for Alex: the pelvis IMU is offset AND yawed +90°). The InEKF's `B` is the
+  *pelvis root body* (what `invariantRootAngularVelocityBody` reports), so the code
+  now takes THREE distinct frames — base IMU site (joint-KF anchor + gyro source),
+  body frame `B` = `base_body_site` (contact-FK origin+frame), and
+  `R_mount = ᴮR_S` (auto-computed at `qpos0`). On real Alex `R_mount` is a clean
+  +90° yaw.
+
+* **`R_mount` verified against Java to 1e-18 — the frame is exactly right.** Java
+  publishes the pelvis gyro bias in both frames (`jointKF_gyroBias_pelvis_imu_*`
+  in the IMU frame, `invariantAppliedGyroBiasInPelvisFrame` in the body frame), so
+  `R_mount @ bias_S == bias_B` is a pure-rotation check with no signal processing
+  in the way. It holds to 1.3e-18 RMS over the [200,210] s window, and also
+  confirms I1 end-to-end on hardware: the bias the InEKF applies IS the joint-KF's.
+
+* **Finding for Tier-2: the real InEKF consumes a Mahony-prefiltered pelvis gyro,
+  not the raw `gyroscope_pelvis_imu`.** `R_mount @ raw_gyro` misses
+  `invariantRawAngularVelocityBody` by ~2.5e-2 rad/s RMS (33% of signal during
+  walking) while the bias-frame check above is exact — so the gap is the *input
+  signal*, not the frame. A per-IMU `*_imuMahony*` complementary filter sits
+  upstream. A full free-running Tier-2 replay of the fused step must feed the same
+  processed angular-velocity channel, not the raw gyroscope. Does not affect the
+  synthetic G9 gate, the assembly, or `R_mount`.
+
 ### G10 remains
 
 Not built: the MJX sim env, the ONNX→Flax policy port (≤1e-6 oracle), the
 closed-loop scan + vmap, and NIS/NEES consistency bands (`eval/consistency.py`).
 `FusedOutputs` already emits the joint-KF `TickDiagnostics` and InEKF
-`InEKFOutputs` (with per-tick NIS) the consistency evaluation reads.
+`InEKFOutputs` (with per-tick NIS) the consistency evaluation reads. Note the sim
+model is a *different* MJCF from the estimator's: `urdf2mjcf` deliberately drops
+collision/visual geoms (the estimator needs only FK/Jacobians/M), so the sim needs
+its own build with geoms + actuators (from `resources.zip` meshes or a vendored
+full-body MJCF).

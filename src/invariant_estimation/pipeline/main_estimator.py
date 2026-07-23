@@ -37,16 +37,25 @@ The two G9 landmines (memory `invariant-estimation-g9-landmines`)
    argument (default 0.0 = current port behaviour); when non-zero it is added as an
    isotropic floor to the InEKF's contact-position noise. See `_boundary`.
 
-Frames (the one place a bug can hide -- guide §G9.3)
-----------------------------------------------------
-The pelvis IMU is mounted rotated relative to the pelvis *body* frame (`R_mount`,
-IMU→body). The base gyro/accel arrive in the IMU measurement frame and must be
-rotated into the body frame the InEKF's `R = ᵂR_B` refers to. The contact FK is
-written in the *same* body frame, so `R_mount` also enters the kinematics closure.
-For a model whose base IMU site is axis-aligned with the base body (the synthetic
-G9 fixture), `R_mount = I`. On real Alex it is a +90° yaw and MUST be verified
-against `InvariantMainStateEstimator` / `invariantRootAngularVelocityBody*` on the
-hardware log before trusting velocity/position (roll/pitch are `R_mount`-robust).
+Frames — THREE of them, kept distinct (guide §G9.3; the real-Alex trap)
+-----------------------------------------------------------------------
+1. **Base IMU site `S`** (`imu_sites[base_imu]`): where the base gyro/accel are
+   measured, and the joint-KF stance-anchor frame.
+2. **Body frame `B`** (`base_body_site`, the pelvis *root* body): the frame the
+   InEKF's `R = ᵂR_B` refers to and the contact-FK origin. On real Alex the IMU is
+   both offset from and yawed +90° relative to `B`, so `B ≠ S` — using the IMU site
+   as the body frame (as an early cut did) puts that offset+yaw straight into the
+   pose. `build_fused_estimator(base_body_site=...)` selects `B`; it defaults to
+   the base IMU site, which is correct only when the two coincide (the synthetic
+   fixture, where `R_mount = I`).
+3. **`R_mount = ᴮR_S`**: rotates the base IMU measurement into `B`. Auto-computed
+   from FK at `qpos0`. Enters only the boundary (`_boundary`); the contact FK uses
+   `B` directly. On real Alex it is a clean +90° yaw, verified against Java to
+   1e-18 (`R_mount @ jointKF_bias_S == invariantAppliedGyroBiasInPelvisFrame`;
+   `tests/replay/test_fused_real_model.py`). NB: the real InEKF consumes a
+   Mahony-prefiltered pelvis gyro, so a full trajectory replay must feed that
+   processed channel, not the raw `gyroscope_pelvis_imu` — see PORT_NOTES "G9 —
+   real model". Roll/pitch are `R_mount`-robust; velocity/position are not.
 """
 from __future__ import annotations
 
@@ -77,7 +86,66 @@ __all__ = [
     "make_fused_step",
     "init_fused_carry",
     "run_fused",
+    "ALEX_IMU_SITES",
+    "ALEX_PAIRS",
+    "ALEX_FOOT_SITES",
+    "ALEX_EXTRA_SITES",
+    "alex_site_names",
+    "build_alex_fused_estimator",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Alex topology — the resolved `imu_pairs` TODO (CLAUDE.md §2b)
+# ---------------------------------------------------------------------------
+# Derived from the 2026-07-17 Alex001 log's model.sdf and cross-checked three ways
+# (scratch verification, recorded in PORT_NOTES "G9 — real model"):
+#   * this IMU set + star reproduces EXACTLY the 9 logged FILTERED_JOINTS
+#     (SPINE_Z + both legs' HIP_X/Z/Y + KNEE_Y) and jointKFNumberOfIMUs = 8;
+#   * `R_mount` auto-computed from these sites matches the Java InEKF's
+#     `invariantAppliedGyroBiasInPelvisFrame` to 1e-18 (the +90° pelvis-IMU yaw);
+#   * `dof_nuisance` is base-6-only (no gap joints), matching the parity harness.
+# It is a STAR on the pelvis IMU (CLAUDE.md §2 "star on the base IMU"): every other
+# IMU is paired against the pelvis, so the shared-base-IMU `LΣLᵀ` cross-covariance
+# (I6) is exercised. The leg IMUs give progressively longer overlapping chains
+# (hip_x ⊂ thigh ⊂ shin), which is the redundant multi-measurement the star buys.
+ALEX_IMU_SITES: tuple[str, ...] = (
+    "pelvis_imu",                                   # ordinal 0 == base IMU (star centre)
+    "torso_imu",                                    # -> SPINE_Z
+    "left_hip_x_imu", "left_thigh_imu", "left_shin_imu",     # -> LEFT hip X/Z/Y + KNEE_Y
+    "right_hip_x_imu", "right_thigh_imu", "right_shin_imu",  # -> RIGHT hip X/Z/Y + KNEE_Y
+)
+ALEX_PAIRS: tuple[tuple[int, int], ...] = tuple((0, k) for k in range(1, len(ALEX_IMU_SITES)))
+ALEX_FOOT_SITES: tuple[str, ...] = ("left_sole", "right_sole")
+# extra_sites for `urdf2mjcf.convert_log_model`: the InEKF body frame (pelvis root
+# body) and the two foot soles the stance anchors / contacts sit on.
+ALEX_EXTRA_SITES: dict[str, str] = {
+    "base_body": "PELVIS_LINK",
+    "left_sole": "LEFT_FOOT",
+    "right_sole": "RIGHT_FOOT",
+}
+
+
+def alex_site_names() -> tuple[str, ...]:
+    """The full site-name tuple for the Alex `MjxModel` (IMUs, body frame, soles)."""
+    return ALEX_IMU_SITES + ("base_body",) + ALEX_FOOT_SITES
+
+
+def build_alex_fused_estimator(spec, **overrides) -> "FusedEstimator":
+    """Build the fused estimator for real Alex from an `AlexModelSpec`.
+
+    `spec` must come from `urdf2mjcf.convert_log_model(log_dir,
+    extra_sites=ALEX_EXTRA_SITES, ...)` so the body-frame and sole sites exist.
+    Encapsulates the resolved Alex topology (`ALEX_*` above) so production and the
+    replay test share one definition; `**overrides` pass straight through to
+    `build_fused_estimator` (e.g. `contact_meas_var=1e-4`, `dt=...`).
+    """
+    model = MjxModel.from_xml_string(spec.mjcf, site_names=alex_site_names(), pairs=ALEX_PAIRS)
+    return build_fused_estimator(
+        model, imu_sites=ALEX_IMU_SITES, pairs=ALEX_PAIRS, foot_sites=ALEX_FOOT_SITES,
+        base_imu=0, base_body_site="base_body", effort_limits=spec.effort_limits,
+        **overrides,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +275,11 @@ class FusedEstimator:
     kinematics: inf.ContactKinematics
     inekf_step: Callable
     base_imu: int                 # IMU ordinal of the base IMU (star centre)
-    base_site: int                # site ordinal of the base IMU (== base_imu here)
+    base_site: int                # site ordinal of the base IMU (joint-KF anchor frame + gyro source)
+    base_body_site: int           # site ordinal of the InEKF body frame B (root/pelvis body origin)
     foot_site_ords: np.ndarray    # (K,) site ordinals of the sole sites
     pair_sites: np.ndarray        # (n_pairs, 2) site ordinals per IMU pair
-    R_mount: Array                # (3,3) IMU-frame -> body-frame
+    R_mount: Array                # (3,3) ᴮR_S: base-IMU measurement frame -> InEKF body frame
     contact_meas_var: float       # isotropic floor on InEKF contact-position noise
 
     @property
@@ -229,6 +298,7 @@ def build_fused_estimator(
     foot_sites: Sequence[str],
     *,
     base_imu: int = 0,
+    base_body_site: str | None = None,
     R_mount: Array | None = None,
     effort_limits: dict[str, float] | None = None,
     dt: float = 1.0e-3,
@@ -245,10 +315,23 @@ def build_fused_estimator(
     are `(parent_ordinal, child_ordinal)` over that ordering; `foot_sites` host the
     stance anchors (`K = len(foot_sites)`) AND become the InEKF's `N` contacts.
 
+    Three frames, kept distinct (the real-Alex frame trap)
+    ------------------------------------------------------
+    * **Base IMU site** = `imu_sites[base_imu]`: the joint-KF anchor frame and the
+      source of the base gyro/accel. The measurement lives here.
+    * **Body frame `B`** = `base_body_site`: the InEKF's `R = ᵂR_B` frame and the
+      contact-FK origin — the *root/pelvis body*, which is what
+      `invariantRootAngularVelocityBody` reports. Defaults to the base IMU site
+      (correct only when the IMU is mounted at the body origin with no rotation,
+      e.g. the synthetic fixture). On real Alex, pass the pelvis-body site: the
+      pelvis IMU is offset AND yawed +90° from the body, and using the IMU site as
+      the body frame puts that offset+rotation straight into the pose.
+    * **`R_mount = ᴮR_S`**: rotates the base IMU measurement into `B`. Auto-computed
+      from the model at `qpos0` (`base_body_rotᵀ · base_imu_rot`) unless overridden.
+
     The two landmine arguments default to their FLIGHT values (`imu_bias_process_var
     = 0`) or to the current-port value (`contact_meas_var = 0`); see the module
-    docstring. Both are surfaced here rather than buried so the G9 gate can flip
-    them and measure the effect.
+    docstring. Both are surfaced here so the gate can flip them and measure the effect.
     """
     site_names = model.site_names
     imu_sites = tuple(imu_sites)
@@ -268,11 +351,19 @@ def build_fused_estimator(
     )
 
     base_site = site_names.index(imu_sites[base_imu])
+    base_body_ord = base_site if base_body_site is None else site_names.index(base_body_site)
     foot_site_ords = np.array([site_names.index(s) for s in foot_sites], dtype=int)
-    R_mount = jnp.eye(3, dtype=jnp.float64) if R_mount is None \
-        else jnp.asarray(R_mount, dtype=jnp.float64)
 
-    kinematics = _make_contact_kinematics(model, base_site, foot_site_ords, R_mount)
+    # R_mount = ᴮR_S at qpos0. When base_body_site is the IMU site (synthetic case)
+    # this is exactly I. When it is the pelvis body (real Alex) it carries the
+    # +90° mount yaw. Auto-computed from FK unless the caller pins it.
+    if R_mount is None:
+        _, rot0 = model.site_poses(jnp.zeros(model.n_joints, dtype=jnp.float64))
+        R_mount = jnp.asarray(rot0[base_body_ord].T @ rot0[base_site], dtype=jnp.float64)
+    else:
+        R_mount = jnp.asarray(R_mount, dtype=jnp.float64)
+
+    kinematics = _make_contact_kinematics(model, base_body_ord, foot_site_ords)
     inekf_step = inf.make_step(ekf, kinematics)
 
     return FusedEstimator(
@@ -284,6 +375,7 @@ def build_fused_estimator(
         inekf_step=inekf_step,
         base_imu=base_imu,
         base_site=base_site,
+        base_body_site=base_body_ord,
         foot_site_ords=foot_site_ords,
         pair_sites=np.asarray(model.pair_sites, dtype=int),
         R_mount=R_mount,
@@ -296,24 +388,24 @@ def build_fused_estimator(
 # ---------------------------------------------------------------------------
 
 def _make_contact_kinematics(
-    model: MjxModel, base_site: int, foot_site_ords: np.ndarray, R_mount: Array
+    model: MjxModel, base_body_site: int, foot_site_ords: np.ndarray
 ) -> inf.ContactKinematics:
-    r"""The `robot/` seam: `q ↦ ContactFrames(y, J)` in the InEKF body frame.
+    r"""The `robot/` seam: `q ↦ ContactFrames(y, J)` in the InEKF body frame `B`.
 
     `y_i = ᵂR_B^T (p_{foot_i} − p_B)` with the FK evaluated at the model's `qpos0`
-    base pose (the base cancels — every quantity is base-relative), and
-    `ᵂR_B = ᵂR_{baseIMU} R_mount^T` so the FK body frame is exactly the frame the
-    InEKF's `R` refers to. `J = ∂y/∂q` by forward-mode autodiff; `J_dot = 0` (a
-    port TODO shared with the Tier-2 replay — the velocity-noise term is deferred,
-    `inEKF/filter.py`).
+    base pose (the base cancels — every quantity is base-relative). `B` is the
+    `base_body_site` frame directly (the pelvis/root body), so its origin is `p_B`
+    and its rotation is `ᵂR_B` — no `R_mount` here: the mount rotation is a
+    *sensor* concern (the boundary), not a kinematics one. `J = ∂y/∂q` by
+    forward-mode autodiff; `J_dot = 0` (a port TODO shared with the Tier-2 replay —
+    the velocity-noise term is deferred, `inEKF/filter.py`).
     """
     feet = jnp.asarray(foot_site_ords, dtype=int)
-    Rm_T = R_mount.T
 
     def _foot_y(q: Array) -> Array:
         pos, rot = model.site_poses(q)
-        p_base = pos[base_site]
-        R_bw = rot[base_site] @ Rm_T                     # ᵂR_B
+        p_base = pos[base_body_site]
+        R_bw = rot[base_body_site]                       # ᵂR_B (body frame == site frame)
         return jnp.einsum("ij,kj->ki", R_bw.T, pos[feet] - p_base)   # (K,3)
 
     def kinematics(q: Array, q_dot: Array) -> inf.ContactFrames:
