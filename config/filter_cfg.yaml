@@ -1,0 +1,254 @@
+# filter_cfg.yaml — single source of truth for every tunable in the estimator.
+#
+# Nothing in `src/` should hard-code a tuning number: modules read their defaults
+# from here via `invariant_estimation.config`. Structural constants (tangent
+# indices, block layouts, group sizes) are NOT tunables and deliberately stay in
+# code — changing them changes the math, not the tuning.
+#
+# Values marked [test-locked] are asserted by the ported Java suite
+# (TEST_SUITE_MAP.md §"Filter constants the tests lock in"). Changing one will
+# fail a test — that is the intent, not a bug.
+#
+# GOTCHA: PyYAML is YAML 1.1, where an exponent needs an explicit sign. Write
+# `1.0e+9`, never `1.0e9` — the latter parses as the *string* "1.0e9" and blows
+# up far away from here. `load_config` type-checks every scalar to catch it at
+# load time; see `config.py`.
+
+inekf:
+  dt: 1.0e-3                      # [s] 1 kHz control loop
+  gravity: [0.0, 0.0, -9.81]      # [m/s^2] world frame  [test-locked]
+
+  # Continuous error-density VARIANCES (not standard deviations — see
+  # PORT_NOTES.md "G3 / Resolved"). Q_g = gyro_var*I3, Q_a = accel_var*I3.
+  gyro_var: 1.0e-4                # [(rad/s)^2/Hz]  [test-locked]
+  accel_var: 1.0e-3               # [(m/s^2)^2/Hz]  [test-locked]
+  contact_var: 1.0e-6             # [m^2/Hz] default isotropic contact density  [test-locked]
+
+  # Variance floor added to every digested ContactNet covariance. Keeps the
+  # L -> Sigma map smooth and PSD at a (near-)singular factor, which an
+  # eigenvalue clamp would not.
+  contact_floor: 1.0e-4           # [m^2]
+
+  # Conditioning gate on the innovation covariance S. Above this, the gain is
+  # masked to zero and (X, P) are left bit-for-bit unchanged (CLAUDE.md §4).
+  cond_max: 1.0e+9
+
+  # Diagonal prior for `init_state`. Contacts start diffuse: a candidate not yet
+  # in firm contact is "off" via a large covariance (CoCo), never a shape change.
+  init:
+    rotation_var: 1.0e-2
+    velocity_var: 1.0e-1
+    position_var: 1.0e-2
+    contact_var: 1.0
+
+  # Prior used by the EKF orchestrator's `initialize` when none is supplied.
+  initial_covariance: 1.0         # [test-locked]
+
+gravity_leveling:
+  gravity: 9.81                   # [m/s^2] magnitude  [test-locked]
+
+  # Anisotropic measurement variances. Pitch is trusted far less than roll:
+  # fore-aft specific force is contaminated by walking, lateral much less so.
+  roll_var: 2.5e-3                # ~(2.9 deg)^2  [test-locked]
+  pitch_var: 1.9e-1               # ~(25 deg)^2   [test-locked]
+
+  # Substituted for pitch_var when pitch is not observable. Large enough to
+  # freeze pitch, small enough to keep S well conditioned. Java's exact value is
+  # not observable from the test, which only asserts R(0,0) > 1e3.
+  pitch_disabled_var: 1.0e+4
+
+  # Complementary gravity-reference time constant. Sets the artifact rejection:
+  # gain at the 0.49 Hz balance mode is 1/sqrt(1+(w*tau)^2) ~ 0.065 (~15x).
+  reference_tau: 5.0              # [s]  [test-locked]
+
+  # Quasi-static gate. The horizontal test resolves against the sensor-driven
+  # gravity reference, NEVER the estimate's attitude (regression F.3).
+  gates:
+    norm_tol: 0.05                # fraction of g  [test-locked]
+    rot_tol: 0.15                 # [rad/s] on RAW gyro  [test-locked]
+    horiz_tol: 0.5                # [m/s^2]  [test-locked]
+
+# ---------------------------------------------------------------------------
+# joint_kf — transcribed from JointLevelKFPreFilter.java:70-200 and cross-checked
+# against TEST_SUITE_MAP.md §"Filter constants the tests lock in". That table is
+# the acceptance checksum for this section (CLAUDE.md §5): a mismatch fails the
+# port, not the test. `tests/test_config.py::test_test_locked_values_match_the_java_suite`
+# asserts every [test-locked] value below.
+# ---------------------------------------------------------------------------
+joint_kf:
+  dt: 1.0e-3                      # [s] 1 kHz  [test-locked]
+
+  # -- Measurement noise ----------------------------------------------------
+  # Fallback encoder position VARIANCE for any joint the per-joint lookup does
+  # not cover. sigma ~ 7.1e-3 rad, which is 2-4 orders ABOVE the hardware-
+  # measured per-joint values (sigma 5.6e-5..7.5e-4, walking-run PSD 2026-07-15).
+  # A joint silently on this fallback badly UNDER-trusts its encoder — the build
+  # logs a loud warning naming it (Java parity).
+  encoder_var: 5.0e-5             # [rad^2]  [test-locked]
+
+  # Gyro measurement-noise floor. getAngularVelocityNoiseCovariance is zero on
+  # hardware whenever SensorNoiseParameters are unset; a zero Sigma removes the
+  # innovation-covariance floor on the pure-bias rows, collapsing lambda_min(S)
+  # (logged 2.155e-12) and diverging P through the Joseph K R K^T loop. Safety
+  # net only — the wired Sigma should sit above it.
+  sigma_gyro_floor: 1.0e-6        # [(rad/s)^2] per axis  [test-locked]
+  sigma_gyro_floor_trace: 3.0e-6  # floor engages below this trace  [test-locked]
+
+  # -- Process noise --------------------------------------------------------
+  sigma_accel: 50.0               # [rad/s^2] scalar-CWNA fallback (no robot model)  [test-locked]
+  sigma_tau: 5.0                  # [N.m] fallback torque STD when tau_max absent  [test-locked]
+
+  # Per-joint unmodeled-torque STD is sigma_tau,i = alpha_i * tau_max,i. Two
+  # levels of scaling: tau_max,i is the actuator's capacity, alpha_i the
+  # dimensionless "fraction of capacity that is unmodeled".
+  #
+  # A UNIFORM alpha fixes unmodeled torque at a fixed fraction of capacity, but
+  # the torque->acceleration map Lambda_eff^-1 varies by orders of magnitude
+  # across joints, so joints trip QA_MAX one after another. The physically
+  # motivated fix equalizes the unmodeled-ACCELERATION STD (the CWNA quantity for
+  # a (q,qd) filter) at a common target:
+  #     alpha_i = TARGET_QDD_STD / (|Lambda_eff^-1|_ii * tau_max,i)
+  # Calibrate from a run by reading per-joint diag(Qa) and rescaling
+  #     alpha_i <- alpha_i * sqrt(TARGET^2 / diag(Qa)_i)
+  # iterating 2-3x (off-diagonal coupling makes it not one-shot).
+  target_qdd_std: 20.0            # [rad/s^2] equalization target  [test-locked]
+  alpha_default: 0.15             # fallback for an unlisted filtered joint  [test-locked]
+
+  # CALIBRATED 2026-07-10 from a live STAND_PREP read of diag(Qa). Cross-check:
+  # LEFT/RIGHT pairs agree to ~0.2% — the legs are physically identical, so that
+  # symmetry validates the measurement. diag(Qa) is CONFIGURATION-DEPENDENT;
+  # re-read after a gait change and iterate.
+  alpha_overrides:
+    SPINE_Z:      5.61133e-2
+    LEFT_HIP_X:   6.01544e-2
+    LEFT_HIP_Z:   2.94985e-2
+    LEFT_HIP_Y:   2.82043e-2
+    LEFT_KNEE_Y:  2.47925e-2
+    RIGHT_HIP_X:  5.52493e-2
+    RIGHT_HIP_Z:  3.34146e-2
+    RIGHT_HIP_Y:  2.56966e-2
+    RIGHT_KNEE_Y: 2.49771e-2
+
+  # TRIPWIRE ONLY — never a scaler. Physical ceiling (~(30 rad/s^2)^2) on the
+  # per-joint acceleration process-noise variance. When exceeded we SURFACE it
+  # (warn once naming the argmax joint, bump a per-joint counter) and do NOT
+  # rescale: the old uniform rescale coupled one joint's outlier into GLOBAL Q
+  # starvation (hips down ~6 orders), collapsing P onto the measurement floors
+  # and CAUSING the min-side S singularity. A cap that silently rescales the
+  # whole robot is worse than the disease.
+  qa_max: 900.0                   # [(rad/s^2)^2]  [test-locked]
+
+  # Reflected rotor inertia n^2 * J_rotor, matched by case-insensitive joint-name
+  # SUBSTRING. Added as a diagonal to the Schur complement BEFORE inversion:
+  # Lambda_eff = Lambda + diag(rotor). Physics: the rotor spins behind the
+  # gearbox about its own axis and does not couple through the floating base, so
+  # this post-Schur diagonal add is simultaneously the EXACT drivetrain term and
+  # a principled regularizer (it floors lambda_min by Weyl). Distal joints'
+  # link-side inertia is as low as ~8e-4 while their drivetrains reflect
+  # 0.05-0.07 — without this, Lambda^-2 has diagonal outliers up to ~1.6e6.
+  #
+  # TRAP (CLAUDE.md §6): these same values live in the MJCF as `armature`, where
+  # MuJoCo folds them into qM PRE-Schur. Since armature never touches M_bb/M_jb,
+  # the two are algebraically identical -- so adding BOTH double-counts. The
+  # G3 armature-equivalence oracle proves the identity; production takes the
+  # armature path and never adds rotor again post-Schur.
+  rotor_inertia:
+    HIP_X: 0.062
+    HIP_Z: 0.02
+    HIP_Y: 0.167
+    KNEE: 0.167
+    ANKLE_Y: 0.07
+    ANKLE_X: 0.05
+    SPINE: 0.062
+    SHOULDER_Y: 0.067
+    SHOULDER_X: 0.067
+    SHOULDER_Z: 0.022
+    ELBOW: 0.022
+    WRIST_Z: 0.005
+    WRIST_X: 0.005
+    GRIPPER_Z: 0.005
+    NECK_Z: 0.005
+    NECK_Y: 0.005
+  rotor_inertia_default: 0.005    # conservative floor, unmatched joint  [test-locked]
+
+  # Random-walk density on the per-IMU gyro bias. Q_bb = dt * this * I_3m.
+  imu_bias_process_var: 1.0e-4    # [(rad/s)^2/s]  [test-locked]
+
+  # -- Conditioning ---------------------------------------------------------
+  # cond(S) estimated from the Cholesky diagonal ((max L_ii / min L_ii)^2 — no
+  # eigendecomposition). Above this the whole stacked update is SKIPPED: a
+  # finite-but-ill-conditioned S inverts to a huge gain that the Joseph K R K^T
+  # loop squares every tick (the P-divergence mechanism the isFinite guards were
+  # blind to). Skip, never latch — masked K leaves (x, P) bit-identical.
+  cond_s_max: 1.0e+9              # [test-locked]
+
+  # -- Initial covariance ---------------------------------------------------
+  # Ordering intent: position (encoders trusted) < bias < velocity (unknown).
+  init:
+    pos_var: 1.0e-6               # encoders trusted at init  [test-locked]
+    vel_var: 1.0                  # velocity unknown at init  [test-locked]
+    bias_var: 2.5e-3              # (0.05 rad/s)^2  [test-locked]
+
+  # -- Stance anchors -------------------------------------------------------
+  # Sigma_eps: stance FK slip variance. This is the ContactNet injection point
+  # (CLAUDE.md §7) — the default heuristic is this constant diagonal.
+  anchor_var: 4.0e-4              # [test-locked]
+
+  # Encoder joint-VELOCITY noise STD for base->foot chain joints that are NOT
+  # filter states (on Alex: the ankles, no foot IMUs). Their measured velocity
+  # enters the anchor row as a known input, so by the input-noise congruence its
+  # covariance must propagate into the anchor measurement covariance:
+  #     R_anchor = Sigma_eps + J_U diag(sigma_qd^2) J_U^T
+  # Erring LARGE is safe (merely weakens the anchor, which still fixes the bias
+  # gauge). Erring small is NOT: it over-trusts a noisy input and feeds that
+  # noise straight into the base gyro-bias the InEKF depends on.
+  sigma_qd_unfiltered: 0.1        # [rad/s]  [test-locked]
+
+  # -- Direct joint-velocity channel (OPTIONAL, default OFF for sim v1) ------
+  # Lag inflation R_ii = sigma_i^2 + (dhat_i/omega_eff)^2. The firmware low-pass
+  # makes qd^meas a LAGGED measurement; for a first-order filter u - y = ydot/w_c
+  # is EXACT, so the instantaneous lag error is the signal's own slope over the
+  # effective corner. The slope comes from a finite difference of the NOISY
+  # measurement — raw, its variance 2*sigma^2/dt^2 would inflate R by ~2 orders
+  # at quiet standing, exactly the regime the channel exists for — so it is
+  # low-passed at 5 Hz (above the gait band, cutting FD noise to ~sigma^2 order).
+  direct_velocity_enabled: false
+  lag_slew_smoothing_hz: 5.0      # [Hz]  [test-locked]
+
+  # -- Masking (CLAUDE.md §4 constant-XLA-graph rules) ----------------------
+  # An inactive anchor gets R_LARGE*I3, never zeroed rows (which make S singular).
+  r_large: 1.0e+12
+
+  # Per-joint sidecars, filled from the robot's sensor spec. Empty => every joint
+  # takes the fallback above and the build logs it loudly (Java parity).
+  encoder_pos_std: {}             # TODO(Lucas): 2026-07-15 hardware PSD values
+  encoder_vel_std: {}             # TODO(Lucas): direct-velocity channel
+  gyro_sigma: {}                  # TODO(Lucas): AlexSensorNoiseParameters
+
+numerics:
+  # Below this value of theta^2 the SO(3) coefficient closed forms suffer
+  # catastrophic cancellation and the truncated series is used instead
+  # (theta ~ 1e-4; the series is then accurate to ~1e-24, far past float64).
+  small_angle_eps: 1.0e-8
+
+# ---------------------------------------------------------------------------
+# Not yet implemented — parameters recorded here so the tuning surface is
+# complete and the modules have somewhere to read from when they land.
+# ---------------------------------------------------------------------------
+
+# TODO(reseed): touchdown re-seed + TouchdownReseedLatch. Deferred by Lucas
+# 2026-07-21 — did not make a measurable difference on the real robot. See
+# PORT_NOTES.md "G5 / Deferred". Values below are the Java ones, unused for now.
+reseed:
+  enabled: false
+  latch_trigger: 0.5              # rising-crossing fire threshold
+  latch_rearm: 0.1                # sustained-low threshold that re-arms
+  latch_dwell_ticks: 100          # consecutive below-rearm ticks needed
+
+# TODO(contact_trust): FootSwitchContactProbabilityProvider. Not ported — will
+# be validated by comparing the Python and Java implementations on logged data
+# rather than by a unit-test port (Lucas, 2026-07-21).
+contact_trust:
+  schmitt_stay: 0.25
+  schmitt_enter: 0.35
+  dwell_seconds: 0.04

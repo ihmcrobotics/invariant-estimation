@@ -11,7 +11,12 @@ authors = [
 dependencies = [
   "jax",
   "jaxlie",
-  "ipython"
+  "ipython",
+  "pyyaml",
+  "ruff",
+  "black",
+  "mujoco>=3.10.0",
+  "mujoco-mjx>=3.10.0",
 ]
 
 [project.scripts]
@@ -44,3 +49,6 @@ package-dir = { "" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff.lint]
+ignore = ["E401", "E402", "F401"]
