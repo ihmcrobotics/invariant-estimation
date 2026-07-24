@@ -218,3 +218,7 @@ __marimo__/
 .streamlit/secrets.toml
 .idea/
 tmp/
+
+# Generated type stubs for libraries shipping no py.typed / .pyi (mujoco, mjx).
+# Regenerated locally via `uv run gen-stubs`; never committed.
+typings/

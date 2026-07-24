@@ -22,6 +22,7 @@ dependencies = [
 [project.scripts]
 docs = "invariant_estimation._docs:serve"
 docs-build = "invariant_estimation._docs:build"
+gen-stubs = "invariant_estimation._stubs:main"
 
 [dependency-groups]
 # zstandard decodes robotData.bsz for the Java-parity harness (replay/logsource.py).
