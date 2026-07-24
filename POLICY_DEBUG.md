@@ -1,12 +1,30 @@
 # POLICY_DEBUG.md — getting `walking_baseline` to walk in our MuJoCo sim
 
 Handoff / resume doc for the `run_policy.py` sim-to-sim debugging (2026-07-23).
-Written because the working context was nearly full. Everything needed to pick up
-is here.
+
+> **READ THIS FIRST — CURRENT STATE (2026-07-23, Session 2 = authoritative).**
+> Everything in the "Session 1" sections below (Goal → "run_policy.py current state")
+> is the ORIGINAL investigation and is **partly superseded** — in particular the
+> "foot collision geometry" suspect was DISPROVEN. The authoritative, up-to-date
+> conclusions live in the **`## SESSION 2 ...`** sections at the bottom. TL;DR:
+>
+> - **`run_policy.py` is refactored and policy-agnostic** (reads any policy's
+>   `policy_cfg.yaml`; builds obs term-by-term; drives its joints). CLI:
+>   `uv run python run_policy.py [--policy standing|baseline|forearms] [--headless]`.
+>   See `RUNNING.md`.
+> - **The harness is PROVEN CORRECT.** The `standing` policy (`--policy standing`)
+>   **balances** (~4 s, tilt <3°). That validates joint order (yaml/BFS), gains,
+>   armature, foot box, obs frames/layout, action mapping, dt — no gross bug.
+> - **The foot box == SCS2's foot, bit-for-bit** — not a guess, not the bug.
+> - **The walking baseline face-plants forward in ~1 s.** Every tuning lever failed
+>   (base_height, contact, stiffer/softer PD, dt, interpolation, walk commands). This
+>   is a genuine **PhysX→MuJoCo sim-to-sim gap** for the marginal walking gait, NOT an
+>   obs/action/param bug. Fix = training-side (domain randomization / fine-tune against
+>   MuJoCo, or reproduce IHMC's full deployment loop). Details in Session 2 §"#3 walking".
 
 ---
 
-## Goal
+## Goal (Session 1)
 
 Run IHMC's pre-trained **`walking_baseline`** RL policy **directly** (via
 `onnxruntime`, no JAX port) inside a **standalone MuJoCo sim** (`run_policy.py` at
@@ -14,18 +32,17 @@ the repo root), with **ground-truth observations**, keyboard command now / Xbox
 later. The invariant-estimator integration is **deferred** — this is purely "watch
 the policy walk in sim." (Estimator work is the actual project and is untouched.)
 
-**Status:** the loop runs end-to-end, finite, renders as the full-mesh robot — but
-**the robot falls over**; the policy does not balance it. This is a sim-to-sim
-transfer/setup problem, being debugged systematically against a known-good
-reference (below).
+**Status (Session 1 snapshot; see TL;DR above for current):** the loop runs
+end-to-end, finite, renders as the full-mesh robot — but the robot falls over.
+Being debugged systematically against a known-good reference (below).
 
 ---
 
 ## Files
 
-- **`run_policy.py`** (repo root) — the sim + control loop. `build_sim_model(with_visuals, actuators)`,
-  `build_obs`, `policy`, `Loop`. Run: `uv run python run_policy.py` (viewer) or
-  `--headless`.
+- **`run_policy.py`** (repo root) — the sim + control loop. **(Session 2: refactored to be
+  policy-agnostic — see "run_policy.py current state" below and `RUNNING.md`.)** Entry:
+  `uv run python run_policy.py [--policy standing|baseline|forearms] [--headless]`.
 - **Policy** (the one to use — FULLBODY, 98-in/29-joint):
   `/home/llibshutz/workspaces/robot-stuff/alex/src/main/resources/rl_models/2026-07-10_baseline/{policy.onnx,policy_cfg.yaml}`
   - NAMING TRAP: the Java `getModelName()=="walking_baseline"` is the *nub* variant
@@ -113,44 +130,35 @@ base_height(1), joint_pos_rel(29), joint_vel_rel(29), last_action(29)]`, in the
 - `ncon=0` at the "rest" pose earlier (feet started 1 mm above floor → free-fall);
   user observed **"feet hang from the plane by their tops, reset flies up."**
 
-## STRONGEST REMAINING SUSPECT → the next step
+## STRONGEST REMAINING SUSPECT → the next step  ⛔ SUPERSEDED (foot hypothesis DISPROVEN)
 
-**Foot collision geometry.** Since obs/action/physics/actuator all match the working
-reference yet it still fails, and a CoM-over-feet statue still topples, the **feet
-aren't providing proper support** — a contact/geometry problem. Our foot box
-(`size 0.11 0.05 0.01` at `pos 0.05 0 -0.06`, in `run_policy.build_sim_model.foot()`)
-is a **guess from one URDF collision tag**; SCS2 uses the robot's **real** collision
-shapes.
+> **This Session-1 conclusion was WRONG.** Kept for the record. Session 2 proved:
+> SCS2's MuJoCo foot geom == our box bit-for-bit; the feet give real support; a rigid
+> robot stands on them; and the `standing` policy balances on them. Foot geometry is
+> NOT the bug. See Session 2 §"foot hypothesis KILLED".
 
-**DO NEXT:**
-1. Extract SCS2/IHMC's **actual** foot collision geometry (from the Alex robot
-   model's `CollisionShapeDefinition`s / the SDF collision, the same source SCS2
-   feeds `MujocoTools.appendGeom`). Compare to our box; replace it.
-2. Emit the **full** collision set (all robot primitive collisions) with robot-vs-
-   terrain groups (`contype=1 conaffinity=2` on robot, `2/1` on floor), exactly like
-   SCS2 — not just feet.
-3. Fix `qpos0`/reset: add a `<keyframe>` (or set spawn `pos`) with the standing
-   half-squat, so reset doesn't drop the pelvis to z=0 (that's the "reset flies up").
-4. Re-test static-hold (does a rigid home pose now stand?) then policy.
+**(historical)** Foot collision geometry — the box `0.11 0.05 0.01 @ 0.05 0 -0.06` was
+suspected to be a bad guess. It is in fact exactly what SCS2 emits from the URDF.
 
-## Lower-priority candidates (if foot collision isn't it)
+## Lower-priority candidates (Session 1)  — resolved in Session 2
 
-- **Joint sign convention**: order is gathered by name (correct). Signs *probably*
-  fine (our URDF = IsaacLab's training URDF). A definitive check needs running the
-  Java sim side-by-side.
-- **Physics dt**: SCS2 uses MuJoCo default 0.002 (control 0.02 → decim 10); ours is
-  0.005 (decim 4). Finer dt = more stable; try matching.
+- **Joint sign / order**: RESOLVED — the yaml/BFS joint order is correct (the standing
+  policy balances with it; the alex.py per-limb `JOINT_NAMES_FULLBODY` order is worse).
+- **Physics dt**: RESOLVED — IsaacLab trains at dt=0.005/decim=4 (NOT 0.002); ours
+  already matches. dt=0.002 was tried and does not help.
 
 ---
 
-## run_policy.py current state
+## run_policy.py current state  (UPDATED Session 2 — the script was refactored)
 
-`build_sim_model(with_visuals=True, actuators=True)`: free-base model + floor + 2
-**guessed** foot boxes + SCS2 physics config (option + contact defaults) + position
-servos (kp from yaml, joint damping=kd) + visual meshes. `actuators=False` gives
-bare joints for the external `qfrc_applied` PD path (tested). Obs/action wiring is
-correct (verified vs oracle). The one thing NOT yet matched to the reference: the
-**collision geometry**.
+`run_policy.py` is now **policy-agnostic**. Key functions: `load_policy(name)` (reads a
+`policy_cfg.yaml`), `build_sim_model(policy, with_visuals=True)` (free base + floor + SCS2
+physics + foot boxes + per-joint position servos using the policy's kp/kd, others held at
+home by the baseline PD), `make_maps`, `build_obs(m,d,policy,maps,cmd,last_action)` (emits
+each obs term in the order the policy's `observations` list declares), `Loop`. Registry
+`POLICIES = {standing, baseline, forearms}`. Run per `RUNNING.md`. Obs/action/gains/order
+are all verified correct (the standing policy balances). The remaining issue is the
+PhysX→MuJoCo dynamics gap that the walking gait cannot survive (Session 2 §"#3 walking").
 
 ---
 

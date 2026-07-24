@@ -116,6 +116,44 @@ the Java InEKF to 1e-18. **Caveat for a full trajectory replay:** the real InEKF
 consumes a *Mahony-prefiltered* pelvis gyro, not the raw `gyroscope_pelvis_imu`
 (see `PORT_NOTES.md` "G9 — real model").
 
+## Watching an RL policy in a standalone MuJoCo sim (`run_policy.py`)
+
+`run_policy.py` (repo root) runs an IHMC pre-trained ONNX policy **directly** (via
+`onnxruntime`, no JAX/port) inside a plain MuJoCo loop with ground-truth observations.
+It is a sim-to-sim demo, **independent of the estimator** (that work is untouched).
+
+```bash
+uv run python run_policy.py                       # viewer, default = the STANDING demo
+uv run python run_policy.py --headless --ticks 200 # no window; prints tilt / z / |action|
+uv run python run_policy.py --policy baseline     # the walking_baseline policy
+```
+
+Viewer keys: `WASD` = vx/vy, `Q/E` = turn, `X` = stop, `SPACE` = stand toggle.
+
+**What works:** `--policy standing` (the `20251219_standing18` policy) **balances** —
+holds ~4 s at tilt <3°, then slowly drifts out when a foot loses contact. This is the
+proof the harness (obs frames, joint order, gains, foot, action mapping) is correct.
+
+**What does NOT work yet:** `--policy baseline` / `--policy forearms` (Isaac-WalkingUneven)
+**face-plant forward in ~1 s** — a genuine PhysX→MuJoCo sim-to-sim gap for the marginal
+walking gait, NOT a wiring bug (see `POLICY_DEBUG.md`). Fixing it is a training-side effort
+(domain randomization / fine-tune against MuJoCo, or reproduce IHMC's full deployment loop).
+
+**How it's wired (policy-agnostic).** `load_policy(name)` reads
+`rl_models/<...>/policy_cfg.yaml` (obs list, joint order, per-joint kp/kd/home/effort,
+action scale); `build_sim_model(policy)` builds a free-base MJCF (estimator MJCF + floor +
+SCS2 physics/contact + one foot box per foot == SCS2's foot bit-for-bit + per-joint position
+servos, policy gains for its joints, baseline gains for the rest); `build_obs` emits each
+obs term in the order the policy's `observations` list declares; `Loop` runs it at 50 Hz
+control / 200 Hz physics. Verified facts: obs are UNSCALED; `target = home + scale*action`;
+joint order is the yaml (IsaacLab breadth-first) order; base_height is a genuinely sensitive
+input. Registry: `POLICIES = {standing, baseline, forearms}`.
+
+**Paths it hardcodes** (edit the constants at the top of `run_policy.py` if they move):
+`URDF` (`~/Documents/alex_with_imus.urdf`), `RL_MODELS`
+(`.../alex/src/main/resources/rl_models`), `MESHDIR` (v1 visual meshes). Needs
+`onnxruntime` (already a dependency).
+
 ## Exploring a log by hand
 
 The `ihmc-log` skill's CLI is the tool for this; it needs no JVM and no SCS2.
