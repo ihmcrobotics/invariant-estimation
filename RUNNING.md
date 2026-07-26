@@ -128,26 +128,129 @@ uv run python run_policy.py --headless --ticks 200 # no window; prints tilt / z 
 uv run python run_policy.py --policy baseline     # the walking_baseline policy
 ```
 
-Viewer keys: `WASD` = vx/vy, `Q/E` = turn, `X` = stop, `SPACE` = stand toggle.
+Viewer keys (x forward, y **left**, z up — REP-103):
 
-**What works:** `--policy standing` (the `20251219_standing18` policy) **balances** —
-holds ~4 s at tilt <3°, then slowly drifts out when a foot loses contact. This is the
-proof the harness (obs frames, joint order, gains, foot, action mapping) is correct.
+| key | effect |
+|---|---|
+| `W` / `S` | ±0.1 m/s forward / back (`vx`, clamped ±0.9) |
+| `A` / `D` | ±0.1 m/s left / right (`vy`, clamped ±0.5) |
+| `Q` / `E` | ±0.1 rad/s yaw rate (clamped ±1.5) — **does not turn yet**, see `EXPERIMENTS.md` §8 |
+| `X` | stop (zeroes vx/vy/yaw and restores the standing flag) |
+| `SPACE` / `SHIFT` | raise / lower the commanded base height by 2 cm (clamped 0.55–1.00 m) |
+| `T` | toggle the standing flag by hand |
 
-**What does NOT work yet:** `--policy baseline` / `--policy forearms` (Isaac-WalkingUneven)
-**face-plant forward in ~1 s** — a genuine PhysX→MuJoCo sim-to-sim gap for the marginal
-walking gait, NOT a wiring bug (see `POLICY_DEBUG.md`). Fixing it is a training-side effort
-(domain randomization / fine-tune against MuJoCo, or reproduce IHMC's full deployment loop).
+Any nonzero velocity command clears the standing flag automatically — the policy's
+`base_velocity_plus_standing[3]` gates walking, so commanding `vx` while it is set does nothing.
+
+`SPACE`/`SHIFT` re-seed `RLHeightManager`'s cubic from the current command, so the height eases to
+the new target over 0.5 s rather than stepping. Verified: target 0.89 → 0.99 raises the pelvis
+0.896 → 0.943 and 0.89 → 0.79 lowers it to 0.820, upright with 8 contacts throughout. The pelvis
+tracks roughly half the commanded change — that is the policy's own behaviour, not the harness.
+
+**Status: working.** All three policies stand indefinitely and the walking policies walk.
+
+```
+--policy baseline   30 s: root z 0.895, tilt 1.1 deg, |action| flat 1.86, ncon 8
+--policy standing   30 s: root z 0.743, tilt 1.5 deg, |action| flat 2.92
+--policy forearms   30 s: root z 0.905, tilt 0.3 deg, |action| flat 1.91
+walking (baseline): vx=0.3 -> 0.25 m/s, vx=0.6 -> 0.60 m/s, vy=0.3 -> 0.26 m/s lateral,
+                    15 s each, upright, tilt < 3 deg
+```
+
+The baseline numbers reproduce the Java reference (root 0.8918, tilt < 1.2 deg, |action| ~1.86,
+ncon 8). A yaw-rate command does not turn yet — see `EXPERIMENTS.md` §8.
+
+**The bug was a frame error in the gyro observation.**
+`mj_objectVelocity(m, d, mjOBJ_BODY, bid, v6, 1)` resolves the velocity in the body's **inertial**
+frame, not its body frame. Alex's pelvis `body_iquat` is ~180° about (1,0,1)/sqrt(2), so
+`base_ang_vel` reached the policy with its **x and z axes swapped and y negated** — the equivalent of
+mounting the IMU rotated. `mjOBJ_XBODY` uses the body frame and matches Java's
+`RLEstimates.root_AngularVelocity` to 1e-4. If you ever read a body twist out of MuJoCo for a
+control or estimation signal, use `mjOBJ_XBODY`; `projected_gravity` was always right because it
+goes through `d.xmat`, a different code path.
+
+**`EXPERIMENTS.md` is the full investigation log** — everything measured, everything ruled out, the
+Java reference numbers, and the retracted wrong conclusions. Read it before re-testing any
+hypothesis about this harness.
+
+### Getting the Java numbers out (the reference dump)
+
+`alex/src/test/java/us/ihmc/alex/rlController/AlexMujocoObsDumpTest.java` — a diagnostic, not a
+real test. Runs the RL controller standing on SCS2's MuJoCo engine and writes
+`/tmp/alex_java_obs_dump.csv` (per 50 Hz tick: root pose/twist, gravity vector, commands, and
+per-joint q/qd/home/last_action/residual/qdes) plus `/tmp/alex_java_yovariables.txt`.
+
+```bash
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+cd ~/workspaces/robot-stuff/alex
+xvfb-run -a ../gradlew :alex-test:test --offline --tests '*AlexMujocoObsDumpTest*'
+```
+
+Gotchas, all of which cost time:
+- The test source set is its own project: **`:alex-test:test`**, not `:alex:test` (that reports
+  `NO-SOURCE`). `../gradlew` from inside `alex/`, since it is an included build.
+- `AlexStateEstimatorParameters` defaults to `JOINT_KF` but only builds the IMU pairs eagerly on
+  `RobotTarget.REAL_ROBOT`, so in SCS the pre-filter constructor throws
+  *"Base IMU is null, check the kinematic tree."* Call
+  `setJointLevelEstimatorType(ALPHA_COMPLEMENTARY)` (empty pair list ⇒ pass-through) or
+  `JOINT_KF` explicitly to trigger the lazy build.
+- xvfb is required even headless.
+- Resolve YoVariables by **full** name. `q_LEFT_HIP_X` exists on both the simulated robot and the
+  controller-core feedback toolbox, and `LEFT_HIP_X_q_prev` exists once per instantiated RL model
+  (`baseline_walking`, `mout_walking`, …). `RLEstimates`/`RLDesireds`/`RLData` live under the
+  **controller** thread (`...HumanoidHighLevelControllerManager.RLControllerState.*`), not the
+  estimator thread.
+- **SCS2 writes its generated MJCF to `/tmp/scs2-mujoco-*/world.xml`.** That file is the single
+  best artifact for model comparison — it is the actual MuJoCo model Java simulates.
+- The sensor path is a pass-through in sim: `raw_q*` == `filt_q*` == the simulated robot's q/qd,
+  so the policy sees ground truth, same as we do.
+
+### Ground truth: SCS2's MuJoCo backend
+
+The reference implementation is `us.ihmc.scs2.simulation.mujoco` (jar `scs2-mujoco-simulation`,
+sources in the Gradle cache), driven by `AlexRLSimulation.startHeadlessMujocoSimulation` and
+`AlexRDXTeleoperationUI` (`USE_MUJOCO = true`). What it does, and where we stand:
+
+| Thing | SCS2 MuJoCo | `run_policy.py` |
+|---|---|---|
+| Body | `AlexV2Version.CYCLOID_FOREARMS` — no hand adapters, 49 links, 90.539488 kg | matches (hands stripped, see below) |
+| Collision geoms | every **primitive** URDF `<collision>` → 32 geoms; mesh collisions skipped | matches (`add_collision_geoms`) |
+| Self-collision | robot `contype=1 conaffinity=2`, terrain `2/1` → robot geoms test only against terrain | matches |
+| `<option>` / contact | `MujocoSimulationParameters` defaults: Newton, implicitfast, iterations 25, noslip 5, impratio 1, pyramidal, friction `1 0.05 0.01`, solref `0.02 1`, solimp `0.9 0.99 0.0007 0.5 2`, condim 4 | matches |
+| Collision set, actual | only **7** geoms, from `AlexSimulationCollisionModel` (pelvis/torso/head/2 gripper capsules + 2 foot boxes) — the URDF `<collision>` tags are NOT what SCS2 uses | we port all 32 URDF primitives; harmless on flat ground but not faithful |
+| Foot box | **0.26 × 0.14 × 0.055** at `(0.045, 0, −0.05)` in the ankle-roll frame (`newBoxWithSTP`) | 0.22 × 0.10 × 0.02 at `(0.05, 0, −0.06)` — *smaller* in every dimension |
+| Ground | 82 tiled 25×25×0.5 boxes (`FlatGroundEnvironment`) | one infinite plane |
+| Physics rate | 0.0005 s (2 kHz) | 0.005 s (200 Hz) — matches the IsaacLab training env (`SIM_DT`), not SCS2 |
+| Joint armature | 0 (global default); kd comes from the low-level PD, MJCF `damping` is just the URDF's 0.05 | rotor armature from `urdf2mjcf`; `damping = kd` (a faithful emulation — tested) |
+| Actuation | explicit torque into `qfrc_applied` at the sim rate, `τ = clamp(kp·(q_d−q) + kd·(0−q̇), ±τmax)` | MuJoCo `position` actuator + joint damping; tracks Java's setpoints better than our own torque-PD port did |
+| Commanded root height | `RLHeightManager` ramps 0.9397 → **0.8902** over ~0.4 s | constant 0.90 / 0.75 |
+
+The foot box and the root-height command are the two genuinely unreconciled numbers. Neither fixes
+the fall on its own; both are worth correcting anyway since the foot is 29% narrower in y than the
+robot Java balances on.
+
+**Model variant.** `alex_with_imus.urdf` is the `FULL_ROBOT_ABILITY_HANDS` assembly (141 links),
+but the policies were trained on `CYCLOID_FOREARMS` and `AlexFullWalkingModelDefinition` throws
+if the robot version lacks cycloid forearms. `cycloid_forearm_urdf()` drops the two
+`*_ABILITY_HAND_ADAPTER` fixed joints and their 92 descendants, which reproduces the Java cycloid
+model exactly — same 49 links, same mass and full inertia tensor on every one. Set
+`STRIP_ABILITY_HANDS = False` to go back to the hands body (adds 0.973 kg at both wrists).
+
+**Foot collision box** is `0.22 × 0.10 × 0.02` at `(0.05, 0, −0.06)` in the `*_FOOT` frame,
+straight from the URDF — i.e. MuJoCo half-extents `0.11 0.05 0.01`. Note this is *not* the
+`0.26 × 0.14 × 0.055` box in `AlexSimulationCollisionModel`: that one feeds SCS2's own impulse
+engine and the RDX selection model, not the MuJoCo path.
 
 **How it's wired (policy-agnostic).** `load_policy(name)` reads
 `rl_models/<...>/policy_cfg.yaml` (obs list, joint order, per-joint kp/kd/home/effort,
 action scale); `build_sim_model(policy)` builds a free-base MJCF (estimator MJCF + floor +
-SCS2 physics/contact + one foot box per foot == SCS2's foot bit-for-bit + per-joint position
-servos, policy gains for its joints, baseline gains for the rest); `build_obs` emits each
-obs term in the order the policy's `observations` list declares; `Loop` runs it at 50 Hz
-control / 200 Hz physics. Verified facts: obs are UNSCALED; `target = home + scale*action`;
-joint order is the yaml (IsaacLab breadth-first) order; base_height is a genuinely sensitive
-input. Registry: `POLICIES = {standing, baseline, forearms}`.
+SCS2 physics/contact/collision set + per-joint position servos, policy gains for its joints,
+baseline gains for the rest); `build_obs` emits each obs term in the order the policy's
+`observations` list declares; `Loop` runs it at 50 Hz control / 200 Hz physics. Verified facts:
+obs are UNSCALED; `target = home + scale*action`; joint order is the yaml (IsaacLab
+breadth-first) order; base_height is a genuinely sensitive input.
+Registry: `POLICIES = {standing, baseline, forearms}`. Collision geoms are in viewer group 3
+(hidden by default — press `3` to see them over the visual meshes).
 
 **Paths it hardcodes** (edit the constants at the top of `run_policy.py` if they move):
 `URDF` (`~/Documents/alex_with_imus.urdf`), `RL_MODELS`
