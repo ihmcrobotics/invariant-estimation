@@ -21,7 +21,8 @@ exactly:
 | `ncon` | 8 | 8 |
 
 And it walks: `vx = 0.3` → 0.25 m/s, `vx = 0.6` → 0.60 m/s, `vy = 0.3` → 0.26 m/s lateral, all
-upright over 15 s with tilt < 3°. (A yaw-rate command does not turn — unresolved, see §8.)
+upright over 15 s with tilt < 3°. Yaw tracks too: ≥0.75 rad/s commanded gives ratio 1.04–1.07,
+correct sign both ways.
 
 **Why this hid for so long, and the lesson.** The term-by-term observation diff against Java reported
 `base_ang_vel` as matching, because the state I seeded set only *joint* velocities and left the
@@ -31,6 +32,7 @@ other term genuinely was bit-identical. `projected_gravity` was correct througho
 zero is not a comparison.** Perturb every channel you claim to have verified.
 
 Companion docs: `RUNNING.md` §"Watching an RL policy" (how to run things, the ground-truth table),
+`TERRAIN.md` (uneven terrain + MJX vmap, and the pure-MuJoCo-training go/no-go),
 `POLICY_DEBUG.md` (earlier sessions).
 
 ---
@@ -223,7 +225,24 @@ in §5a and the open-loop method in §5b remain valid tools.
 
 ---
 
-## 6. Reproducing the Java reference
+## 6. The diagnostic tools
+
+`experiments/java_parity.py` — the three checks that cornered this, kept runnable:
+
+```bash
+uv run python experiments/java_parity.py dynamics   # qM / qfrc_bias / CoM vs Java's compiled MJCF
+uv run python experiments/java_parity.py obs        # observation vector + ONNX action vs Java
+uv run python experiments/java_parity.py openloop   # replay Java's qdes, per-joint state error
+```
+
+Each isolates a different layer, so a future misbehaviour tells you *which* layer disagrees.
+`dynamics` needs only `/tmp/scs2-mujoco-*/world.xml`; the other two also need the CSV from §6b.
+
+The `obs` check now seeds the **free-joint twist** as well as the joint velocities. The version that
+missed the gyro bug did not, so `base_ang_vel` read (0,0,0) on both sides and reported agreement. It
+now reports 1.7e-05, i.e. a real comparison.
+
+## 6b. Reproducing the Java reference
 
 `~/workspaces/robot-stuff/alex/src/test/java/us/ihmc/alex/rlController/AlexMujocoObsDumpTest.java`
 — a diagnostic, not a real test. Writes `/tmp/alex_java_obs_dump.csv` (per 50 Hz tick: root
@@ -276,18 +295,55 @@ Things previously written down here or in memory that turned out to be **wrong**
 
 ---
 
+## 7b. The policy's command deadband (not a bug)
+
+The policy stands still for small velocity commands and only tracks above a threshold — measured on
+`baseline`, 8 s per point, with the yaw unwrapped:
+
+| commanded | achieved ratio |
+|---|---|
+| `vx` 0.20 | 0.01 |
+| `vx` 0.30 | 0.74 |
+| `vx` ≥0.45 | 0.95 |
+| `yaw` 0.25 | 0.03 |
+| `yaw` 0.50 | 0.69 |
+| `yaw` ≥0.75 | 1.05 |
+
+This is a property of the trained policy (`RampingVelocityWithStandCommandCfg` has
+`rel_standing_envs=0.1`, `stand_still_ratio=0.05`), not of the harness. It matters for input
+mapping: a linear stick with a 0.15 hardware deadzone needs ~40% deflection before anything happens,
+which reads as "the pad registers but the robot won't move". `_stick_to_command` maps the first bit
+of travel past the deadzone straight onto `WALK_MIN_*` so any real deflection moves.
+
+Also worth knowing, from `AlexCommandsCfg`: the trained command ranges are
+`lin_vel_x=(-0.9,0.9)`, `lin_vel_y=(-0.5,0.5)`, `ang_vel_z=(-1.5,1.5)` and
+`base_height=(0.83,0.93)`. `heading_command=True` is set but `rel_heading_envs=0.0`, so the
+heading-to-yaw law never activated — the policy saw `ang_vel_z` sampled directly, which is why
+driving it as a raw rate is correct.
+
 ## 8. Still open
 
-- **Yaw-rate command does not turn.** `cmd[2] = 0.5 rad/s` with `stand = 0` for 15 s produces
-  +0.1° of yaw, while `vx`/`vy` track well. `ObservationDefinitions.base_velocity` puts
-  `desiredTurningVelocity` in slot 2 of `base_velocity_plus_standing`, which is where we put it, so
-  the wiring looks right. Not yet investigated.
-- **Our sole sites are at the ankle, not the sole.** `ALEX_EXTRA_SITES` maps `left_sole`/`right_sole`
-  to the `*_FOOT` body origin with no offset, so they sit `ANKLE_HEIGHT = 0.072 m` too high
-  (root − sole_site = 0.818 where Java reports 0.890). This is estimator territory, not the policy
-  harness, and the estimator is hardware-validated — so either the InEKF contact update absorbs the
-  offset elsewhere or there is a 7.2 cm contact-point error behind a passing suite. **Unresolved and
-  worth checking independently of the policy work.**
+- ~~Yaw-rate command does not turn.~~ **RETRACTED — yaw works.** That claim came from reading yaw
+  out of `atan2`, which wraps: at 1.5 rad/s the robot turns 687° in 8 s, so the wrapped reading was
+  meaningless. Accumulating per-tick deltas instead gives ratio 1.04–1.07 for commands ≥0.75 rad/s
+  with the correct sign. Always unwrap an angle before differencing it.
+- ~~Our sole sites are at the ankle, not the sole.~~ **FIXED 2026-07-26.** It was a real 7.2 cm
+  error, not absorbed anywhere. `InvariantMainStateEstimator` anchors contacts at
+  `referenceFrames.getSoleFrame(side)`, and `AlexV1PhysicalProperties.soleToAnkleFrameTransforms` is
+  a pure translation `(ACTUAL_FOOT_LENGTH/2 − FOOT_BACK, 0, −ANKLE_HEIGHT)` = **(0.0465, 0, −0.072)**
+  in the ankle-roll frame — note the forward term, it is not z-only. `urdf2mjcf` now accepts
+  `site -> (link, offset)` and `ALEX_EXTRA_SITES` carries `ALEX_SOLE_OFFSET`.
+
+  Validated two independent ways: the sole site is 5.5 mm above the foot collision box's underside
+  (exactly the amount SCS2's box is proud of the sole plane), and `root − lower sole` now reproduces
+  Java's logged `lowestFootToRootHeight` to **1.8e-06 m** where before it was off by 0.072.
+
+  **Why the suite missed it:** the only test that looked at foot-site geometry
+  (`test_urdf_site_fk_is_bit_identical_to_java`) compares our URDF model against our *own* SDF
+  model, both built from the same `ALEX_EXTRA_SITES` — the sole was only ever compared to itself and
+  would have matched at any offset. `tests/model/test_sole_frame.py` now reaches the sole plane by
+  routes that bypass that table (the Java constants; where the foot actually rests on a floor), and
+  both are mutation-checked against the original bug and against a z-only half-fix.
 - **Armature is a known, deliberate deviation from Java** (+8.7% inertia on hip/knee, §5c). Harmless
   for the policy, but if a future comparison needs bit-parity with Java's dynamics, drop it.
 - Deferred, low priority now that it works: `frictionloss` (neither Java nor we have any), Java's

@@ -128,24 +128,54 @@ uv run python run_policy.py --headless --ticks 200 # no window; prints tilt / z 
 uv run python run_policy.py --policy baseline     # the walking_baseline policy
 ```
 
-Viewer keys (x forward, y **left**, z up — REP-103):
+### Driving it
 
-| key | effect |
+**Gamepad (preferred).** An Xbox-style pad on `/dev/input/js0`, read straight off the legacy
+joystick device — no extra dependency, no thread, drained once per control tick.
+
+| control | effect |
 |---|---|
-| `W` / `S` | ±0.1 m/s forward / back (`vx`, clamped ±0.9) |
-| `A` / `D` | ±0.1 m/s left / right (`vy`, clamped ±0.5) |
-| `Q` / `E` | ±0.1 rad/s yaw rate (clamped ±1.5) — **does not turn yet**, see `EXPERIMENTS.md` §8 |
-| `X` | stop (zeroes vx/vy/yaw and restores the standing flag) |
-| `SPACE` / `SHIFT` | raise / lower the commanded base height by 2 cm (clamped 0.55–1.00 m) |
-| `T` | toggle the standing flag by hand |
+| left stick | `vx` forward/back, `vy` strafe (absolute, scaled to ±0.9 / ±0.5 m/s) |
+| right stick X | yaw rate, up to ±1.5 rad/s (≈±86°/s) |
+| `RT` / `LT` | raise / lower commanded base height at 0.15 m/s, clamped to the policy's trained band (0.83–0.93 for the walking policies, from `AlexCommandsCfg.base_height`) |
+| `A` | toggle the standing flag |
+| `B` | stop |
+| `START` | height back to the policy default |
+
+Axis numbering is Linux `xpad` (8 axes, 11 buttons, triggers resting at −1.0) and the sign
+conventions were checked by hand against the attached pad (2026-07-26). Deadzone is 0.15 because
+these sticks rest up to 0.07 off centre.
+
+`uv run python run_policy.py --probe-gamepad` prints the raw axes next to the command they produce
+— use it after swapping controllers, since the numbering is per-driver, not universal.
+
+**The policy has its own command deadband** — it stands still below `vx` ≈ 0.25 and `yaw` ≈ 0.5,
+then tracks at ratio ≈1.0 above `vx` 0.45 / `yaw` 0.75. So the sticks are *not* mapped linearly:
+`_stick_to_command` sends the first bit of travel past the hardware deadzone straight to
+`WALK_MIN_*` (0.30 / 0.28 / 0.60), so any real deflection moves the robot instead of silently
+commanding a velocity the policy ignores. Trained ranges are `vx` ±0.9, `vy` ±0.5, `yaw` ±1.5.
+
+**Keypad (fallback).** `8`/`2` = ±vx, `4`/`6` = ±vy, `7`/`9` = turn, `5` = stop, `+`/`-` = height,
+`0` = standing flag.
+
+> **Letters cannot be viewer keys.** MuJoCo's viewer reserves every letter A–Z (plus `,` `/` `;`
+> `'` `\` `` ` ``) for render-flag toggles — the shortcut column of `mjVISSTRING`/`mjRNDSTRING` —
+> and it fires its own toggle *in addition* to calling `key_callback`. A WASD mapping therefore
+> steers *and* flips wireframe / auto-connect / shadows / static-body. `RESERVED_KEYS` in
+> `run_policy.py` is built from those tables at import so a future letter binding fails loudly.
+
+**Terminal (always available).** Single letters mirroring the old WASD (`w`, `s`, `a`, `d`, `q`,
+`e`, `x`, `t`, `+`, `-`; `www` = three presses), plus `h 0.85` to set the height target and
+`v 0.4 0 0` to set `vx vy yaw` outright.
 
 Any nonzero velocity command clears the standing flag automatically — the policy's
 `base_velocity_plus_standing[3]` gates walking, so commanding `vx` while it is set does nothing.
 
-`SPACE`/`SHIFT` re-seed `RLHeightManager`'s cubic from the current command, so the height eases to
-the new target over 0.5 s rather than stepping. Verified: target 0.89 → 0.99 raises the pelvis
-0.896 → 0.943 and 0.89 → 0.79 lowers it to 0.820, upright with 8 contacts throughout. The pelvis
-tracks roughly half the commanded change — that is the policy's own behaviour, not the harness.
+Discrete height changes ease to the new target over 0.5 s (re-seeding `RLHeightManager`'s cubic, as
+`goHome()` does); the analog triggers move the command directly via `nudge_height` instead, since
+re-seeding the ramp every tick would pin it at t=0 and freeze it. Verified: 0.89 → 0.99 raises the
+pelvis 0.896 → 0.943, 0.89 → 0.79 lowers it to 0.820, upright with 8 contacts throughout. The
+pelvis tracks roughly half the commanded change — that is the policy's behaviour, not the harness.
 
 **Status: working.** All three policies stand indefinitely and the walking policies walk.
 
@@ -168,6 +198,14 @@ mounting the IMU rotated. `mjOBJ_XBODY` uses the body frame and matches Java's
 `RLEstimates.root_AngularVelocity` to 1e-4. If you ever read a body twist out of MuJoCo for a
 control or estimation signal, use `mjOBJ_XBODY`; `projected_gravity` was always right because it
 goes through `d.xmat`, a different code path.
+
+`experiments/java_parity.py {dynamics,obs,openloop}` holds the three parity checks that found this
+— rigid-body model vs Java's compiled MJCF, observation vector vs Java's, and an open-loop setpoint
+replay. Reach for them first if a policy starts misbehaving.
+
+`TERRAIN.md` is the plan for uneven-terrain training + vmapped envs in MJX, and the go/no-go for
+training in pure MuJoCo at all. Its two feasibility claims are backed by
+`experiments/mjx_terrain_probe.py`, which asserts them — run that first.
 
 **`EXPERIMENTS.md` is the full investigation log** — everything measured, everything ruled out, the
 Java reference numbers, and the retracted wrong conclusions. Read it before re-testing any

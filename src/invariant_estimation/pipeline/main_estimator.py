@@ -90,6 +90,8 @@ __all__ = [
     "ALEX_PAIRS",
     "ALEX_FOOT_SITES",
     "ALEX_EXTRA_SITES",
+    "ALEX_SOLE_OFFSET",
+    "ALEX_ANKLE_HEIGHT",
     "alex_site_names",
     "build_alex_fused_estimator",
     "alex_spec_from_urdf",
@@ -119,12 +121,24 @@ ALEX_IMU_SITES: tuple[str, ...] = (
 )
 ALEX_PAIRS: tuple[tuple[int, int], ...] = tuple((0, k) for k in range(1, len(ALEX_IMU_SITES)))
 ALEX_FOOT_SITES: tuple[str, ...] = ("left_sole", "right_sole")
-# extra_sites for `urdf2mjcf.convert_log_model`: the InEKF body frame (pelvis root
-# body) and the two foot soles the stance anchors / contacts sit on.
-ALEX_EXTRA_SITES: dict[str, str] = {
+# The sole plane, in the `*_FOOT` link frame == the ankle-roll frame. Java:
+#   AlexV1PhysicalProperties.soleToAnkleFrameTransforms
+#     translation = (ACTUAL_FOOT_LENGTH / 2 - FOOT_BACK, 0, -ANKLE_HEIGHT)
+#                 = (0.197 / 2 - 0.052, 0, -0.072)
+# (the transform's rotation is commented out in Java, so this is a pure translation)
+# and `InvariantMainStateEstimator` anchors contacts at `referenceFrames.getSoleFrame(side)`,
+# i.e. HERE and not at the ankle. Emitting the soles at the link origin -- as this table did
+# until 2026-07-26 -- put the InEKF's contact points and the joint-KF's stance anchors 7.2 cm
+# above the ground and 4.65 cm behind the sole centre.
+ALEX_ANKLE_HEIGHT: float = 0.072
+ALEX_SOLE_OFFSET: tuple[float, float, float] = (0.197 / 2.0 - 0.052, 0.0, -ALEX_ANKLE_HEIGHT)
+
+# extra_sites for `urdf2mjcf`: the InEKF body frame (pelvis root body) and the two foot soles
+# the stance anchors / contacts sit on.
+ALEX_EXTRA_SITES: dict[str, str | tuple[str, tuple[float, float, float]]] = {
     "base_body": "PELVIS_LINK",
-    "left_sole": "LEFT_FOOT",
-    "right_sole": "RIGHT_FOOT",
+    "left_sole": ("LEFT_FOOT", ALEX_SOLE_OFFSET),
+    "right_sole": ("RIGHT_FOOT", ALEX_SOLE_OFFSET),
 }
 
 

@@ -237,8 +237,10 @@ def urdf_to_mjcf(
         lowercase, with the suffix stripped and ``_imu`` appended -- the log's
         sensor naming.
     extra_sites
-        ``site name -> link name`` for anything else the estimator needs a frame
-        on (foot soles for the InEKF contact update).
+        ``site name -> link name``, or ``site name -> (link name, (x, y, z))`` when
+        the frame is offset from the link origin. The offset is in the link frame,
+        metres. Foot soles need it: the sole plane is not the ankle-roll origin
+        (see ``main_estimator.ALEX_EXTRA_SITES``).
     """
     rotor_inertia = {} if rotor_inertia is None else dict(rotor_inertia)
     extra_sites = {} if extra_sites is None else dict(extra_sites)
@@ -282,10 +284,13 @@ def urdf_to_mjcf(
             sensor = link_name[: -len(imu_link_suffix)].lower() + "_imu"
             site_of_link.setdefault(link_name, []).append(sensor)
             imu_sites[sensor] = sensor
-    for site_name, link_name in extra_sites.items():
+    site_offsets: dict[str, tuple[float, float, float]] = {}
+    for site_name, target in extra_sites.items():
+        link_name, offset = target if isinstance(target, tuple) else (target, (0.0, 0.0, 0.0))
         if link_name not in links:
             raise ValueError(f"extra site '{site_name}' names unknown link '{link_name}'")
         site_of_link.setdefault(link_name, []).append(site_name)
+        site_offsets[site_name] = tuple(float(v) for v in offset)
 
     out: list[str] = [
         f'<mujoco model="{model_name}">',
@@ -352,7 +357,8 @@ def urdf_to_mjcf(
             out.append(f'{pad}  <inertial pos="0 0 0" mass="{_MASSLESS!r}" diaginertia="0 0 0"/>')
 
         for site_name in site_of_link.get(link_name, []):
-            out.append(f'{pad}  <site name="{site_name}" pos="0 0 0"/>')
+            x, y, z = site_offsets.get(site_name, (0.0, 0.0, 0.0))
+            out.append(f'{pad}  <site name="{site_name}" pos="{x!r} {y!r} {z!r}"/>')
 
         for child_joint in children[link_name]:
             emit_link(child_joint.find("child").get("link"), child_joint, depth + 1)
