@@ -28,6 +28,9 @@ import pytest
 
 from invariant_estimation.pipeline import main_estimator as me
 
+# tests/model/ -> repo root -> assets/. Vendored so this file's fixture runs on a bare clone.
+ASSETS_URDF = pathlib.Path(__file__).resolve().parents[2] / "assets" / "alex_with_imus.urdf"
+
 # AlexV1PhysicalProperties, transcribed. `soleToAnkleFrameTransforms` is
 #   translation = (ACTUAL_FOOT_LENGTH / 2 - FOOT_BACK, 0, -ANKLE_HEIGHT)
 # with the rotation left commented out, i.e. a pure translation in the ankle-roll frame.
@@ -50,16 +53,16 @@ FOOT_BOX_SOLE_CLEARANCE = 0.0055
 
 @pytest.fixture(scope="module")
 def alex_mjcf():
-    """The Alex MJCF from the RL training URDF. Override the path with $ALEX_URDF.
+    """The Alex MJCF from the RL training URDF, vendored at `assets/alex_with_imus.urdf`.
 
-    NOTE: without the URDF this skips, and then only `test_sole_offset_matches_the_java_transform`
-    still constrains anything — the two tests that catch a broken `extra_sites` emission or a
-    correlated mis-transcription disappear into skips. Same trade `tests/replay/` makes (a missing
-    model is a missing fixture, not a failure), but worth knowing before reading a green CI run as
-    coverage of the sole frame.
+    Override the path with $ALEX_URDF to run against a working copy. This used to default to
+    `~/Documents/`, i.e. it skipped everywhere but Lucas's laptop — and then only
+    `test_sole_offset_matches_the_java_transform` still constrained anything, the two tests that
+    catch a broken `extra_sites` emission or a correlated mis-transcription disappearing into
+    skips. The skip is kept for the $ALEX_URDF override (a missing model is a missing fixture, not
+    a failure, same trade `tests/replay/` makes), but off the default path it can no longer fire.
     """
-    path = pathlib.Path(os.environ.get(
-        "ALEX_URDF", str(pathlib.Path.home() / "Documents" / "alex_with_imus.urdf")))
+    path = pathlib.Path(os.environ.get("ALEX_URDF", str(ASSETS_URDF)))
     if not path.exists():
         pytest.skip(f"no Alex URDF at {path} (set $ALEX_URDF)")
     return me.alex_spec_from_urdf(path).mjcf

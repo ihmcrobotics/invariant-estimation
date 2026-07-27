@@ -1,8 +1,13 @@
+import os
 import numpy as np, mujoco, yaml
 import xml.etree.ElementTree as ET
 from invariant_estimation.pipeline import main_estimator as me
 
-URDF = '/home/llibshutz/Documents/alex_with_imus.urdf'
+# Superseded by `run_policy.py` -- kept as the minimal scaffold. Its URDF now comes from the
+# vendored `assets/`, but PCFG still points into `persona_rl`, so this file is NOT self-contained;
+# run `run_policy.py` unless you specifically want the bare scaffold.
+ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
+URDF = os.environ.get('ALEX_URDF', os.path.join(ASSETS, 'alex_with_imus.urdf'))
 PCFG = '/home/llibshutz/alex/persona_rl/projects/ihmc_data_processing/Alex001/20260611_001_ForwardWalk/policy_cfg.yaml'
 
 params = {p["name"]: p for p in yaml.safe_load(open(PCFG))["jointParameters"]}

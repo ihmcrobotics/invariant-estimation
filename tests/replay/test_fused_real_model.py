@@ -56,10 +56,9 @@ def alex_fused(log_dir):
 
 
 def _alex_urdf_path() -> pathlib.Path:
-    """The RL training body with IMUs. Override with $ALEX_URDF."""
-    return pathlib.Path(
-        os.environ.get("ALEX_URDF", str(pathlib.Path.home() / "Documents" / "alex_with_imus.urdf"))
-    )
+    """The RL training body with IMUs, vendored at `assets/`. Override with $ALEX_URDF."""
+    vendored = pathlib.Path(__file__).resolve().parents[2] / "assets" / "alex_with_imus.urdf"
+    return pathlib.Path(os.environ.get("ALEX_URDF", str(vendored)))
 
 
 @pytest.fixture(scope="module")

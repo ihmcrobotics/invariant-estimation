@@ -290,20 +290,31 @@ breadth-first) order; base_height is a genuinely sensitive input.
 Registry: `POLICIES = {standing, baseline, forearms}`. Collision geoms are in viewer group 3
 (hidden by default — press `3` to see them over the visual meshes).
 
-**Policy assets are vendored.** The three policies' `.onnx` + `policy_cfg.yaml` are committed
-under `rl_models/` (~1.5 MB), copied from `alex/src/main/resources/rl_models`, so the script
-runs on any machine with only this repo checked out. To run against the Java repo's live copies
-(e.g. after a retrain), point `ALEX_RL_MODELS` at that directory:
+**Everything it reads is vendored — a bare clone runs.** No sibling repos, nothing under `~`:
+
+| `assets/…` | size | copied verbatim from |
+|---|---|---|
+| `alex_with_imus.urdf` | 113 KB | `~/Documents/alex_with_imus.urdf` |
+| `rl_models/` (3 policies, `.onnx` + `policy_cfg.yaml`) | 1.5 MB | `alex/src/main/resources/rl_models/` |
+| `alex_virtual_description/` (29 visual meshes) | 16.5 MB | `ihmc-alex-sdk/alex-models/alex_virtual_description/` |
+
+Only the meshes this URDF references are vendored (16.5 of the source tree's 43 MB). The 7
+ability-hand meshes are deliberately absent: `cycloid_forearm_urdf` deletes those links before the
+model is built, and `_add_visual_meshes` already skips any mesh file that is missing.
+
+Each has an env override, for running against a live working copy without editing the source —
+`ALEX_URDF` (the same variable the test suite uses), `ALEX_RL_MODELS`, `ALEX_MESHDIR`:
 
 ```bash
 ALEX_RL_MODELS=~/workspaces/robot-stuff/alex/src/main/resources/rl_models \
-  uv run python run_policy.py --policy baseline
+  uv run python run_policy.py --policy baseline      # e.g. against a fresh retrain
 ```
 
-**Paths it still hardcodes** (edit the constants at the top of `run_policy.py` if they move):
-`URDF` (`~/Documents/alex_with_imus.urdf`) and `MESHDIR` (v1 visual meshes — cosmetic only;
-`--headless` builds with `with_visuals=False` and never touches it). Needs `onnxruntime`
-(already a dependency).
+`onnxruntime` is a declared dependency (`pyproject.toml`), so `uv sync` is all the setup there is.
+
+The one still-machine-local file in the repo is `sim_scaffold.py`'s `PCFG`, which points into
+`persona_rl`. That scaffold is superseded by `run_policy.py`; its `URDF` now uses `assets/` but the
+file as a whole does not run on a bare clone.
 
 ## Exploring a log by hand
 

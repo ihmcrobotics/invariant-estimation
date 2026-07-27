@@ -36,16 +36,24 @@ import yaml
 from invariant_estimation.pipeline import main_estimator as me
 from invariant_estimation.model.urdf2mjcf import _rpy_to_quat
 
-URDF = "/home/llibshutz/Documents/alex_with_imus.urdf"
-MESHDIR = "/home/llibshutz/workspaces/robot-stuff/ihmc-alex-sdk/alex-models/alex_virtual_description"
+# Everything this script reads is VENDORED under `assets/` (~18 MB), so a fresh clone runs with no
+# sibling repos and no files outside the checkout. The copies are byte-identical to their sources:
+#
+#   assets/alex_with_imus.urdf          <- ~/Documents/alex_with_imus.urdf
+#   assets/rl_models/                   <- alex/src/main/resources/rl_models/
+#   assets/alex_virtual_description/    <- ihmc-alex-sdk/alex-models/alex_virtual_description/
+#                                          (only the 29 visual meshes this URDF references, 16.5 MB
+#                                           of its 43 MB; the 7 ability-hand meshes are omitted --
+#                                           `cycloid_forearm_urdf` deletes those links anyway)
+#
+# Each has an env override, for running against a live working copy (a retrained policy, an edited
+# URDF) without touching the source: ALEX_URDF, ALEX_RL_MODELS, ALEX_MESHDIR. `ALEX_URDF` is the
+# same variable the test suite uses.
+ASSETS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
-# The ONNX policies and their `policy_cfg.yaml` are VENDORED here (`rl_models/`, ~1.5 MB) rather
-# than read out of the `alex` Java repo, so this script runs on a machine that has only this repo
-# checked out. They are exact copies of
-# `alex/src/main/resources/rl_models/`; set ALEX_RL_MODELS to that directory to run against the
-# Java repo's live copies instead (e.g. after a retrain).
-RL_MODELS = os.environ.get(
-    "ALEX_RL_MODELS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rl_models"))
+URDF = os.environ.get("ALEX_URDF", os.path.join(ASSETS, "alex_with_imus.urdf"))
+RL_MODELS = os.environ.get("ALEX_RL_MODELS", os.path.join(ASSETS, "rl_models"))
+MESHDIR = os.environ.get("ALEX_MESHDIR", os.path.join(ASSETS, "alex_virtual_description"))
 
 # 200 Hz physics / 50 Hz control, matching IsaacLab's SIM_DT = 0.005 and CONTROL_DT = 0.02. The
 # policy is queried at exactly the rate it was trained at; changing DT without changing DECIMATION
