@@ -191,11 +191,56 @@ def _geom(parent, name, contact_group, **attrs):
     return _sub(parent, "geom", name=name, **{**attrs, **contact_group, **CONTACT})
 
 
+def _asset(root):
+    """The single `<asset>` element, created on first use (MuJoCo merges duplicates, we don't)."""
+    a = root.find("asset")
+    return a if a is not None else ET.SubElement(root, "asset")
+
+
+# Cosmetic only -- no geom here carries collision, mass or inertia, so the dynamics are identical
+# with or without `_add_scene_look`.
+SKY_TOP, SKY_BOTTOM = "0.3 0.5 0.7", "0 0 0"          # MuJoCo's default gradient skybox
+TILE_LIGHT, TILE_DARK = "0.2 0.3 0.4", "0.1 0.2 0.3"  # ... and its blue/dark-blue checker floor
+ROBOT_RGBA = "0.09 0.09 0.10 1"                       # Alex in black
+
+
+def _add_scene_look(root):
+    """MuJoCo's stock studio look: gradient skybox, blue checkered floor, black robot.
+
+    Purely for legibility on video -- against a flat grey floor the feet have nothing to swing
+    past, so a walk reads as a hover. The tiles give the stride a scale (each is 1 m).
+    """
+    asset = _asset(root)
+    _sub(asset, "texture", type="skybox", builtin="gradient", rgb1=SKY_TOP, rgb2=SKY_BOTTOM,
+         width="512", height="3072")
+    _sub(asset, "texture", type="2d", name="groundplane", builtin="checker", mark="edge",
+         rgb1=TILE_LIGHT, rgb2=TILE_DARK, markrgb="0.8 0.8 0.8", width="300", height="300")
+    # texrepeat is in metres with texuniform, and the checker is 2x2 -- so 1 1 makes 0.5 m tiles.
+    _sub(asset, "material", name="groundplane", texture="groundplane", texuniform="true",
+         texrepeat="1 1", reflectance="0.2")
+    # A black robot needs a specular highlight to keep any shape at all against a dark floor.
+    _sub(asset, "material", name="robot", rgba=ROBOT_RGBA, specular="0.6", shininess="0.6")
+
+    # The URDF ships no lights, so without these the scene is lit by the headlight alone and the
+    # robot is a silhouette. The directional light also gives it a shadow to stand on.
+    _sub(root.find("worldbody"), "light", pos="0 0 4", dir="0 0 -1", directional="true",
+         diffuse="0.55 0.55 0.55", specular="0.25 0.25 0.25", castshadow="true")
+
+    vis = _sub(root, "visual")
+    _sub(vis, "headlight", diffuse="0.75 0.75 0.75", ambient="0.45 0.45 0.45",
+         specular="0.2 0.2 0.2")
+    _sub(vis, "rgba", haze="0.15 0.25 0.35 1")
+    # `offwidth/offheight` size MuJoCo's offscreen buffer: without them `--video` is capped at
+    # 640x480 no matter what resolution is asked for.
+    _sub(vis, "global", azimuth="140", elevation="-20", offwidth="1920", offheight="1080")
+    _sub(vis, "quality", shadowsize="4096")
+
+
 def _add_visual_meshes(root, urdf_path):
     """Cosmetic: the URDF's visual meshes as non-colliding geoms."""
     urdf = ET.parse(urdf_path).getroot()
     root.find("compiler").set("meshdir", MESHDIR)
-    asset = ET.SubElement(root, "asset")
+    asset = _asset(root)
     bodies = {b.get("name"): b for b in root.iter("body")}
     seen = {}
     for link in urdf.findall("link"):
@@ -214,7 +259,7 @@ def _add_visual_meshes(root, urdf_path):
         w, x, y, z = _rpy_to_quat([float(v) for v in
                                   ((o is not None and o.get("rpy")) or "0 0 0").split()])
         _sub(body, "geom", type="mesh", mesh=seen[rel], pos=xyz, quat=f"{w} {x} {y} {z}",
-             contype="0", conaffinity="0", group="1", rgba="0.72 0.74 0.80 1")
+             contype="0", conaffinity="0", group="1", material="robot")
 
 
 def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
@@ -233,7 +278,12 @@ def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
     _sub(root, "option", timestep=DT, gravity="0 0 -9.81", integrator="implicitfast",
          solver="Newton", iterations="25", noslip_iterations="5", impratio="1", cone="pyramidal")
 
-    _geom(root.find("worldbody"), "floor", TERRAIN_GROUP, type="plane", size="20 20 0.1")
+    # The look (textures, materials, lighting) rides along with the visual meshes: headless runs
+    # compile the same dynamics with neither.
+    if with_visuals:
+        _add_scene_look(root)
+    _geom(root.find("worldbody"), "floor", TERRAIN_GROUP, type="plane", size="20 20 0.1",
+          **({"material": "groundplane"} if with_visuals else {}))
     bodies = {b.get("name"): b for b in root.iter("body")}
     for body, typ, size, pos, quat in SCS2_COLLISION_GEOMS:
         _geom(bodies[body], f"{body}_collision_0", ROBOT_GROUP,
@@ -665,6 +715,51 @@ def run_headless(policy_name, ticks, use_gamepad=False):
             print(f"  t={k * DECIMATION * DT:5.2f}s  {loop.status()}{extra}")
     print(f"final {loop.status()}  travelled=({loop.d.qpos[0] - x0:+.2f},{loop.d.qpos[1] - y0:+.2f})m"
           f"  finite={np.all(np.isfinite(loop.d.qpos))}")
+
+
+# ---------------------------------------------------------------------------
+# Offscreen video
+#
+# `mujoco.Renderer` + a raw-RGB pipe into ffmpeg: no imageio/mediapy dependency, and nothing
+# has to be held in memory (a 30 s 720p run is ~4 GB of frames if you buffer them).
+#
+# Needs an offscreen GL context. `MUJOCO_GL=egl` is the headless-safe pick and is what the
+# entry points default to, but it MUST be set before `import mujoco` -- see the top of
+# `run_estimator.py`.
+# ---------------------------------------------------------------------------
+class VideoRecorder:
+    """Renders a tracking view of `body` and streams it to `path` as H.264."""
+
+    def __init__(self, m, path, *, body=0, width=1280, height=720, fps=50,
+                 distance=3.2, azimuth=120.0, elevation=-15.0):
+        import subprocess
+        self.m, self.path, self.fps = m, path, fps
+        self.renderer = mujoco.Renderer(m, height, width)
+        self.cam = mujoco.MjvCamera()
+        mujoco.mjv_defaultCamera(self.cam)
+        self.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        self.cam.trackbodyid = body
+        self.cam.distance, self.cam.azimuth, self.cam.elevation = distance, azimuth, elevation
+        self.opt = mujoco.MjvOption()
+        mujoco.mjv_defaultOption(self.opt)
+        self.n = 0
+        self.proc = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps),
+             "-i", "-", "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+             "-pix_fmt", "yuv420p", path],
+            stdin=subprocess.PIPE)
+
+    def capture(self, d):
+        self.renderer.update_scene(d, camera=self.cam, scene_option=self.opt)
+        self.proc.stdin.write(self.renderer.render().tobytes())
+        self.n += 1
+
+    def close(self):
+        self.proc.stdin.close()
+        self.proc.wait()
+        self.renderer.close()
+        print(f"  video -> {self.path}  ({self.n} frames, {self.n / self.fps:.1f}s @ {self.fps}fps)")
 
 
 def stdin_commands(loop):

@@ -23,7 +23,14 @@ Read `run_policy.py` first — the sim, the policy contract and every magic numb
 """
 import argparse
 import os
+import sys
 import time
+
+# `MUJOCO_GL` is read when `mujoco` is imported, so the offscreen backend has to be chosen before
+# the import below -- hence the argv peek. EGL renders without a window, which is what `--video`
+# wants; the interactive viewer is left on the platform default.
+if any(a.startswith("--video") for a in sys.argv):
+    os.environ.setdefault("MUJOCO_GL", "egl")
 
 import mujoco
 import numpy as np
@@ -221,14 +228,32 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
     return loop
 
 
-def run_headless(loop, ticks, cmd=None, out=None, every=25):
+def run_headless(loop, ticks, cmd=None, out=None, every=25, video=None, video_fps=50,
+                 video_size=(1280, 720)):
+    """Run `ticks` control ticks with no window, scoring the estimate; optionally record `video`.
+
+    Recording renders the same sim the estimator is driving -- the robot on screen is being walked
+    by the filter, not by ground truth (unless `--source truth`).
+    """
     if cmd is not None:
         loop.cmd[0:3] = cmd
         loop.cmd[3] = 0.0 if np.any(np.abs(np.asarray(cmd)) > 1e-9) else 1.0
+    rec = None
+    if video:
+        # The control loop runs at 50 Hz, so that is the ceiling on frame rate; a lower --video-fps
+        # renders every `stride`-th tick and the result is still real time.
+        control_hz = 1.0 / (rp.DECIMATION * rp.DT)
+        stride = max(1, int(round(control_hz / video_fps)))
+        w, h = video_size
+        rec = rp.VideoRecorder(loop.m, video, body=loop.maps["BASE_BID"], width=w, height=h,
+                               fps=control_hz / stride)
+        print(f"  recording {w}x{h} @ {control_hz / stride:.0f} fps -> {video}")
     x0, y0 = loop.d.qpos[0], loop.d.qpos[1]
     t0 = time.time()
     for k in range(ticks):
         loop.control_tick()
+        if rec is not None and k % stride == 0:
+            rec.capture(loop.d)
         if k % every == 0:
             print(f"  t={k * rp.DECIMATION * rp.DT:5.2f}s  {loop.status()}\n"
                   f"            {loop.est_status()}")
@@ -238,6 +263,8 @@ def run_headless(loop, ticks, cmd=None, out=None, every=25):
     print(f"\nfinal {loop.status()}"
           f"  travelled=({loop.d.qpos[0] - x0:+.2f},{loop.d.qpos[1] - y0:+.2f})m"
           f"  wall={time.time() - t0:.1f}s for {ticks * rp.DECIMATION * rp.DT:.1f}s of sim")
+    if rec is not None:
+        rec.close()
     s = print_summary(loop.history)
     if out:
         np.savez(out, **{k: np.array([h[k] for h in loop.history]) for k in loop.history[0]})
@@ -296,20 +323,32 @@ if __name__ == "__main__":
                          "(faithful), 4 = one step per control tick (50 Hz), which makes the "
                          "viewer run at roughly real time")
     ap.add_argument("--out", default=None, help="write the per-tick history to this .npz")
+    ap.add_argument("--video", default=None, metavar="PATH.mp4",
+                    help="record the run offscreen to an H.264 file (implies --headless; needs "
+                         "ffmpeg on PATH)")
+    ap.add_argument("--video-fps", type=float, default=50.0,
+                    help="frame rate, capped by the 50 Hz control loop (default 50 = real time)")
+    ap.add_argument("--video-size", default="1280x720", metavar="WxH")
     args = ap.parse_args()
+
+    video_size = tuple(int(v) for v in args.video_size.lower().split("x"))
 
     sources = () if args.source == ["truth"] else tuple(args.source)
     bad = [s for s in sources if s not in SOURCES]
     if bad:
         raise SystemExit(f"unknown --source {bad}; choose from {SOURCES} or 'truth'")
 
+    # Recording is a headless run that still needs the visual meshes -- without them there is
+    # nothing in the scene but the hidden collision boxes.
+    headless = args.headless or bool(args.video)
     loop = make_estimated_loop(
-        args.policy, with_visuals=not args.headless, sources=sources,
+        args.policy, with_visuals=not headless or bool(args.video), sources=sources,
         noise=IMUNoise(seed=args.noise_seed) if args.imu_noise else None,
         contact_meas_var=args.contact_meas_var,
         stance_chol=args.stance_chol, swing_chol=args.swing_chol,
         contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every)
-    if args.headless:
-        run_headless(loop, args.ticks, cmd=(args.vx, args.vy, args.yaw), out=args.out)
+    if headless:
+        run_headless(loop, args.ticks, cmd=(args.vx, args.vy, args.yaw), out=args.out,
+                     video=args.video, video_fps=args.video_fps, video_size=video_size)
     else:
         run_viewer(loop)
