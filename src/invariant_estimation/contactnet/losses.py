@@ -58,3 +58,14 @@ def beta_nll(nu: jax.Array, S: jax.Array, beta: float = 0.5) -> jax.Array:
     weight = jax.lax.stop_gradient(jnp.exp(beta * logdet_S))
 
     return weight * nll
+
+def beta_nll_from_diagnostics(nis: jax.Array, logdet_S: jax.Array, beta: float = 0.5) -> jax.Array:
+    """
+    Beta-NLL read off UpdateDiagnostics
+
+    `inEKF.correct.linear_update` already yields a Cholesky factored S to produce both scalars,
+    so this needs no factorization here, and can just return the full loss. 
+    """
+    nll = 0.5 * (nis + logdet_S)
+    weight = jax.lax.stop_gradient(jnp.exp(beta * logdet_S))
+    return weight * nll
