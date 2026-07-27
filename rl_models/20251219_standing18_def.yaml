@@ -1,0 +1,127 @@
+isaacTask: Isaac-Standing-Alex-Play-v0
+actionScale: 0.3
+inputSize: 76
+taskName: Standing
+jointParameters:
+- name: LEFT_HIP_X
+  kp: 80.35
+  kd: 8.035
+  homePosition: 0.0
+  maxEffort: 160.7
+- name: RIGHT_HIP_X
+  kp: 80.35
+  kd: 8.035
+  homePosition: 0.0
+  maxEffort: 160.7
+- name: SPINE_Z
+  kp: 80.35
+  kd: 8.035
+  homePosition: 0.0
+  maxEffort: 160.7
+- name: LEFT_HIP_Z
+  kp: 70.5
+  kd: 7.05
+  homePosition: 0.0
+  maxEffort: 70.5
+- name: RIGHT_HIP_Z
+  kp: 70.5
+  kd: 7.05
+  homePosition: 0.0
+  maxEffort: 70.5
+- name: LEFT_SHOULDER_Y
+  kp: 80.35
+  kd: 12.0
+  homePosition: 0.15
+  maxEffort: 160.7
+- name: NECK_Z
+  kp: 25.0
+  kd: 2.5
+  homePosition: 0.0
+  maxEffort: 25.0
+- name: RIGHT_SHOULDER_Y
+  kp: 80.35
+  kd: 12.0
+  homePosition: 0.15
+  maxEffort: 160.7
+- name: LEFT_HIP_Y
+  kp: 108.6
+  kd: 10.86
+  homePosition: -0.772
+  maxEffort: 217.2
+- name: RIGHT_HIP_Y
+  kp: 108.6
+  kd: 10.86
+  homePosition: -0.772
+  maxEffort: 217.2
+- name: LEFT_SHOULDER_X
+  kp: 80.35
+  kd: 12.0
+  homePosition: 0.05
+  maxEffort: 160.7
+- name: NECK_Y
+  kp: 25.0
+  kd: 2.5
+  homePosition: 0.0
+  maxEffort: 25.0
+- name: RIGHT_SHOULDER_X
+  kp: 80.35
+  kd: 12.0
+  homePosition: -0.05
+  maxEffort: 160.7
+- name: LEFT_KNEE_Y
+  kp: 108.6
+  kd: 10.86
+  homePosition: 1.419
+  maxEffort: 217.2
+- name: RIGHT_KNEE_Y
+  kp: 108.6
+  kd: 10.86
+  homePosition: 1.419
+  maxEffort: 217.2
+- name: LEFT_SHOULDER_Z
+  kp: 35.25
+  kd: 4.0
+  homePosition: 0.05
+  maxEffort: 70.5
+- name: RIGHT_SHOULDER_Z
+  kp: 35.25
+  kd: 4.0
+  homePosition: -0.05
+  maxEffort: 70.5
+- name: LEFT_ANKLE_Y
+  kp: 96.8
+  kd: 9.68
+  homePosition: -0.634
+  maxEffort: 193.6
+- name: RIGHT_ANKLE_Y
+  kp: 96.8
+  kd: 9.68
+  homePosition: -0.634
+  maxEffort: 193.6
+- name: LEFT_ELBOW_Y
+  kp: 35.25
+  kd: 4.0
+  homePosition: -0.5
+  maxEffort: 70.5
+- name: RIGHT_ELBOW_Y
+  kp: 35.25
+  kd: 4.0
+  homePosition: -0.5
+  maxEffort: 70.5
+- name: LEFT_ANKLE_X
+  kp: 72.6
+  kd: 7.26
+  homePosition: 0.0
+  maxEffort: 145.2
+- name: RIGHT_ANKLE_X
+  kp: 72.6
+  kd: 7.26
+  homePosition: 0.0
+  maxEffort: 145.2
+observations:
+- base_ang_vel
+- projected_gravity
+- base_height
+- joint_pos_rel
+- joint_vel_rel
+- last_action

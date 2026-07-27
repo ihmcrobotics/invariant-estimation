@@ -290,10 +290,20 @@ breadth-first) order; base_height is a genuinely sensitive input.
 Registry: `POLICIES = {standing, baseline, forearms}`. Collision geoms are in viewer group 3
 (hidden by default — press `3` to see them over the visual meshes).
 
-**Paths it hardcodes** (edit the constants at the top of `run_policy.py` if they move):
-`URDF` (`~/Documents/alex_with_imus.urdf`), `RL_MODELS`
-(`.../alex/src/main/resources/rl_models`), `MESHDIR` (v1 visual meshes). Needs
-`onnxruntime` (already a dependency).
+**Policy assets are vendored.** The three policies' `.onnx` + `policy_cfg.yaml` are committed
+under `rl_models/` (~1.5 MB), copied from `alex/src/main/resources/rl_models`, so the script
+runs on any machine with only this repo checked out. To run against the Java repo's live copies
+(e.g. after a retrain), point `ALEX_RL_MODELS` at that directory:
+
+```bash
+ALEX_RL_MODELS=~/workspaces/robot-stuff/alex/src/main/resources/rl_models \
+  uv run python run_policy.py --policy baseline
+```
+
+**Paths it still hardcodes** (edit the constants at the top of `run_policy.py` if they move):
+`URDF` (`~/Documents/alex_with_imus.urdf`) and `MESHDIR` (v1 visual meshes — cosmetic only;
+`--headless` builds with `with_visuals=False` and never touches it). Needs `onnxruntime`
+(already a dependency).
 
 ## Exploring a log by hand
 

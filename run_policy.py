@@ -37,8 +37,15 @@ from invariant_estimation.pipeline import main_estimator as me
 from invariant_estimation.model.urdf2mjcf import _rpy_to_quat
 
 URDF = "/home/llibshutz/Documents/alex_with_imus.urdf"
-RL_MODELS = "/home/llibshutz/workspaces/robot-stuff/alex/src/main/resources/rl_models"
 MESHDIR = "/home/llibshutz/workspaces/robot-stuff/ihmc-alex-sdk/alex-models/alex_virtual_description"
+
+# The ONNX policies and their `policy_cfg.yaml` are VENDORED here (`rl_models/`, ~1.5 MB) rather
+# than read out of the `alex` Java repo, so this script runs on a machine that has only this repo
+# checked out. They are exact copies of
+# `alex/src/main/resources/rl_models/`; set ALEX_RL_MODELS to that directory to run against the
+# Java repo's live copies instead (e.g. after a retrain).
+RL_MODELS = os.environ.get(
+    "ALEX_RL_MODELS", os.path.join(os.path.dirname(os.path.abspath(__file__)), "rl_models"))
 
 # 200 Hz physics / 50 Hz control, matching IsaacLab's SIM_DT = 0.005 and CONTROL_DT = 0.02. The
 # policy is queried at exactly the rate it was trained at; changing DT without changing DECIMATION
