@@ -20,6 +20,10 @@ dependencies = [
   # run_policy.py runs the exported RL policies (assets/rl_models/*.onnx) on CPU. Not used by the
   # estimator itself, but a hard requirement of the sim entry point, so it stays a main dependency.
   "onnxruntime>=1.20",
+  # contactnet/train.py only. The ContactNet forward pass is hand-written (it is transliterated
+  # into Java per network_plan.md §7); optax supplies just the training-time optimizer chain,
+  # which never leaves Python.
+  "optax>=0.2.8",
 ]
 
 [project.scripts]
