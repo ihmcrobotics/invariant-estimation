@@ -67,6 +67,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
+from ..config import load_config
 from ..inEKF import ekf as inekf_mod
 from ..inEKF import filter as inf
 from ..inEKF.gravity_update import UP, GravityRef
@@ -277,6 +278,11 @@ class FusedSensors(NamedTuple):
     contact_chol : (N, 3, 3)
         ContactNet Cholesky factors for the InEKF (the ONLY contact-condition
         input to the InEKF; firm ⇒ small, swing ⇒ large). `N == K`.
+    q_unfiltered : (n_u,), optional
+        Measured POSITIONS of the same off-path anchor joints. Only read when the
+        estimator was built with `contact_fk_unfiltered=True`, which lets the
+        contact FK stand on the live ankle angles instead of `qpos0`; ignored
+        otherwise, so the field is optional and defaults to empty.
     """
 
     encoders: Array
@@ -285,6 +291,7 @@ class FusedSensors(NamedTuple):
     qd_unfiltered: Array
     contact: Array
     contact_chol: Array
+    q_unfiltered: Array = ()
 
 
 class FusedOutputs(NamedTuple):
@@ -329,6 +336,9 @@ class FusedEstimator:
     pair_sites: np.ndarray        # (n_pairs, 2) site ordinals per IMU pair
     R_mount: Array                # (3,3) ᴮR_S: base-IMU measurement frame -> InEKF body frame
     contact_meas_var: float       # isotropic floor on InEKF contact-position noise
+    aux_qpos: np.ndarray          # (n_u,) qpos indices of the off-path anchor joints (may be empty)
+    aux_encoder_var: np.ndarray   # (n_u,) their encoder position variance
+    aux_qd_var: float             # their velocity variance (config `sigma_qd_unfiltered`)
 
     @property
     def n_joints(self) -> int:
@@ -337,6 +347,11 @@ class FusedEstimator:
     @property
     def n_contacts(self) -> int:
         return self.ekf.N
+
+    @property
+    def n_aux(self) -> int:
+        """Off-path joints fed to the contact FK (0 when the feature is off)."""
+        return int(len(self.aux_qpos))
 
 
 def build_fused_estimator(
@@ -355,6 +370,7 @@ def build_fused_estimator(
     gyro_var: float | None = None,
     accel_var: float | None = None,
     contact_var: float | None = None,
+    contact_fk_unfiltered: bool = False,
 ) -> FusedEstimator:
     """Assemble the joint KF + InEKF into one fused estimator (plain Python, I7).
 
@@ -380,6 +396,14 @@ def build_fused_estimator(
     The two landmine arguments default to their FLIGHT values (`imu_bias_process_var
     = 0`) or to the current-port value (`contact_meas_var = 0`); see the module
     docstring. Both are surfaced here so the gate can flip them and measure the effect.
+
+    `contact_fk_unfiltered` feeds the MEASURED off-path anchor joints (Alex's
+    ankles) to the contact FK instead of pinning them at `qpos0`, and widens
+    `Σ_q` with their encoder variance so `N = J Σ_q Jᵀ` still accounts for every
+    joint the measurement depends on. Java's InEKF anchors at the live sole frame,
+    so this is the faithful behaviour; it is off by default only because it
+    changes numbers the existing gates were recorded against. See
+    `_make_contact_kinematics` for what it is worth in metres.
     """
     site_names = model.site_names
     imu_sites = tuple(imu_sites)
@@ -422,7 +446,13 @@ def build_fused_estimator(
     else:
         R_mount = jnp.asarray(R_mount, dtype=jnp.float64)
 
-    kinematics = _make_contact_kinematics(model, base_body_ord, foot_site_ords)
+    # -- off-path anchor joints for the contact FK (Alex: the four ankles) ----
+    aux_qpos, aux_var = _aux_joint_tables(model, build) if contact_fk_unfiltered else (
+        np.zeros(0, dtype=int), np.zeros(0))
+    kinematics = _make_contact_kinematics(
+        model, base_body_ord, foot_site_ords,
+        aux_qpos=aux_qpos, n_filtered=build.n_joints,
+    )
     inekf_step = inf.make_step(ekf, kinematics)
 
     return FusedEstimator(
@@ -439,7 +469,32 @@ def build_fused_estimator(
         pair_sites=np.asarray(model.pair_sites, dtype=int),
         R_mount=R_mount,
         contact_meas_var=float(contact_meas_var),
+        aux_qpos=aux_qpos,
+        aux_encoder_var=aux_var,
+        aux_qd_var=float(load_config()["joint_kf"]["sigma_qd_unfiltered"]) ** 2,
     )
+
+
+def _aux_joint_tables(model: MjxModel, build: JointKFBuild) -> tuple[np.ndarray, np.ndarray]:
+    """`qpos` indices and encoder variances of the anchor chain's off-path joints.
+
+    Resolved by NAME through the same per-joint table the filtered encoders use
+    (`encoder_var_for_name`), so an ankle with no measured value falls back loudly
+    exactly as a filtered joint would.
+    """
+    import mujoco
+
+    from ..jointKF.state import encoder_var_for_name
+
+    mj = model.mj_model
+    cfg = load_config()["joint_kf"]
+    qpos, var = [], []
+    for dof in np.asarray(build.dof_anchor_unfiltered, dtype=int):
+        j = int(np.flatnonzero(mj.jnt_dofadr == dof)[0])
+        name = mujoco.mj_id2name(mj, mujoco.mjtObj.mjOBJ_JOINT, j)
+        qpos.append(int(mj.jnt_qposadr[j]))
+        var.append(encoder_var_for_name(name, cfg)[0])
+    return np.array(qpos, dtype=int), np.array(var, dtype=float)
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +502,8 @@ def build_fused_estimator(
 # ---------------------------------------------------------------------------
 
 def _make_contact_kinematics(
-    model: MjxModel, base_body_site: int, foot_site_ords: np.ndarray
+    model: MjxModel, base_body_site: int, foot_site_ords: np.ndarray,
+    aux_qpos: np.ndarray | None = None, n_filtered: int | None = None,
 ) -> inf.ContactKinematics:
     r"""The `robot/` seam: `q ↦ ContactFrames(y, J)` in the InEKF body frame `B`.
 
@@ -458,10 +514,35 @@ def _make_contact_kinematics(
     *sensor* concern (the boundary), not a kinematics one. `J = ∂y/∂q` by
     forward-mode autodiff; `J_dot = 0` (a port TODO shared with the Tier-2 replay —
     the velocity-noise term is deferred, `inEKF/filter.py`).
+
+    Off-path joints (`aux_qpos`)
+    ----------------------------
+    With `aux_qpos` given, `q` arrives as `concat(q_filtered, q_offpath)` and the
+    off-path joints are scattered into `qpos` at their MEASURED values instead of
+    staying at `qpos0`. On Alex those are the four ankles, and pinning them is not
+    a small effect: they travel 0.66 rad while walking, which swings the base→sole
+    vector by **5.3 cm over a gait cycle** (measured). A planted foot then appears
+    to slide by that much every step, and a filter whose contacts are stationary by
+    construction can only explain it as base motion — which is exactly the odometry
+    drift it produces.
+
+    This deliberately does NOT extend to `MjxModel.evaluate`: the mass matrix must
+    keep seeing off-path joints at `qpos0`, because Mecano composites the ignored
+    subtree's inertia once at construction and the joint-KF `Qa` parity depends on
+    matching that (`MjxModel.qpos`, worth 14% on `diag(Qa)`). Live angles are right
+    for kinematics and wrong for this model's inertia; the two uses are separate.
     """
     feet = jnp.asarray(foot_site_ords, dtype=int)
+    use_aux = aux_qpos is not None and len(aux_qpos) > 0
+    if use_aux:
+        qpos0 = jnp.asarray(model.mj_model.qpos0, dtype=jnp.float64)
+        idx_filtered = jnp.asarray(model.joint_qpos, dtype=int)
+        idx_aux = jnp.asarray(aux_qpos, dtype=int)
+        n_f = int(n_filtered if n_filtered is not None else model.n_joints)
 
     def _foot_y(q: Array) -> Array:
+        if use_aux:
+            q = qpos0.at[idx_filtered].set(q[:n_f]).at[idx_aux].set(q[n_f:])
         pos, rot = model.site_poses(q)
         p_base = pos[base_body_site]
         R_bw = rot[base_body_site]                       # ᵂR_B (body frame == site frame)
@@ -497,6 +578,9 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
     inekf_step = fused.inekf_step
     n = build.n_joints
     contact_meas_var = fused.contact_meas_var
+    aux_encoder_var = (jnp.asarray(fused.aux_encoder_var, dtype=jnp.float64)
+                       if fused.n_aux else None)
+    aux_qd_var = fused.aux_qd_var
 
     def fused_step(carry, sensors: FusedSensors):
         jkf_carry, inekf_carry = carry
@@ -529,7 +613,7 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
         # -- (c) the boundary: bias-correct + frame the base IMU (I1, G9.3) ----
         inekf_inputs = _boundary(
             sensors, bias, base_imu, R_mount, q_hat, qd_hat, sigma_q, sigma_qd,
-            contact_meas_var,
+            contact_meas_var, aux_encoder_var, aux_qd_var,
         )
 
         # -- (d/e) InEKF step --------------------------------------------------
@@ -547,7 +631,7 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
 
 def _boundary(
     sensors, bias, base_imu, R_mount, q_hat, qd_hat, sigma_q, sigma_qd,
-    contact_meas_var,
+    contact_meas_var, aux_encoder_var=None, aux_qd_var=0.0,
 ) -> inf.InEKFInputs:
     r"""Joint-KF output → InEKF input. The one genuinely new piece of G9.
 
@@ -572,6 +656,19 @@ def _boundary(
     n = q_hat.shape[0]
     sigma_q_eff = sigma_q + contact_meas_var * jnp.eye(n, dtype=jnp.float64)
 
+    if aux_encoder_var is not None:
+        # The contact FK also stands on the measured off-path joints, so the joint
+        # vector it is handed is `concat(filtered, off-path)` and Σ_q grows to
+        # match: the off-path block is their ENCODER variance (they are measured,
+        # not estimated, so there is no cross-covariance with the filter states).
+        # Widening Σ_q is not optional bookkeeping — `N = J Σ_q Jᵀ` would otherwise
+        # claim the ankle contribution to the contact position is noise-free.
+        q_hat = jnp.concatenate([q_hat, jnp.asarray(sensors.q_unfiltered, dtype=jnp.float64)])
+        qd_hat = jnp.concatenate([qd_hat, jnp.asarray(sensors.qd_unfiltered, dtype=jnp.float64)])
+        sigma_q_eff = jax.scipy.linalg.block_diag(sigma_q_eff, jnp.diag(aux_encoder_var))
+        sigma_qd = jax.scipy.linalg.block_diag(
+            sigma_qd, jnp.eye(aux_encoder_var.shape[0], dtype=jnp.float64) * aux_qd_var)
+
     joint = inf.JointFilterOutput(
         q=q_hat, q_dot=qd_hat, sigma_q=sigma_q_eff, sigma_q_dot=sigma_qd,
     )
@@ -594,6 +691,7 @@ def init_fused_carry(
     position: Array | None = None,
     covariance: Array | None = None,
     seed_gravity: bool = True,
+    q0_unfiltered: Array | None = None,
 ):
     """Seed `(jkf_carry, inekf_carry)` for a level, planted start.
 
@@ -609,8 +707,16 @@ def init_fused_carry(
     p0 = jnp.zeros(3, dtype=jnp.float64) if position is None else jnp.asarray(position, float)
 
     # Contacts consistent with the initial pose: d_i = R0 · y_i(q0) + p0, so
-    # y_i = R0ᵀ(d_i − p0) holds and the first FK innovation is zero.
-    frames = fused.kinematics(q0, jnp.zeros_like(q0))
+    # y_i = R0ᵀ(d_i − p0) holds and the first FK innovation is zero. With the
+    # off-path joints wired in, the seed must use the SAME augmented vector the
+    # running filter will — seeding at `qpos0` ankles and then updating against
+    # measured ones injects the whole standing FK offset as a step at tick 1.
+    q_seed = q0
+    if fused.n_aux:
+        aux0 = (jnp.zeros(fused.n_aux, dtype=jnp.float64) if q0_unfiltered is None
+                else jnp.asarray(q0_unfiltered, dtype=jnp.float64))
+        q_seed = jnp.concatenate([q0, aux0])
+    frames = fused.kinematics(q_seed, jnp.zeros_like(q_seed))
     d0 = jnp.einsum("ij,kj->ki", R0, frames.y) + p0[None, :]
 
     state0 = inekf_mod.initialize(

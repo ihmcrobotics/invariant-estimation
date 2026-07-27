@@ -360,6 +360,55 @@ The one still-machine-local file in the repo is `sim_scaffold.py`'s `PCFG`, whic
 `persona_rl`. That scaffold is superseded by `run_policy.py`; its `URDF` now uses `assets/` but the
 file as a whole does not run on a bare clone.
 
+## The estimator IN THE LOOP with a policy (`run_estimator.py`)
+
+`run_policy.py` runs the policy on ground truth. **`run_estimator.py` runs the same sim with the
+fused estimator in the loop**: simulated IMUs and encoders go in, and the policy's `base_ang_vel`
+and `projected_gravity` come out of the filter — the arrangement the real robot runs.
+
+```bash
+uv run python run_estimator.py --policy baseline --headless --ticks 1500 --vx 0.6   # 30 s walk
+uv run python run_estimator.py --policy baseline                                    # viewer
+uv run python run_estimator.py --policy baseline --headless --imu-noise             # noisy IMUs
+uv run python run_estimator.py --policy baseline --headless --source truth          # A/B control
+uv run python run_estimator.py ... --out run.npz                                    # per-tick log
+```
+
+Every run prints an error table against the sim's own state (tilt as the policy sees it,
+attitude, gyro, velocity, position drift, joint state) over the whole run and over its last half.
+
+| flag | what it changes |
+|---|---|
+| `--source ...` | which obs terms come from the estimate: `base_ang_vel`, `projected_gravity`, `joints` (routes the 9 filtered joints through the joint KF), or `truth` for none — the estimator still runs and is still scored, which is the A/B control |
+| `--imu-noise` | constant per-IMU gyro bias + white noise on gyros/accel/encoders (`--noise-seed`) |
+| `--contact-fk measured\|pinned` | whether the InEKF contact FK uses the measured ankle angles (default) or pins them at `qpos0`, as the library default still does — worth ~2x on attitude error, see below |
+| `--stance-chol` / `--swing-chol` | the Σ_C factor for a trusted / airborne foot. The InEKF has **no contact mask**; contact condition rides entirely in Σ_C, so a swing foot needs a large factor or the filter keeps believing it is planted |
+| `--contact-meas-var` | flight's `1e-4` contact measurement-noise floor (port default 0) |
+
+**Measured, 30 s at vx = 0.6 (2026-07-26, `experiments/sim_runs/`).** It walks 19–20 m on its
+own estimate, and closing the loop costs essentially nothing — estimate-driven and truth-driven
+score the same, so the filter is not being destabilised by its own feedback:
+
+| tail-RMS | estimate-driven | truth-driven (A/B) | + IMU noise |
+|---|---|---|---|
+| tilt error (policy) | 0.81° | 1.33°* | 1.42°* |
+| base gyro | 0.003 rad/s | 0.002 | 0.004 |
+| base position drift | 2.20 m in 19.4 m | 2.42 m* | 2.85 m* |
+
+\* the A/B and noise columns predate `--contact-fk measured`; rerun them for a like-for-like table.
+
+**Speed.** ~20 ms per physics step on CPU (MJX FK + CRB per tick) = ~4x slower than real time at
+200 Hz: a 30 s run takes ~2 min headless, and the viewer runs at roughly quarter speed. The first
+call pays ~45 s of MJX tracing.
+
+**How it is wired** (`src/invariant_estimation/sim/`): `sensors.py` adds real MuJoCo
+`gyro`/`accelerometer` sensors on the 8 estimator IMU sites (site frame = the estimator's
+measurement frame; a MuJoCo accelerometer reports SPECIFIC FORCE, which is what the InEKF wants),
+reads encoders and foot normal force, and runs the Schmitt/dwell contact trust.
+`estimator_loop.py` owns the jitted step and advances it over the 4 physics substeps of each
+control tick in ONE scan call, so the estimate the policy reads is current rather than a control
+period stale. Gates: `uv run pytest tests/sim -q` (24 tests, ~3 min).
+
 ## Exploring a log by hand
 
 The `ihmc-log` skill's CLI is the tool for this; it needs no JVM and no SCS2.

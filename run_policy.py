@@ -217,11 +217,15 @@ def _add_visual_meshes(root, urdf_path):
              contype="0", conaffinity="0", group="1", rgba="0.72 0.74 0.80 1")
 
 
-def build_sim_model(policy, with_visuals=True):
+def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
     """Free-base Alex: estimator MJCF + floor + SCS2's collision set + per-joint position servos.
 
     kd is applied as MuJoCo joint damping, which with a kp-only `position` actuator reproduces
     Java's `tau = kp*(q_d - q) + kd*(0 - qd)` closely (verified in EXPERIMENTS.md §4).
+
+    `with_imu_sensors` adds a gyro + accelerometer on each of the estimator's 8 IMU sites, for
+    `run_estimator.py`. Sensors are massless and stateless, so the dynamics are bit-identical
+    either way (`tests/sim/test_sensors.py::test_sensors_do_not_change_the_dynamics`).
     """
     urdf = cycloid_forearm_urdf(URDF)
     root = ET.fromstring(me.alex_spec_from_urdf(urdf).mjcf)
@@ -250,6 +254,9 @@ def build_sim_model(policy, with_visuals=True):
 
     if with_visuals:
         _add_visual_meshes(root, urdf)
+    if with_imu_sensors:
+        from invariant_estimation.sim.sensors import add_imu_sensors
+        add_imu_sensors(root, me.ALEX_IMU_SITES)
     return mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
 
 
@@ -280,15 +287,23 @@ def make_maps(m, policy):
     }
 
 
-def build_obs(m, d, policy, maps, cmd, last_action):
+def build_obs(m, d, policy, maps, cmd, last_action, est=None):
     """The observation vector, term-by-term in the order the policy's `observations` declares.
 
     cmd = [vx, vy, yaw_rate, standing, base_height].
+
+    `est` optionally supplies ESTIMATED values for individual terms, keyed by term name
+    (`run_estimator.py` passes `base_ang_vel` and `projected_gravity`). A term present in `est`
+    replaces the ground-truth one; everything else is unchanged, so `est=None` is exactly the
+    old behaviour and the two modes are directly A/B-comparable.
     """
     bid = maps["BASE_BID"]
+    est = est or {}
     out = []
     for term in policy["obs_terms"]:
-        if term == "base_ang_vel":
+        if term in est:
+            out.append(np.asarray(est[term], dtype=np.float64).ravel())
+        elif term == "base_ang_vel":
             # mjOBJ_XBODY, NOT mjOBJ_BODY. With flg_local=1 MuJoCo resolves mjOBJ_BODY in the body's
             # INERTIAL frame, and Alex's pelvis inertia frame is ~180 deg about (1,0,1)/sqrt(2) — so
             # mjOBJ_BODY hands back a gyro with x/z swapped and y negated. This was THE bug that
