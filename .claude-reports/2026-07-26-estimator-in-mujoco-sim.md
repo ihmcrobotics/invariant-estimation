@@ -139,12 +139,53 @@ the home-pose position servos **cannot hold Alex up** (left passive it sinks fro
 ~5 s; only the policy stands it up), and an accelerometer in free fall correctly reads **zero** —
 the robot is in free fall at the seeded pose, 1 mm above the floor.
 
-## 5. Still open
+## 5. The remaining drift, investigated: it is a touchdown problem
 
-* **Base position drift, ~11% of distance walked.** Two natural suspects, in order: the InEKF has
-  no contact zero-velocity constraint (`J_dot = 0`, deferred in `inEKF/filter.py`), and
-  `contact_floor = 1e-4 m²` is a permissive per-tick slip allowance. Neither reaches the policy —
-  position and velocity are not in the observation — so this is estimator quality, not gait risk.
+The 2.2 m of "position drift" is **almost entirely vertical**. Horizontal odometry is good — 18.77 m
+estimated against 19.42 m travelled, a 3.3% stride-scale error, with lateral essentially perfect.
+The vertical error grows **linearly at ~0.09 m/s**, so the estimated pelvis is metres underground
+by the end of a 30 s walk (`est_z` mean −0.49 m against a true 0.90 m).
+
+**The base and both contact anchors sink together in lockstep** — base −1.87 m, anchors −1.82 and
+−1.87 m over 20 s — while the contact innovation stays at 0.4 mm. That is the signature of a
+common mode: the contact update constrains the base only *relative* to its anchors, so an
+assembly that descends as a rigid whole generates no innovation to correct it.
+
+Three hypotheses tested and **eliminated**:
+
+1. **IMU lever arm.** The pelvis IMU sits at r = (−0.087, 0.012, −0.081) m from the body origin
+   the InEKF integrates, and the centripetal term is sign-definite, so it biases specific force by
+   a measured −0.023 m/s² in z. Plausible — and wrong: feeding the estimator a body-origin
+   accelerometer instead moved the 20 s drift from −1.873 m to −1.917 m. Not the driver.
+2. **Anchors too loose** (`contact_floor = 1e-4 m²` allowing the anchors to follow). Tightening it
+   is not just ineffective but catastrophic: at 1e-6 the drift goes to −15 m, tilt error to 18°,
+   and **the robot falls**. That slack is load-bearing — it absorbs contact/FK inconsistency that
+   would otherwise be forced into the base pose.
+3. **Ankle contact FK** — this one *was* real and is fixed (§3), and it is what took attitude from
+   1.40° to 0.81°. It is not what remains.
+
+**What it is.** The drift is gait-driven, not sensor-driven: **standing for 30 s produces no drift
+at all** (0.012 m constant offset, 0.0002 m/s velocity error), and in a walking run **63% of the
+vertical error accumulates in the 25% of ticks around a touchdown**, at 5x the background per-tick
+rate (−4.7 mm vs −0.9 mm). The filter mis-reconciles each foot landing, and the correction it
+applies has a persistent downward common-mode component.
+
+That is exactly what **touchdown re-seed** exists to prevent: `reseedContact` re-anchors the
+landing slot instead of making the update absorb a stale anchor. `CLAUDE.md` §2 lists it as tested
+Java runtime behaviour with a fire-once latch, but **the port never implemented it** — there is no
+`inEKF/reseed.py`, and `config/filter_cfg.yaml` has `reseed.enabled: false`, deferred 2026-07-21 as
+"did not make a measurable difference on the real robot". That judgement was made where absolute
+height matters least; in sim it is worth ~2 m per 30 s of walking.
+
+**Recommendation:** implement the reseed (G5's `InvariantEKFReseedTest` already specifies the
+congruence `P_dd = P_pp + R N Rᵀ`, `P_θd = P_θp` and the zero-release property) and re-measure.
+Second candidate, independent of it: the contact zero-velocity constraint, still deferred with
+`J_dot = 0` in `inEKF/filter.py`. **None of this reaches the policy** — base position and velocity
+are not in the observation vector — so it is estimator quality, not gait risk.
+
+## 6. Still open
+
+* Vertical drift above — the one thing worth picking up next.
 * **Joint velocity error ~0.8 rad/s peak while walking** (positions are excellent, 8e-4 rad). The
   direct-velocity channel is off by default in sim; it was what took hardware q̇ to ~3%.
 * **Speed.** ~0.6x real time on CPU-only jaxlib; the cost is MJX FK + CRB over 49 links inside the

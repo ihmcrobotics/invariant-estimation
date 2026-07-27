@@ -1490,3 +1490,59 @@ model is a *different* MJCF from the estimator's: `urdf2mjcf` deliberately drops
 collision/visual geoms (the estimator needs only FK/Jacobians/M), so the sim needs
 its own build with geoms + actuators (from `resources.zip` meshes or a vendored
 full-body MJCF).
+
+## G10 (part) — the estimator in the loop with the RL policy (`sim/`, 2026-07-26)
+
+`run_estimator.py` + `src/invariant_estimation/sim/` put the fused step inside the MuJoCo policy
+sim: simulated IMUs/encoders in, the policy's `base_ang_vel` + `projected_gravity` out of the
+filter. Full numbers in `.claude-reports/2026-07-26-estimator-in-mujoco-sim.md`; the two findings
+that belong in the port record are below.
+
+### Finding 1 (FIXED, behind a flag): the contact FK pinned the off-path ankles at `qpos0`
+
+`_make_contact_kinematics` evaluates base→sole FK from the 9 filtered joints, and
+`MjxModel.qpos` widens that by leaving every other joint at `qpos0`. Alex's ankles are off-path,
+so the InEKF's contact FK always believed them to be at zero. Measured on a walking run: the
+ankles travel **0.66 rad**, and the contact FK error is 3.4 cm mean with a **5.3 cm swing over a
+gait cycle**. The constant part is harmless — contacts are seeded consistently — but the swing is
+not: a planted foot appears to slide 5 cm every step, and a filter whose contacts are stationary
+by construction can only read that as base motion.
+
+Java anchors at the live sole frame (`referenceFrames.getSoleFrame`), so **this is a port gap, not
+a modelling choice**. Invisible to the Tier-1 parity harness because that compares roll/pitch,
+which gravity leveling holds; the error lands on velocity/position.
+
+Fix: `build_fused_estimator(contact_fk_unfiltered=True)` feeds the measured off-path joints to the
+contact FK and block-diagonally widens `Σ_q` with their encoder variance, so `N = J Σ_q Jᵀ` still
+covers every joint the measurement depends on. `init_fused_carry` seeds from the same augmented
+vector, or the whole standing FK offset arrives as a step at tick 1. **Default off** so recorded
+gates keep their numbers; the sim CLI defaults it on. 30 s walk, tail-RMS: tilt error
+1.40° → **0.81°**, attitude 1.61° → 0.83°, position drift 2.84 → 2.20 m.
+
+The **mass matrix deliberately keeps seeing `qpos0`** — that pinning reproduces Mecano compositing
+the ignored subtree's inertia once at construction (worth 14% on `diag(Qa)`, `MjxModel.qpos`) and
+is a separate concern from kinematics. The fix does not touch it.
+
+### Finding 2 (OPEN): the missing touchdown reseed costs ~2 m of height per 30 s of walking
+
+Residual drift after Finding 1 is **almost entirely vertical**, linear at ~0.09 m/s; horizontal
+odometry is fine (18.77 m estimated vs 19.42 m travelled, 3.3% stride scale). **Base and both
+anchors sink together** (−1.87 m base, −1.82/−1.87 m anchors over 20 s) with a 0.4 mm contact
+innovation — a common mode the relative contact constraint cannot see.
+
+Eliminated by direct test, not by argument:
+* **not the IMU lever arm** — r = (−0.087, 0.012, −0.081) m biases specific force by −0.023 m/s²
+  in z, but substituting a body-origin accelerometer moves 20 s drift only −1.873 → −1.917 m;
+* **not loose anchors** — tightening `contact_floor` 1e-4 → 1e-6 makes it −15 m with 18° of tilt
+  error and **the robot falls**. That slack absorbs contact/FK inconsistency; it is load-bearing.
+
+It is gait-driven: **standing 30 s drifts not at all** (0.012 m constant), and while walking
+**63% of the vertical error accumulates in the 25% of ticks around a touchdown**, at 5x the
+background rate. That is the mechanism `reseedContact` + `TouchdownReseedLatch` exist to prevent —
+tested Java runtime behaviour per `CLAUDE.md` §2, **never implemented in this port** (no
+`inEKF/reseed.py`; `reseed.enabled: false`, deferred 2026-07-21 as "no measurable difference on
+the real robot", a judgement made where absolute height matters least). `InvariantEKFReseedTest`
+already specifies the congruence and the zero-release property. Second, independent candidate: the
+still-deferred contact zero-velocity constraint (`J_dot = 0`, `inEKF/filter.py`).
+
+Neither reaches the policy — base position and velocity are not in the 98-term observation.

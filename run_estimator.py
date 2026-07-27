@@ -131,8 +131,12 @@ class EstimatedLoop(rp.Loop):
             "nis": est.nis,
             "trusted": est.trusted.sum(),
             "est_rpy": est.rpy,
-            "true_z": t["p"][2],
-            "est_z": est.p[2],
+            # Vectors, not just norms: a drift that is 11% of forward travel is a stride-length
+            # scale error, while one that wanders in yaw is slip. The norm cannot tell them apart.
+            "est_p": est.p.copy(),
+            "true_p": t["p"].copy(),
+            "est_v": est.v.copy(),
+            "true_v": t["v"].copy(),
         })
 
     def est_status(self):
@@ -236,9 +240,7 @@ def run_headless(loop, ticks, cmd=None, out=None, every=25):
           f"  wall={time.time() - t0:.1f}s for {ticks * rp.DECIMATION * rp.DT:.1f}s of sim")
     s = print_summary(loop.history)
     if out:
-        keys = [k for k in loop.history[0] if k != "est_rpy"]
-        np.savez(out, **{k: np.array([h[k] for h in loop.history]) for k in keys},
-                 est_rpy=np.array([h["est_rpy"] for h in loop.history]))
+        np.savez(out, **{k: np.array([h[k] for h in loop.history]) for k in loop.history[0]})
         print(f"  history -> {out}")
     return s
 
