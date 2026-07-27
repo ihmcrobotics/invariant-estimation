@@ -83,7 +83,12 @@ def test_assembles_on_the_real_model(alex_fused):
 
 
 def test_runs_finite_and_constant_graph_on_the_real_model(alex_fused):
-    """A short level-rest run: finite, PSD, and a single compiled graph (I7)."""
+    """A short level-rest run: finite, PSD, and a single compiled graph (I7).
+
+    The graph half is measured by `lower(...).as_text()` rather than `_cache_size()`, which reads a
+    process-global LRU that a full-suite run evicts — see
+    `tests/pipeline/test_main_estimator.py::test_step_does_not_recompile_across_conditions`.
+    """
     f = alex_fused
     n_u = f.build.anchor_unfiltered_mask.shape[1]
 
@@ -99,12 +104,16 @@ def test_runs_finite_and_constant_graph_on_the_real_model(alex_fused):
 
     step = jax.jit(me.make_fused_step(f))
     carry = me.init_fused_carry(f, q0=jnp.zeros(f.n_joints))
+    programs = set()
     for _ in range(5):
-        carry, out = step(carry, sensors())
+        s = sensors()
+        programs.add(step.lower(carry, s).as_text())
+        carry, out = step(carry, s)
         assert np.all(np.isfinite(np.asarray(out.p)))
         P = np.asarray(carry[1].state.P)
         assert np.linalg.eigvalsh(0.5 * (P + P.T)).min() > -1e-9
-    assert step._cache_size() == 1
+    assert len(programs) == 1, f"the step changed program across ticks ({len(programs)} distinct)"
+    assert step._cache_size() <= 1, "a tick triggered a retrace"
 
 
 def test_R_mount_is_a_ninety_degree_yaw(alex_fused):

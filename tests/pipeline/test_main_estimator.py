@@ -215,9 +215,18 @@ def test_jaxpr_constant_across_contact_and_gate(fused):
 
 
 def test_step_does_not_recompile_across_conditions(fused):
-    """Operational I7: one XLA trace serves every contact/gate condition."""
+    """Operational I7: one XLA trace serves every contact/gate condition.
+
+    Measured by comparing `lower(...).as_text()`, not `_cache_size()` — see the same treatment in
+    `tests/jointKF/test_filter.py::test_contact_pattern_does_not_change_the_program`. The jit cache
+    is a process-global LRU, so a full-suite run evicts this entry, `_cache_size()` reads 0, and an
+    `== 1` assertion fails with no retrace having occurred: it measures the test session, not the
+    code. Eviction can only push the count below one and a retrace pushes it above, so the residual
+    `<= 1` check stays meaningful either way.
+    """
     step = jax.jit(make_fused_step(fused))
     carry = init_fused_carry(fused, q0=jnp.zeros(N))
+    programs = set()
     for contact, scale, accel in [
         (np.ones(K), 1e-4, [0.0, 0.0, G]),
         (np.zeros(K), 1.0, [3.0, 0.0, 9.0]),
@@ -227,8 +236,12 @@ def test_step_does_not_recompile_across_conditions(fused):
         s = _sensors(contact=contact,
                      contact_chol=np.tile(np.eye(3) * scale, (K, 1, 1)),
                      accel=np.array(accel))
+        programs.add(step.lower(carry, s).as_text())
         carry, _ = step(carry, s)
-    assert step._cache_size() == 1
+    assert len(programs) == 1, (
+        f"a contact/gate condition changed the compiled program ({len(programs)} distinct)"
+    )
+    assert step._cache_size() <= 1, "a contact/gate condition triggered a retrace"
 
 
 # ---------------------------------------------------------------------------
