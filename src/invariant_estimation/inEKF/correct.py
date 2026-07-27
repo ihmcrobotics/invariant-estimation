@@ -266,11 +266,21 @@ class UpdateDiagnostics(NamedTuple):
         ``(max L_ii / min L_ii)²`` from the Cholesky of ``S`` — the §4 gate proxy.
     correction_rotation_norm : Array, scalar
         ``‖(Kν)_rotation‖``; zero-release checks read this.
+    logdet_S : Array, scalar
+        ``log det S`` on the **prior** ``P``, from the same Cholesky factor that
+        produces ``nis`` — so the pair ``(nis, logdet_S)`` is a complete Gaussian
+        NLL, ``0.5 (nis + logdet_S)``, with no second numerical path.
+
+        Exposed for ContactNet's β-NLL training objective, which needs the
+        ``logdet`` term to constrain the *absolute* scale of ``S``; the quadratic
+        term alone (``nis``) fixes only ratios.  NaN before any update, like
+        ``nis``.
     """
     applied: Array
     nis: Array
     condition_proxy: Array
     correction_rotation_norm: Array
+    logdet_S: Array
 
 
 def no_update_diagnostics() -> UpdateDiagnostics:
@@ -284,6 +294,7 @@ def no_update_diagnostics() -> UpdateDiagnostics:
         nis=jnp.array(jnp.nan),
         condition_proxy=jnp.array(jnp.nan),
         correction_rotation_norm=jnp.array(jnp.nan),
+        logdet_S=jnp.array(jnp.nan),
     )
 
 
@@ -338,6 +349,9 @@ def linear_update(
 
     diag = jnp.abs(jnp.diag(factor[0]))
     condition_proxy = (jnp.max(diag) / jnp.min(diag)) ** 2
+    # log det S = 2 Σ log L_ii — free from the factor already computed, so it
+    # cannot drift from `nis` the way a separate `slogdet` call could.
+    logdet_S = 2.0 * jnp.sum(jnp.log(diag))
 
     K = cho_solve(factor, H @ state.P).T           # P Hᵀ S⁻¹
     nis = residual @ cho_solve(factor, residual)   # prior P, prior residual
@@ -358,6 +372,7 @@ def linear_update(
             nis=nis,
             condition_proxy=condition_proxy,
             correction_rotation_norm=jnp.linalg.norm(xi[0:3]),
+            logdet_S=logdet_S,
         ),
     )
 

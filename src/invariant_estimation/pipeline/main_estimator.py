@@ -672,9 +672,17 @@ def _boundary(
     joint = inf.JointFilterOutput(
         q=q_hat, q_dot=qd_hat, sigma_q=sigma_q_eff, sigma_q_dot=sigma_qd,
     )
+    # ContactNet seam: the learned FK measurement noise Σ_C (network_plan.md §1).
+    # Zeros until the network is trained, which reproduces the pre-ContactNet
+    # filter bit-for-bit — `N` is then the encoder term J Σ_q Jᵀ alone.  This is
+    # the single line ContactNet replaces; see inEKF/filter.py, "Two contact
+    # covariance sockets", for why this is *not* `sensors.contact_chol`.
+    contact_meas_chol = jnp.zeros_like(sensors.contact_chol)
+
     return inf.InEKFInputs(
         omega=omega_body, accel=accel_body, raw_omega=raw_omega_body,
         joint=joint, contact_chol=sensors.contact_chol,
+        contact_meas_chol=contact_meas_chol,
     )
 
 

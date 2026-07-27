@@ -75,10 +75,13 @@ def _make_kinematics(n_contacts=N_CONTACTS, n_joints=N_JOINTS):
     return kinematics
 
 
-def _inputs(rng, contact_chol=None, accel=None, omega=None):
+def _inputs(rng, contact_chol=None, accel=None, omega=None, contact_meas_chol=None):
     """One tick of inputs."""
     if contact_chol is None:
         contact_chol = jnp.tile(jnp.eye(3) * 1.0e-3, (N_CONTACTS, 1, 1))
+    if contact_meas_chol is None:
+        # Zeros = no learned FK measurement noise = the pre-ContactNet filter.
+        contact_meas_chol = jnp.zeros((N_CONTACTS, 3, 3))
     joint = JointFilterOutput(
         q=jnp.asarray(rng.uniform(-0.5, 0.5, N_JOINTS)),
         q_dot=jnp.asarray(rng.uniform(-0.5, 0.5, N_JOINTS)),
@@ -91,6 +94,7 @@ def _inputs(rng, contact_chol=None, accel=None, omega=None):
         raw_omega=jnp.zeros(3) if omega is None else omega,
         joint=joint,
         contact_chol=jnp.asarray(contact_chol, dtype=float),
+        contact_meas_chol=jnp.asarray(contact_meas_chol, dtype=float),
     )
 
 

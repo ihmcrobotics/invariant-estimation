@@ -66,6 +66,28 @@ Consequences to keep in mind:
 CLAUDE.md I2 (contacts permanently in state) and §7 (contact condition expressed
 through ``Σ_C``) are the governing invariants.
 
+Two contact covariance sockets — do not conflate them
+-----------------------------------------------------
+The decision above governs contact *condition* and is unchanged.  It is not the
+only place a contact covariance enters, and the two are different physics:
+
+===================  ====================  ==============================
+``contact_chol``     process, ``Q_d``      *Is this foot world-static?*
+``contact_meas_chol``  measurement, ``N``  *How well do we know where it is?*
+===================  ====================  ==============================
+
+``contact_chol`` answers the swing/slip question and is the lever the DECISION
+argues for; inflating it is how a swing foot is de-weighted.  ``contact_meas_chol``
+is additive on the encoder term, ``N_i = J_{C_i} Σ_q J_{C_i}ᵀ + Σ_{C_i}``, and
+models sole compliance and contact-point geometry — uncertainty that is present
+in *firm* stance and that the encoder term structurally cannot express.
+
+ContactNet (network_plan.md §1) is specified to learn the **measurement** one.
+The process one predates it, is a large and largely untuned knob, and is a
+candidate for removal once the learned path is trained — see PORT_NOTES.md.
+Setting ``contact_meas_chol`` to zeros recovers the pre-ContactNet filter
+bit-for-bit.
+
 The joint-filter boundary
 -------------------------
 `JointFilterOutput` is the seam the joint KF feeds through: ``(q̂, q̇̂, Σ_q, Σ_q̇)``.
@@ -86,7 +108,7 @@ import jax
 from jax import Array
 import jax.numpy as jnp
 
-from .contact import digest
+from .contact import digest, reconstruct_cov
 from .correct import (
     UpdateDiagnostics,
     innovation,
@@ -179,17 +201,34 @@ class InEKFInputs(NamedTuple):
     joint : JointFilterOutput
         The joint-KF boundary (above).
     contact_chol : Array, shape (N, 3, 3)
-        ContactNet Cholesky factors ``L_{C_i}``; `contact.digest` reconstructs
-        and floors them into ``Σ_C``.  **This is the only contact-condition
-        input** — see the DECISION note in the module docstring.  Firm contact ⇒
-        small; slip ⇒ anisotropic; swing ⇒ large.  Default heuristic: a constant
-        diagonal factor, inflated for swing feet.
+        Cholesky factors of the **stance-anchor slip process noise**;
+        `contact.digest` reconstructs and floors them into the ``Σ_C`` that
+        reaches the contact block of ``Q_d``.  **This is the only
+        contact-condition input** — see the DECISION note in the module
+        docstring.  Firm contact ⇒ small; slip ⇒ anisotropic; swing ⇒ large.
+        Default heuristic: a constant diagonal factor, inflated for swing feet.
+
+        This is a large, largely untuned knob (PORT_NOTES.md, "Two contact
+        covariance sockets"): it sets how fast an anchor is allowed to drift,
+        and it is *not* the quantity ContactNet is specified to learn.
+    contact_meas_chol : Array, shape (N, 3, 3)
+        Cholesky factors of the **contact FK measurement noise** ``Σ_C``, added
+        to the encoder term: ``N_i = J_{C_i} Σ_q J_{C_i}ᵀ + Σ_{C_i}``.  This is
+        ContactNet's target per network_plan.md §1 — sole compliance, contact
+        point geometry, foot deformation: real uncertainty in *where the foot
+        is*, which the encoder term alone does not model.
+
+        Distinct from ``contact_chol`` and does not reopen the DECISION above:
+        that decision is about contact *condition* (is this foot world-static?),
+        which stays in the process noise.  Zeros here recover the pre-ContactNet
+        filter exactly.
     """
     omega: Array
     accel: Array
     raw_omega: Array
     joint: JointFilterOutput
     contact_chol: Array
+    contact_meas_chol: Array
 
 
 class InEKFCarry(NamedTuple):
@@ -260,8 +299,15 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
 
         # Joint-KF covariance enters here and only here, through the Jacobian.
         # Note there is no per-contact mask: contact condition rides entirely in
-        # Σ_C (the DECISION note above).
+        # the *process* Σ_C (the DECISION note above).
         Np = contact_position_noise(frames.J, inputs.joint.sigma_q)
+
+        # ContactNet's FK measurement noise, additive per contact and in the
+        # same frame as Np (network_plan.md §1).  No floor is applied: S =
+        # H P Hᵀ + N needs only N PSD (H P Hᵀ is already SPD — see
+        # `kalman_gain`), and ContactNet owns strict positivity of its own
+        # factor diagonal.  Zeros recover the pre-ContactNet filter exactly.
+        Nc = reconstruct_cov(inputs.contact_meas_chol)
 
         # TODO(N^v / zero-velocity): `contact_velocity_noise(frames.J_dot,
         # inputs.joint.sigma_q_dot)` is the noise on the contact *zero-velocity*
@@ -272,7 +318,7 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
 
         nu = innovation(state, frames.y)
         state, contact_diagnostics = linear_update(
-            state, ekf.params.H, nu, measurement_noise(Np)
+            state, ekf.params.H, nu, measurement_noise(Np + Nc)
         )
 
         # -- 3. gravity leveling (G4), gated --------------------------------

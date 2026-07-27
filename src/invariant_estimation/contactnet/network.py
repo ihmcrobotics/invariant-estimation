@@ -79,7 +79,7 @@ def forward(params: ContactNetParams, x: jax.Array, eps: float) -> jax.Array:
         eps: softplus floor on the Cholesky diagonal.
 
     Returns:
-        Sigma_C, (3,3), symmetric positive definite (SPD) by construction.
+        L, (3,3), yields symmetric positive definite covariance (SPD) by construction.
     """
     h = x
     for layer in params.trunk:
@@ -98,5 +98,6 @@ def forward(params: ContactNetParams, x: jax.Array, eps: float) -> jax.Array:
     )
     # We put the actual output of the head into the lower triangular bit,
     # and the diagonal is the softplus gate.
-    return L @ L.T # return the actual covariance
+    # return L @ L.T # return the actual covariance
+    return L # inputs take cholesky factors
 

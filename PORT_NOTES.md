@@ -1546,3 +1546,70 @@ already specifies the congruence and the zero-release property. Second, independ
 still-deferred contact zero-velocity constraint (`J_dot = 0`, `inEKF/filter.py`).
 
 Neither reaches the policy — base position and velocity are not in the 98-term observation.
+
+---
+
+## ContactNet seam — two contact covariance sockets (2026-07-27)
+
+`network_plan.md` §1 specifies ContactNet as supplying `Σ_C` into the contact
+update's measurement noise, `N̄ = R̂(J_C Σ_q J_Cᵀ + Σ_C)R̂ᵀ`. That term **did not
+exist in the port**: `correct.measurement_noise(Np)` block-diagonalised the
+encoder term `J_Ci Σ_q J_Ciᵀ` and nothing else, and `InEKFParams` had no contact
+measurement variance field.
+
+What *did* exist — `InEKFInputs.contact_chol` → `contact.digest` → `sigma_c` — is
+a different quantity. `propagate.continuous_Qc` places it at `Qc[9:, 9:]`, which
+in the I4 tangent ordering `[R, v, p, d_1…d_N]` is the **contact anchor block**.
+It is the random-walk density on `d_i`: the stance-anchor slip process noise.
+The naming (`Σ_C` in both the plan and `contact.py`) hid this; they are not the
+same object and must not be conflated.
+
+| input | enters | answers |
+|---|---|---|
+| `contact_chol` | process, `Q_d` | *is this foot world-static?* |
+| `contact_meas_chol` | measurement, `N` | *how well do we know where it is?* |
+
+### Change
+
+* `InEKFInputs` gains `contact_meas_chol: (N,3,3)`, lower-triangular Cholesky
+  factors of the FK measurement noise. `filter.step` adds it per contact before
+  block-diagonalising: `N_i = J_Ci Σ_q J_Ciᵀ + Σ_Ci`.
+* **No floor on this path.** `S = H P Hᵀ + N` needs only `N` PSD (`H P Hᵀ` is
+  already SPD — see `kalman_gain`), and ContactNet owns strict positivity of its
+  factor diagonal. So `contact_floor` stays what it always was: the process
+  knob. This resolves an ambiguity in `network_plan.md` §6.2, which instructs a
+  sweep of the network's `eps` to satisfy `cond(S) < 1e9`; `eps` is the right
+  lever for the *measurement* socket, `contact_floor` for the *process* one.
+* `UpdateDiagnostics` gains `logdet_S` — `2 Σ log L_ii` from the Cholesky
+  `linear_update` already computes, so it cannot drift from `nis`. Together
+  `(nis, logdet_S)` are a complete Gaussian NLL, `0.5(nis + logdet_S)`, which is
+  what ContactNet's β-NLL objective (`network_plan.md` §5.3) needs: `nis` alone
+  constrains only ratios of `S`, and the `logdet` term is what fixes absolute
+  scale. NaN before any update, matching `nis`.
+* Zeros in `contact_meas_chol` reproduce the pre-change filter exactly.
+  `pipeline/main_estimator.py` passes zeros today — that is the single line
+  ContactNet replaces.
+
+### This does not reopen the "no contact mask" DECISION
+
+`inEKF/filter.py`'s DECISION block argues contact *condition* belongs in the
+process noise and that masking the measurement "treats a true observation as
+false". That argument stands and is untouched. The new socket is not a mask and
+is not about condition: it is uncertainty in the FK measurement itself — sole
+compliance, contact-point geometry, foot deformation — which is present in
+**firm** stance and which `J Σ_q Jᵀ` structurally cannot express, since it maps
+only *encoder* variance.
+
+### Open: is the process knob compensating for the missing measurement term?
+
+The 2026-07-21 vertical-drift entry above records that tightening
+`contact_floor` 1e-4 → 1e-6 produces −15 m of drift, 18° of tilt error, and a
+fall, and concludes the slack "absorbs contact/FK inconsistency; it is
+load-bearing". Contact/FK inconsistency is *measurement* error. The hypothesis
+this seam makes testable: some of what `contact_floor` is absorbing belongs in
+`N`, and with the measurement socket fed, the process knob may tighten without
+the fall.
+
+Untested — stated as a hypothesis, not a result. `contact_chol` /
+`contact_floor` are therefore flagged **keep-or-remove pending the trained
+network**, not removed now.
