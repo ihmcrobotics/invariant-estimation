@@ -372,6 +372,8 @@ uv run python run_estimator.py --policy baseline                                
 uv run python run_estimator.py --policy baseline --headless --imu-noise             # noisy IMUs
 uv run python run_estimator.py --policy baseline --headless --source truth          # A/B control
 uv run python run_estimator.py ... --out run.npz                                    # per-tick log
+uv run python run_estimator.py --policy baseline --ticks 1500 --vx 0.6 \
+       --video walk.mp4                                                             # 30 s video
 ```
 
 Every run prints an error table against the sim's own state (tilt as the policy sees it,
@@ -384,6 +386,23 @@ attitude, gyro, velocity, position drift, joint state) over the whole run and ov
 | `--contact-fk measured\|pinned` | whether the InEKF contact FK uses the measured ankle angles (default) or pins them at `qpos0`, as the library default still does — worth ~2x on attitude error, see below |
 | `--stance-chol` / `--swing-chol` | the Σ_C factor for a trusted / airborne foot. The InEKF has **no contact mask**; contact condition rides entirely in Σ_C, so a swing foot needs a large factor or the filter keeps believing it is planted |
 | `--contact-meas-var` | flight's `1e-4` contact measurement-noise floor (port default 0) |
+| `--video walk.mp4` | record the run offscreen to H.264 (implies `--headless`, `--video-fps` / `--video-size` tune it) |
+
+### Recording a video
+
+`--video` renders the run offscreen with a chase camera on the pelvis and pipes raw frames into
+`ffmpeg` — no `imageio`/`mediapy` dependency and nothing buffered in memory. It needs `ffmpeg` on
+`PATH` and an offscreen GL context; the script sets `MUJOCO_GL=egl` for you (it has to happen
+*before* `import mujoco`, hence the argv peek at the top of `run_estimator.py`). Override with
+`MUJOCO_GL=glfw` if EGL is unavailable. Frame rate is capped by the 50 Hz control loop, so the
+default `--video-fps 50` is real time; `--video-size 1920x1080` is the largest the offscreen
+buffer is declared for (`<visual><global offwidth/offheight>` in `_add_scene_look`). Recording
+costs roughly 15 ms/tick on top of the ~35 ms control tick.
+
+The scene look — gradient skybox, blue checkered floor (0.5 m tiles, so a stride can be read off
+them), black robot, overhead light — lives in `run_policy._add_scene_look` and rides along with
+the visual meshes, so `--headless` runs without `--video` compile exactly the dynamics they did
+before: it adds no geom, mass or collision, only textures, materials and a light.
 
 **Measured, 30 s at vx = 0.6 (2026-07-26, `experiments/sim_runs/`).** It walks 19–20 m on its
 own estimate, and closing the loop costs essentially nothing — estimate-driven and truth-driven
