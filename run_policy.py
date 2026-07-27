@@ -5,11 +5,13 @@ with ground-truth observations. Independent of the estimator.
 
     uv run python run_policy.py                       # viewer, standing demo
     uv run python run_policy.py --policy baseline     # the 29-joint walking policy
+    uv run python run_policy.py --policy baseline --wasd   # own-window WASD/Space/Shift, no controller
     uv run python run_policy.py --headless --ticks 400
 
 Live command, in order of preference: an Xbox-style gamepad on /dev/input/js0 (`Gamepad`), the
-viewer's NUMERIC KEYPAD, or letters typed at the terminal (`stdin_commands`). Letters cannot be
-viewer keys -- see the BINDINGS section.
+viewer's NUMERIC KEYPAD, or letters typed at the terminal (`stdin_commands`). Letters cannot be keys
+of the default (passive) viewer -- see the BINDINGS section. The `--wasd` mode (`run_free_viewer`)
+sidesteps that by owning its own GLFW window, giving true key press/release for hold-to-move control.
 
 Every magic number here is matched to SCS2's MuJoCo backend, the reference implementation that
 works. **`EXPERIMENTS.md` is the full log** of which source each one comes from and of every
@@ -706,6 +708,148 @@ def probe_gamepad(seconds=30.0, policy_name="baseline"):
     print()
 
 
+# ---------------------------------------------------------------------------
+# Free (WASD) viewer -- our own GLFW window, so we get real key press/release
+#
+# `launch_passive` is MuJoCo's Simulate GUI: it reserves every letter for render
+# toggles AND only forwards key PRESS (never RELEASE) to `key_callback`, so it can
+# neither host a WASD binding without also flipping wireframe/shadows nor tell when a
+# key is let go. Owning a plain GLFW window and rendering into it ourselves sidesteps
+# both: raw GLFW hands us PRESS *and* RELEASE with no built-in bindings at all. Keys
+# accumulate into `held`; each control tick maps the current set to the command, so
+# holding W walks and releasing it stops -- Minecraft-style, no controller needed.
+# ---------------------------------------------------------------------------
+# Held-key command magnitudes. Chosen above the policy's walk deadband (see the
+# WALK_MIN_* note) so a tap produces motion instead of the ignored first ~40%.
+WASD_VX, WASD_VY, WASD_YAW = 0.6, 0.4, 0.9
+
+WASD_HELP = (
+    "  move:  W/S forward/back   A/D strafe left/right   Q/E turn left/right\n"
+    "  height: SPACE up   SHIFT down   R reset to policy default\n"
+    "  X stop        ESC quit\n"
+    "  mouse:  left-drag orbit   right-drag pan   scroll zoom (camera tracks the pelvis)")
+
+
+def _apply_held(loop, held, dt):
+    """Map the set of currently-held GLFW keycodes onto the live command (continuous)."""
+    import glfw
+    vx = (glfw.KEY_W in held) - (glfw.KEY_S in held)
+    vy = (glfw.KEY_A in held) - (glfw.KEY_D in held)          # A is +vy (y is LEFT)
+    yaw = (glfw.KEY_Q in held) - (glfw.KEY_E in held)
+    loop.cmd[0] = vx * WASD_VX
+    loop.cmd[1] = vy * WASD_VY
+    loop.cmd[2] = yaw * WASD_YAW
+    # Any nonzero velocity clears the standing flag (base_velocity_plus_standing[3]).
+    loop.cmd[3] = 0.0 if (vx or vy or yaw) else 1.0
+    up = glfw.KEY_SPACE in held
+    down = (glfw.KEY_LEFT_SHIFT in held) or (glfw.KEY_RIGHT_SHIFT in held)
+    if up or down:
+        loop.nudge_height((up - down) * HEIGHT_RATE * dt)
+
+
+def run_free_viewer(policy_name):
+    """Standalone GLFW window with WASD+Space+Shift live control. See WASD_HELP."""
+    import glfw
+    # This viewer owns its own GLFW window, so it must run on the main thread -- and it must NOT be
+    # launched under `mjpython`, which runs the script on a *secondary* thread (mjpython keeps the
+    # main thread for its own Cocoa loop). GLFW window creation off the main thread throws an opaque
+    # `libc++abi ... NSException` on macOS; catch that here with a message that says what to do.
+    if threading.current_thread() is not threading.main_thread():
+        raise SystemExit(
+            "--wasd must run on the main thread. Launch it with plain python, NOT mjpython:\n"
+            "    uv run python run_policy.py --wasd\n"
+            "(mjpython runs this script off the main thread, so GLFW raises an NSException. mjpython "
+            "is only needed for the DEFAULT viewer, which uses MuJoCo's own Simulate GUI.)")
+    loop = make_loop(policy_name, with_visuals=True)
+    m, d = loop.m, loop.d
+
+    if not glfw.init():
+        raise SystemExit("glfw.init() failed -- no display?")
+    window = glfw.create_window(1280, 960, f"Alex -- {policy_name} (WASD)", None, None)
+    if not window:
+        glfw.terminate()
+        raise SystemExit("glfw.create_window() failed")
+    glfw.make_context_current(window)
+    glfw.swap_interval(1)
+
+    cam, opt = mujoco.MjvCamera(), mujoco.MjvOption()
+    mujoco.mjv_defaultCamera(cam)
+    mujoco.mjv_defaultOption(opt)
+    scene = mujoco.MjvScene(m, maxgeom=10000)
+    context = mujoco.MjrContext(m, mujoco.mjtFontScale.mjFONTSCALE_150)
+    # Third-person chase cam on the pelvis, so the view follows the robot as it walks.
+    cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+    cam.trackbodyid = loop.maps["BASE_BID"]
+    cam.distance, cam.azimuth, cam.elevation = 3.5, 90.0, -20.0
+
+    held = set()
+    mouse = {"L": False, "R": False, "x": 0.0, "y": 0.0}
+
+    def on_key(_w, key, _sc, action, _mods):
+        if action == glfw.PRESS:
+            if key == glfw.KEY_ESCAPE:
+                glfw.set_window_should_close(window, True)
+            elif key == glfw.KEY_R:
+                loop.set_height_target(loop.policy["base_height"])
+            elif key == glfw.KEY_X:
+                loop.command("stop")
+            else:
+                held.add(key)
+        elif action == glfw.RELEASE:
+            held.discard(key)
+
+    def on_mouse_button(_w, button, action, _mods):
+        down = action == glfw.PRESS
+        if button == glfw.MOUSE_BUTTON_LEFT:
+            mouse["L"] = down
+        elif button == glfw.MOUSE_BUTTON_RIGHT:
+            mouse["R"] = down
+        mouse["x"], mouse["y"] = glfw.get_cursor_pos(window)
+
+    def on_cursor(_w, xpos, ypos):
+        dx, dy = xpos - mouse["x"], ypos - mouse["y"]
+        mouse["x"], mouse["y"] = xpos, ypos
+        if not (mouse["L"] or mouse["R"]):
+            return
+        h = max(1, glfw.get_window_size(window)[1])
+        act = (mujoco.mjtMouse.mjMOUSE_MOVE_V if mouse["R"]
+               else mujoco.mjtMouse.mjMOUSE_ROTATE_V)
+        mujoco.mjv_moveCamera(m, act, dx / h, dy / h, scene, cam)
+
+    def on_scroll(_w, _xoff, yoff):
+        mujoco.mjv_moveCamera(m, mujoco.mjtMouse.mjMOUSE_ZOOM, 0.0, -0.05 * yoff, scene, cam)
+
+    glfw.set_key_callback(window, on_key)
+    glfw.set_mouse_button_callback(window, on_mouse_button)
+    glfw.set_cursor_pos_callback(window, on_cursor)
+    glfw.set_scroll_callback(window, on_scroll)
+
+    print(f"Viewer (WASD): policy={policy_name}\n{WASD_HELP}")
+    print("  Terminal also accepts: 'w'/'www', 'h 0.85', 'v 0.4 0 0'.")
+    stdin_commands(loop)
+
+    dt = DECIMATION * DT
+    last_print = 0.0
+    while not glfw.window_should_close(window):
+        t0 = time.time()
+        _apply_held(loop, held, dt)
+        loop.control_tick()
+
+        mujoco.mjv_updateScene(m, d, opt, None, cam, mujoco.mjtCatBit.mjCAT_ALL, scene)
+        fb_w, fb_h = glfw.get_framebuffer_size(window)
+        mujoco.mjr_render(mujoco.MjrRect(0, 0, fb_w, fb_h), scene, context)
+        glfw.swap_buffers(window)
+        glfw.poll_events()
+
+        if t0 - last_print > 0.5:
+            # print(f"  {loop.status()}   ", end="\r", flush=True)
+            last_print = t0
+        sleep = dt - (time.time() - t0)
+        if sleep > 0:
+            time.sleep(sleep)
+    glfw.terminate()
+
+
 def run_viewer(policy_name):
     import mujoco.viewer
     loop = make_loop(policy_name, with_visuals=True)
@@ -741,10 +885,14 @@ if __name__ == "__main__":
                     help="print raw axes vs the command they produce, to check the sign conventions")
     ap.add_argument("--gamepad", action="store_true",
                     help="with --headless: drive from the gamepad and print axes + command + travel")
+    ap.add_argument("--wasd", action="store_true",
+                    help="own-window GLFW viewer with WASD+Space+Shift hold-to-move (no controller)")
     args = ap.parse_args()
     if args.probe_gamepad:
         probe_gamepad(policy_name=args.policy)
     elif args.headless:
         run_headless(args.policy, args.ticks, use_gamepad=args.gamepad)
+    elif args.wasd:
+        run_free_viewer(args.policy)
     else:
         run_viewer(args.policy)

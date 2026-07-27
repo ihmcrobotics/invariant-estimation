@@ -126,7 +126,26 @@ It is a sim-to-sim demo, **independent of the estimator** (that work is untouche
 uv run python run_policy.py                       # viewer, default = the STANDING demo
 uv run python run_policy.py --headless --ticks 200 # no window; prints tilt / z / |action|
 uv run python run_policy.py --policy baseline     # the walking_baseline policy
+uv run python run_policy.py --policy baseline --wasd  # WASD window, no controller, no mjpython
 ```
+
+> **macOS windowing — the two viewers have opposite launcher rules.**
+> - **Default** viewer = MuJoCo's Simulate GUI (`launch_passive`): **must** use `mjpython`
+>   (`mjpython run_policy.py --policy baseline`). Under plain `python` it can't own the main thread.
+> - **`--wasd`** viewer owns its own GLFW window: **must** use plain `python`
+>   (`uv run python run_policy.py --policy baseline --wasd`), **never** `mjpython`. `mjpython` runs the
+>   script on a secondary thread, so GLFW window creation throws `libc++abi ... NSException`. The
+>   script now detects this and prints the fix instead of crashing. `--wasd` is the one that gives you
+>   WASD (see below), so this is the command you want.
+>
+> If `mjpython` dies at startup with `Library not loaded: @executable_path/../lib/libpython3.12.dylib`,
+> the uv-managed interpreter's shared lib isn't on any path dyld searches. One-time fix (persists for
+> this venv; re-run if you recreate `.venv`):
+> ```bash
+> LIBDIR=$(.venv/bin/python -c 'import sys,os; print(os.path.join(sys.base_prefix,"lib"))')
+> ln -sf "$LIBDIR/libpython3.12.dylib" .venv/lib/libpython3.12.dylib
+> ```
+> Equivalent per-invocation form: `DYLD_FALLBACK_LIBRARY_PATH="$LIBDIR" mjpython run_policy.py …`.
 
 ### Driving it
 
@@ -163,6 +182,31 @@ commanding a velocity the policy ignores. Trained ranges are `vx` ±0.9, `vy` ±
 > and it fires its own toggle *in addition* to calling `key_callback`. A WASD mapping therefore
 > steers *and* flips wireframe / auto-connect / shadows / static-body. `RESERVED_KEYS` in
 > `run_policy.py` is built from those tables at import so a future letter binding fails loudly.
+
+**WASD, in a window (`--wasd`) — no controller, works on the Mac.** The letter restriction above is
+a property of the *passive* Simulate GUI, not of MuJoCo. `--wasd` opens our own GLFW window and
+renders into it directly, so raw key **press *and* release** reach us with none of Simulate's
+render-toggle bindings — hold-to-move, like a game.
+
+```bash
+uv run python run_policy.py --policy baseline --wasd
+```
+
+| key | effect |
+|---|---|
+| `W` / `S` | forward / back (`vx = ±0.6`, held) |
+| `A` / `D` | strafe left / right (`vy = ±0.4`; `y` is LEFT) |
+| `Q` / `E` | turn left / right (`yaw = ±0.9`) |
+| `Space` / `Shift` | raise / lower base height (continuous, via `nudge_height`) |
+| `R` | height back to the policy default |
+| `X` | stop |
+| `Esc` | quit |
+| mouse | left-drag orbit, right-drag pan, scroll zoom; camera tracks the pelvis |
+
+Held magnitudes sit above the policy's walk deadband (same reason as `WALK_MIN_*`), so a tap moves
+the robot rather than commanding the ignored first ~40%. This path does **not** use the passive
+viewer, so the Simulate render-flag panel/sliders are unavailable — use the default viewer (no flag)
+when you want those. On macOS GLFW must own the main thread, which it does here.
 
 **Terminal (always available).** Single letters mirroring the old WASD (`w`, `s`, `a`, `d`, `q`,
 `e`, `x`, `t`, `+`, `-`; `www` = three presses), plus `h 0.85` to set the height target and
