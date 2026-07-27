@@ -1,0 +1,14 @@
+# Vendored assets (see run_policy.py's header and RUNNING.md).
+#
+# The visual meshes are ASCII Wavefront OBJ -- one vertex or face per line, 449,879 lines across
+# the 29 files. Git treats that as text by default, so they land line-by-line in `git diff`,
+# `git show`, `git log -p`, `--stat` counts, and any review of this repo. Nothing about them is
+# reviewable as text and they change only by wholesale replacement, so mark them binary: diffs
+# collapse to "Binary files differ" and the line counts disappear. Storage is unchanged (git
+# already zlib-compresses them either way); this is purely how they are *displayed*.
+#
+# `binary` is git's built-in macro for `-diff -merge -text`: no textual diff, no attempted
+# three-way merge, and no EOL normalization -- the last of which also keeps the bytes identical
+# to their source on a CRLF checkout, which matters because these are vendored copies.
+*.obj binary
+*.onnx binary
