@@ -45,6 +45,10 @@ default-groups = ["dev", "docs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `tests/sim/` drives the real sim entry points, which live at the repo root as scripts
+# (`run_policy.py`, `run_estimator.py`) rather than inside the package.
+pythonpath = ["."]
+markers = ["slow: builds the full Alex estimator (~1 min of MJX tracing per module)"]
 
 [build-system]
 requires = ["setuptools>=61"]
