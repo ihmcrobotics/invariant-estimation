@@ -14,8 +14,10 @@ is the arrangement on the real robot.
 Every run scores the estimate against the sim's own state (attitude, tilt-as-seen-by-the-policy,
 gyro, velocity, position drift, joint state) and can dump the full history to `.npz`.
 
-Speed: the estimator costs ~20 ms per physics step on CPU (MJX FK + CRB per tick), i.e. ~4x
-slower than real time at 200 Hz. Headless runs are unaffected; the viewer runs in slow motion.
+Speed (CPU-only jaxlib, measured): a control tick costs ~35 ms against its 20 ms real-time
+budget while walking and ~21 ms standing, so the viewer runs at roughly 0.6x speed. Building the
+estimator and compiling the step costs ~55 s up front — `make_estimated_loop` compiles eagerly
+(`EstimatorRuntime.warmup`) so that cost lands there and not as an 11 s freeze on the first tick.
 
 Read `run_policy.py` first — the sim, the policy contract and every magic number live there.
 """
@@ -55,15 +57,23 @@ class EstimatedLoop(rp.Loop):
     always exactly DECIMATION samples long, which keeps the scanned graph constant (I7).
     """
 
-    def __init__(self, m, policy, maps, *, fused, reader, sources=DEFAULT_SOURCES):
+    def __init__(self, m, policy, maps, *, fused, reader, sources=DEFAULT_SOURCES, est_every=1):
         super().__init__(m, policy, maps)
         self.reader = reader
         self.sources = tuple(sources)
-        self.rt = EstimatorRuntime(fused, reader, substeps=rp.DECIMATION)
+        # `est_every` physics steps per estimator step. 1 = the physics rate (200 Hz), the
+        # faithful setting. 4 = one estimator step per control tick (50 Hz), which is what makes
+        # the viewer run at roughly real time; the filter is rate-parameterised so this is a
+        # legitimate configuration, just a coarser one.
+        if rp.DECIMATION % est_every:
+            raise ValueError(f"est_every must divide DECIMATION={rp.DECIMATION}")
+        self.est_every = int(est_every)
+        substeps = rp.DECIMATION // self.est_every
+        self.rt = EstimatorRuntime(fused, reader, substeps=substeps)
         self.rt.seed(self.d)
         # t=0 the robot is at rest and the sensors are already meaningful, so prime the batch
-        # with DECIMATION copies of the rest reading rather than special-casing the first tick.
-        self.batch = [reader.read(self.d) for _ in range(rp.DECIMATION)]
+        # rather than special-casing the first tick.
+        self.batch = [reader.read(self.d) for _ in range(substeps)]
         # Filtered joints -> their slots in the policy's joint ordering.
         order = list(policy["order"])
         self.filtered_slots = np.array([order.index(n) for n in fused.build.joint_names])
@@ -97,9 +107,10 @@ class EstimatedLoop(rp.Loop):
         self.d.ctrl[self.maps["AID"]] = self.maps["HOME"] + self.scale * self.last_action
 
         self._record(est)
-        for _ in range(rp.DECIMATION):
+        for k in range(rp.DECIMATION):
             mujoco.mj_step(self.m, self.d)
-            self.batch.append(self.reader.read(self.d))
+            if (k + 1) % self.est_every == 0:
+                self.batch.append(self.reader.read(self.d))
         self._ramp_t += rp.DECIMATION * rp.DT
 
     # -- scoring ------------------------------------------------------------
@@ -176,28 +187,31 @@ def print_summary(history):
 def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
                         noise=None, est_dt=None, contact_meas_var=0.0,
                         stance_chol=1.0e-4, swing_chol=1.0e1,
-                        contact_fk_unfiltered=True, verbose=True):
+                        contact_fk_unfiltered=True, est_every=1, verbose=True):
     t0 = time.time()
     policy = rp.load_policy(policy_name)
     m = rp.build_sim_model(policy, with_visuals=with_visuals, with_imu_sensors=True)
     maps = rp.make_maps(m, policy)
 
     urdf = rp.cycloid_forearm_urdf(rp.URDF)
+    dt = est_dt or rp.DT * est_every
     fused = me.build_alex_fused_estimator_from_urdf(
-        urdf, dt=est_dt or rp.DT, contact_meas_var=contact_meas_var,
+        urdf, dt=dt, contact_meas_var=contact_meas_var,
         contact_fk_unfiltered=contact_fk_unfiltered)
-    reader = SimSensorReader(m, fused, foot_geoms=rp.FOOT_GEOMS, dt=rp.DT, noise=noise,
+    reader = SimSensorReader(m, fused, foot_geoms=rp.FOOT_GEOMS, dt=dt, noise=noise,
                              stance_chol=stance_chol, swing_chol=swing_chol)
     if verbose:
         print(f"estimator: {fused.n_joints} filtered joints {list(fused.build.joint_names)}")
         print(f"           {fused.build.n_imus} IMUs {list(fused.build.imu_names)}, "
               f"{fused.n_contacts} contacts, dt={est_dt or rp.DT}s "
-              f"({1 / (est_dt or rp.DT):.0f} Hz), unfiltered anchor joints "
+              f"({1 / dt:.0f} Hz), unfiltered anchor joints "
               f"{list(reader.unfiltered_names)}")
         print(f"           policy reads {list(sources)} from the estimate; "
               f"noise={'on' if noise else 'off'}; contact FK uses "
               f"{'MEASURED' if fused.n_aux else 'qpos0-pinned'} off-path joints")
-    loop = EstimatedLoop(m, policy, maps, fused=fused, reader=reader, sources=sources)
+    loop = EstimatedLoop(m, policy, maps, fused=fused, reader=reader, sources=sources,
+                         est_every=est_every)
+    loop.rt.warmup(loop.batch)      # pay the ~11 s XLA compile here, not on the first tick
     if verbose:
         print(f"           built + compiled in {time.time() - t0:.1f}s")
     return loop
@@ -234,8 +248,8 @@ def run_viewer(loop):
     pad = rp.Gamepad()
     print(f"  gamepad: {pad.name}\n{rp.GAMEPAD_HELP}" if pad.present
           else f"  no gamepad at {rp.JS_DEVICE}; use the keypad or the terminal\n{rp.KEYMAP_HELP}")
-    print("  NOTE: the estimator costs ~80 ms per control tick on CPU, so the viewer runs at "
-          "roughly 1/4 speed.")
+    print("  NOTE: a control tick costs ~35 ms against its 20 ms budget on CPU, so the viewer "
+          "runs at roughly 0.6x speed.")
     rp.stdin_commands(loop)
     with mujoco.viewer.launch_passive(loop.m, loop.d, key_callback=loop.key) as v:
         last_print = 0.0
@@ -275,6 +289,10 @@ if __name__ == "__main__":
     ap.add_argument("--contact-fk", choices=("measured", "pinned"), default="measured",
                     help="whether the InEKF's contact FK uses the MEASURED off-path joints "
                          "(the ankles) or pins them at qpos0 as the library default does")
+    ap.add_argument("--est-every", type=int, default=1,
+                    help="physics steps per estimator step: 1 = the 200 Hz physics rate "
+                         "(faithful), 4 = one step per control tick (50 Hz), which makes the "
+                         "viewer run at roughly real time")
     ap.add_argument("--out", default=None, help="write the per-tick history to this .npz")
     args = ap.parse_args()
 
@@ -288,7 +306,7 @@ if __name__ == "__main__":
         noise=IMUNoise(seed=args.noise_seed) if args.imu_noise else None,
         contact_meas_var=args.contact_meas_var,
         stance_chol=args.stance_chol, swing_chol=args.swing_chol,
-        contact_fk_unfiltered=(args.contact_fk == "measured"))
+        contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every)
     if args.headless:
         run_headless(loop, args.ticks, cmd=(args.vx, args.vy, args.yaw), out=args.out)
     else:

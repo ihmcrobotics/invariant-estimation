@@ -397,9 +397,13 @@ score the same, so the filter is not being destabilised by its own feedback:
 
 \* the A/B and noise columns predate `--contact-fk measured`; rerun them for a like-for-like table.
 
-**Speed.** ~20 ms per physics step on CPU (MJX FK + CRB per tick) = ~4x slower than real time at
-200 Hz: a 30 s run takes ~2 min headless, and the viewer runs at roughly quarter speed. The first
-call pays ~45 s of MJX tracing.
+**Speed (CPU-only jaxlib, measured per tick, not inferred).** A control tick costs **~35 ms**
+against its 20 ms real-time budget while walking (~21 ms standing), so the viewer runs at roughly
+**0.6x speed** and a 30 s headless run takes ~1 min. Building the estimator and compiling the step
+costs ~55 s up front; `make_estimated_loop` compiles eagerly, so that is all paid before the first
+tick rather than as an 11 s freeze during it. `--est-every 4` runs the estimator once per control
+tick (50 Hz) instead of per physics step — about 1.6x faster, but tilt error degrades 0.81° → 2.0°,
+so it is a viewing convenience, not a setting to measure with.
 
 **How it is wired** (`src/invariant_estimation/sim/`): `sensors.py` adds real MuJoCo
 `gyro`/`accelerometer` sensors on the 8 estimator IMU sites (site frame = the estimator's

@@ -14,8 +14,9 @@ uv run python run_estimator.py --policy baseline                                
 uv run python run_estimator.py --policy baseline --headless --ticks 1500 --vx 0.6  # 30 s walk
 ```
 
-First call spends ~45 s tracing MJX; the viewer then runs at ~1/4 speed (~20 ms of estimator per
-5 ms physics step, CPU-only jaxlib). Headless 30 s takes ~2 min.
+Startup spends ~55 s building the estimator and compiling the step (eagerly, so it is not an 11 s
+freeze on the first tick). After that a control tick costs ~35 ms against its 20 ms budget while
+walking, ~21 ms standing: the viewer runs at **~0.6x speed** and a 30 s headless run takes ~1 min.
 
 ---
 
@@ -146,7 +147,11 @@ the robot is in free fall at the seeded pose, 1 mm above the floor.
   position and velocity are not in the observation — so this is estimator quality, not gait risk.
 * **Joint velocity error ~0.8 rad/s peak while walking** (positions are excellent, 8e-4 rad). The
   direct-velocity channel is off by default in sim; it was what took hardware q̇ to ~3%.
-* **Speed.** ~20 ms/step is MJX FK + CRB over 49 links on CPU-only jaxlib. A CUDA jaxlib, or the
-  `lax.scan`-over-bodies idea in the port-status notes, is the lever if real-time matters.
+* **Speed.** ~0.6x real time on CPU-only jaxlib; the cost is MJX FK + CRB over 49 links inside the
+  step (12.5 ms of a 35 ms tick, the rest being a walking-vs-standing effect I did not chase). A
+  CUDA jaxlib, or the `lax.scan`-over-bodies idea in the port-status notes, is the lever if
+  real time matters. **Correction to an earlier figure:** I first quoted ~20 ms per estimator step
+  / 4x slower than real time. That came from a contended, one-call-per-step probe; measured
+  properly inside the loop it is ~3 ms per step and ~0.6x real time.
 * The A/B and noise runs in `experiments/sim_runs/` prefixed `walk_est`/`walk_noise`/
   `walk_truthdriven` (no `_fk` suffix) predate the contact-FK fix; the `_fk` ones are current.

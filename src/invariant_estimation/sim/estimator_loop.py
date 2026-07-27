@@ -121,15 +121,28 @@ class EstimatorRuntime:
         )
         return self.carry
 
+    def warmup(self, batch):
+        """Compile the scanned step ahead of time, without touching the carry.
+
+        Otherwise XLA compiles on the FIRST control tick — ~11 s of it — which in the viewer
+        reads as a hang and in a timing run poisons the first samples. `lower(...).compile()`
+        populates the same cache the call path uses and has no side effects on the filter state.
+        """
+        if self.carry is None:
+            raise RuntimeError("call seed() before warmup()")
+        self._advance.lower(self.carry, self._stack(batch)).compile()
+
     # -- per control tick ---------------------------------------------------
+
+    @staticmethod
+    def _stack(batch):
+        return jax.tree.map(lambda *xs: jnp.asarray(np.stack(xs), dtype=jnp.float64), *batch)
 
     def advance(self, batch) -> EstimateView:
         """Run the estimator over a list of `FusedSensors` (one per physics step)."""
         if self.carry is None:
             raise RuntimeError("call seed() before advance()")
-        stacked = jax.tree.map(
-            lambda *xs: jnp.asarray(np.stack(xs), dtype=jnp.float64), *batch)
-        self.carry, out = self._advance(self.carry, stacked)
+        self.carry, out = self._advance(self.carry, self._stack(batch))
         self.last = self._view(out, batch[-1])
         return self.last
 
