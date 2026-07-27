@@ -449,6 +449,55 @@ python3 $S plot $L --vars A,B --stride 50 -o out.png
 `--stride` is in **ticks** (dt = 1 ms, so `--stride 25` = 40 Hz). Never decode a
 big log linearly — always stride, or narrow with `--start/--end`.
 
+## ContactNet — the learned contact covariance (`contactnet/`)
+
+Spec: `src/invariant_estimation/contactnet/network_plan.md`. Trains an MLP that
+emits the contact **FK measurement** noise `Σ_C`, by BPTT through the InEKF.
+
+`optax` is the only added dependency (training-time only — the forward pass is
+hand-written because it is transliterated into Java per §7).
+
+**Which socket.** There are two contact covariances and they are not the same
+thing (`inEKF/filter.py`, "Two contact covariance sockets"; `PORT_NOTES.md`):
+
+| `InEKFInputs` field | enters | question |
+|---|---|---|
+| `contact_chol` | process, `Q_d` | is this foot world-static? |
+| `contact_meas_chol` | measurement, `N` | how well do we know where it is? |
+
+ContactNet feeds `contact_meas_chol`. Zeros there reproduce the pre-ContactNet
+filter bit-for-bit, which is what `pipeline/main_estimator.py` passes today.
+
+**Driving a run.**
+
+```python
+from invariant_estimation.contactnet.network import init
+from invariant_estimation.contactnet.rollout import make_batch_loss
+from invariant_estimation.contactnet.train import train
+
+params = init(jax.random.key(0), d_in=H * F, widths=(256, 256),
+              sigma_0=SIGMA_0, eps=EPS)
+batch_loss = make_batch_loss(ekf, kinematics, EPS, beta=0.5,
+                             objective="beta_nll")     # or "l2_velocity"
+params, opt_state, history = train(params, batch_loss, batches,
+                                   dof=3 * n_contacts)
+```
+
+`batches` yields `rollout.Segment` pytrees with a leading batch axis. Hold
+`contact_chol` at a **constant** during training so the network cannot lean on
+the sim's swing/stance oracle (`sim/sensors.py` switches it 1e-4 ↔ 1e1 from a
+contact detector).
+
+**Reading the logs — two traps, both measured (`PORT_NOTES.md`):**
+
+* Under `beta_nll` the **loss is not a progress metric**. It can rise while
+  calibration improves by orders of magnitude, because the `stop_gradient`
+  β-weight is not being minimised. Watch `metrics.nis_over_dof → 1.0`. Under
+  `l2_velocity` the loss *is* monotone — run that baseline first.
+* The **first optimiser step is a no-op** (`init_value=0.0` ⇒ `lr(0) == 0`), and
+  the second moves the head only (the §4 zero-init head makes the trunk gradient
+  exactly zero until the head is nonzero). Not a broken loop.
+
 ## Documentation
 
 ```bash
@@ -468,6 +517,7 @@ src/invariant_estimation/
   inEKF/                        the invariant filter (G2–G5, complete)
   jointKF/                      the joint-space pre-filter (G6–G8)
   pipeline/main_estimator.py    the fused joint-KF→InEKF step (G9); ALEX_* topology
+  contactnet/                   learned contact measurement covariance (network_plan.md)
   replay/logsource.py           hardware-log reader for the parity harness
 tests/pipeline/                 G9 synthetic scenarios + I7 jaxpr-constancy
 tests/replay/                   Java parity — the acceptance test (incl. fused real-model)

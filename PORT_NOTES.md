@@ -1613,3 +1613,59 @@ the fall.
 Untested — stated as a hypothesis, not a result. `contact_chol` /
 `contact_floor` are therefore flagged **keep-or-remove pending the trained
 network**, not removed now.
+
+---
+
+## ContactNet training loop — two non-obvious behaviours (2026-07-27)
+
+Measured on the `tests/inEKF/test_filter.py` kinematics fixture. Absolute values
+are fixture artifacts (the fixture feeds physically inconsistent random inputs,
+so NIS/dof starts at 1.6e4); only the *directions* below are meaningful.
+
+### 1. Under β-NLL the loss value is not a progress metric
+
+Over 60 steps the β-NLL loss went **7.7e-3 → 8.7e-3 (up)** while NIS/dof went
+**15810 → 472** — a 33x improvement in calibration. The optimisation was working
+correctly the entire time.
+
+This is structural, not a tuning artifact. The loss is
+
+    stop_grad(exp(β · logdet S)) · 0.5 (nis + logdet S)
+
+When the filter starts overconfident, the correct move is to inflate `Σ_C`,
+which raises `logdet S`, which raises the **detached** weight. The product can
+rise while calibration improves by orders of magnitude, because the weight is
+not part of what is being minimised.
+
+Consequence: watch **`nis_over_dof → 1`**, never the loss, when the objective is
+β-NLL. `train.Metrics` exists to make that the visible number. Under
+`l2_velocity` the loss *is* monotone and usable (measured 661 → 3.33 over the
+same 60 steps) — a second reason to run the §5.3 L2 baseline first: it is the
+only one of the two runs whose loss curve can be read naively.
+
+NIS is on the stacked contact measurement, so it is χ²(3N) — dof **6** for two
+contacts, not 3. `nis_over_dof` divides by `3 * N_contacts`.
+
+### 2. `init_value=0.0` makes the first optimiser step a literal no-op
+
+`optax.warmup_cosine_decay_schedule(init_value=0.0, ...)` returns exactly `0.0`
+at step 0, so the first update is scaled to zero and *nothing* moves — head
+included. Combined with the §4 zero-initialised head (which makes the trunk
+gradient exactly zero until the head becomes nonzero), the real sequence is:
+
+| step | what moves |
+|---|---|
+| 1 | nothing (lr = 0) |
+| 2 | head only (trunk gradient still exactly 0) |
+| 3+ | everything |
+
+Correct behaviour, but it will read as a broken training loop if unexpected.
+
+### 3. Testing note — `lr=0` cannot validate the weight-decay mask
+
+`optax.adamw` applies decay *inside* the update and then scales the whole thing
+by the learning rate, so `lr=0` zeroes the decay term too. A mask test built on
+`lr=0, weight_decay=large` passes vacuously against **any** mask, including a
+wrong one. The valid form is two steps at the same nonzero lr with
+`weight_decay=0` vs large, asserting the trunk differs and the head is bitwise
+identical. Verified in that form: trunk max|Δ| 4.9e-2 / 9.6e-2, head bit-equal.
