@@ -45,20 +45,24 @@ magnitude is the definition of "the update has been switched off".
 """
 
 
-def gain_table(P0: np.ndarray, sigma_c: np.ndarray) -> dict[str, float]:
-    """``||K||_F`` per state block for one ``Sigma_C``.
+def gain_columns(P0: np.ndarray, sigma_c: np.ndarray,
+                 block: slice = slice(3, 6)) -> np.ndarray:
+    r"""Per-**residual-axis** gain column norms for one ``Sigma_C``.
 
-    ``H`` differences base position against the contact anchor, so the column
-    for a state block is ``P[blk, pos] - P[blk, contact]``.
+    Column ``i`` is how much a unit contact residual along axis ``i`` moves the
+    given state block, default velocity (the block L2 scores).
+
+    Per-axis and not ``||K||_F`` on purpose.  The Frobenius norm is dominated by
+    its largest column, so a network that keeps the forward axis live and
+    switches the other two off reports a healthy aggregate while two thirds of
+    the update is dead.  Run 2 did exactly that — 1.2x on x, 178x on y, 3115x on
+    z, for an aggregate of 1.6x — and the aggregate form of this check passed it.
     """
     pos, c0 = slice(6, 9), slice(9, 12)
     HPH = P0[pos, pos] + P0[c0, c0] - P0[pos, c0] - P0[c0, pos]
     S = HPH + N_ENCODER * np.eye(3) + sigma_c
-    blocks = {"rotation": slice(0, 3), "velocity": slice(3, 6),
-              "position": pos, "anchor": c0}
-    Sinv = np.linalg.inv(S)
-    return {name: float(np.linalg.norm((P0[b, pos] - P0[b, c0]) @ Sinv))
-            for name, b in blocks.items()}
+    K = (P0[block, pos] - P0[block, c0]) @ np.linalg.inv(S)
+    return np.linalg.norm(K, axis=0)
 
 
 def main() -> None:
@@ -111,28 +115,24 @@ def main() -> None:
 
     med = np.diag(np.asarray(jnp.median(sd.reshape(-1, 3), axis=0)) ** 2)
     P0 = np.load(args.p0)["P0"]
-    k_init = gain_table(P0, cfg.sigma_0 ** 2 * np.eye(3))
-    k_now = gain_table(P0, med)
-    print(f"\ncontact-update Kalman gain on the measured P0:")
-    print(f"  {'block':10s}  {'||K|| init':>12s}  {'||K|| trained':>14s}  "
-          f"{'suppression':>12s}")
-    for name in k_init:
-        f = k_init[name] / k_now[name]
-        mark = "  <- scored by L2" if name == "velocity" else ""
-        print(f"  {name:10s}  {k_init[name]:12.4e}  {k_now[name]:14.4e}  "
-              f"{f:11.1f}x{mark}")
+    g0 = gain_columns(P0, cfg.sigma_0 ** 2 * np.eye(3))
+    g1 = gain_columns(P0, med)
+    print(f"\nvelocity-row contact gain per residual axis (measured P0):")
+    print(f"  {'axis':>4}  {'init':>12}  {'trained':>12}  {'suppression':>12}")
+    for i, a in enumerate("xyz"):
+        print(f"  {a:>4}  {g0[i]:12.4e}  {g1[i]:12.4e}  {g0[i] / g1[i]:11.1f}x")
 
-    supp = k_init["velocity"] / k_now["velocity"]
+    supp = float(np.max(g0 / g1))
+    worst = "xyz"[int(np.argmax(g0 / g1))]
     print()
     if supp > 10.0:
-        print(f"DEGENERATE — velocity gain suppressed {supp:.0f}x. The network "
-              f"has switched the contact update off, as run 1 did.")
-    elif supp < 0.1:
-        print(f"velocity gain AMPLIFIED {1/supp:.1f}x — the filter is being "
-              f"pushed to trust contacts far more than at init. Check NEES.")
+        print(f"DEGENERATE — the {worst} axis is suppressed {supp:.0f}x. The "
+              f"network has switched that direction of the contact update off. "
+              f"An aggregate ||K|| would hide this whenever another axis stays "
+              f"live; judge on the WORST axis.")
     else:
-        print(f"OK — velocity gain within {max(supp, 1/supp):.1f}x of "
-              f"initialization. The update is still live.")
+        print(f"OK — every axis within {supp:.1f}x of initialization "
+              f"(worst: {worst}). The update is live in all three directions.")
 
 
 if __name__ == "__main__":
