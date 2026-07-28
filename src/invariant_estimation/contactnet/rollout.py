@@ -32,12 +32,19 @@ class Segment(NamedTuple):
         Filter state at segment start, reseeded from ground truth.
 
     v_true: Array, shape (L, 3)
-        Ground-truth base velocity, for the L2 baseline objective.
+        Ground-truth base velocity, **world frame** (`SimSensorReader.truth()["v"]`
+        already is), for the L2 baseline objective.
+
+    R_true: Array, shape (L, 3, 3)
+        Ground-truth attitude. Needed because `losses.l2_velocity` compares in
+        each side's OWN body frame -- with a single shared rotation the whole
+        conversion would cancel and be a no-op. See that docstring.
     """
     inputs: InEKFInputs
     windows: Array
     state0: InEKFState
     v_true: Array
+    R_true: Array
 
 def contact_factors(params: ContactNetParams, windows: Array, eps: float) -> Array:
     """
@@ -97,7 +104,10 @@ def make_segment_loss(ekf, kinematics, eps, beta = 0.5, objective="beta_nll", re
             per_tick = beta_nll_from_diagnostics(d.nis, d.logdet_S, beta)
             return jnp.mean(per_tick), outputs #NOTE: mean handled outside of beta-NLL, inside of L2.
         else:
-            per_tick = l2_velocity(outputs.state.v, segment.v_true)
+            # Body-frame, each side by its OWN attitude -- see `l2_velocity`.
+            per_tick = l2_velocity(
+                outputs.state.v, outputs.state.R, segment.v_true, segment.R_true
+            )
             return per_tick, outputs
     
     return segment_loss

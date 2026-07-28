@@ -2,14 +2,44 @@ import jax
 import jax.numpy as jnp
 from jax.scipy.linalg import solve_triangular
 
-def l2_velocity(v_est: jax.Array, v_true: jax.Array) -> jax.Array:
+def l2_velocity(v_est: jax.Array, R_est: jax.Array,
+                v_true: jax.Array, R_true: jax.Array) -> jax.Array:
     """
-    CoCo objective for mean squared velocity error.
+    CoCo's objective (run 1): mean squared **body-frame** velocity error.
 
-    Baseline only. NOTE: you need to feed in the BODY FRAME velocities here,
-    otherwise this loss function is incorrect according to the CoCo paper.
+    The filter state is world-centric ``SE_{N+2}(3)``, so ``v_est`` and ``v_true``
+    both arrive in WORLD frame. This rotates each into its OWN body frame before
+    comparing::
+
+        L = mean_k || R_est[k]^T v_est[k]  -  R_true[k]^T v_true[k] ||^2
+
+    Each by its own attitude, and that is the whole point. Rotating BOTH sides by
+    the same matrix would be a no-op -- rotations preserve norms, so
+    ``||R^T(a - b)|| == ||a - b||`` -- and the loss would be identical to
+    comparing in world frame. What makes the body-frame form a *different*
+    objective is that a correct velocity paired with a WRONG attitude now
+    produces loss, where the world-frame form scores it zero. Attitude error
+    therefore reaches ContactNet's gradient, which is the paper's behaviour.
+
+    Sanity check worth keeping in mind: when ``R_est == R_true`` this reduces
+    exactly to the world-frame form, since the shared rotation cancels.
+
+    Baseline only. Sigma reaches this loss solely through the Kalman gain, so
+    only *ratios* of Sigma are constrained -- absolute scale is free, and an
+    L2-trained network can pass RMSE while failing NEES. That gap is why
+    `beta_nll` exists.
+
+    Args:
+        v_est: (..., 3) filter base velocity, world frame.
+        R_est: (..., 3, 3) filter attitude.
+        v_true: (..., 3) ground-truth base velocity, world frame
+            (``SimSensorReader.truth()["v"]`` is already world frame).
+        R_true: (..., 3, 3) ground-truth attitude.
     """
-    return jnp.mean(jnp.sum((v_est - v_true) **2, axis=-1))
+    # '...ji,...j->...i' is R^T v directly -- no transpose materialised per tick.
+    b_est = jnp.einsum("...ji,...j->...i", R_est, v_est)
+    b_true = jnp.einsum("...ji,...j->...i", R_true, v_true)
+    return jnp.mean(jnp.sum((b_est - b_true) ** 2, axis=-1))
 
 def gaussian_nll(nu: jax.Array, S: jax.Array) -> tuple[jax.Array, jax.Array]:
     """
