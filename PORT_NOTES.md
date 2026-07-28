@@ -2407,3 +2407,164 @@ collecting twice. That measurement is ~20 minutes; a 40-rollout sweep is hours.
 
 Run 1 remains worth running as the §9 step 8 plumbing proof. Its number means
 "the machinery works", not "ContactNet helps".
+
+---
+
+## Run 1 learned to switch the contact update OFF (2026-07-28)
+
+**Read this before using `artifacts/contactnet_run1.npz` for anything.**
+
+Run 1 completed: 10 000 steps, `l2_velocity`, B = 32, 31 min on GPU. It is
+healthy by every process metric — `applied_frac` held **1.000** to step 9999
+(the conditioning gate flagged as the likely silent failure never fired; the
+proxy peaked at 7.7e7 against `cond_max = 1e9`), gradients finite throughout,
+loss down to ~1e-4, output SPD and finite everywhere.
+
+It is also **degenerate**. Evaluated on real cached feature windows from
+`flat_seed000`, 400 ticks x 2 contacts:
+
+| per-axis contact std | min | median | max | init `sigma_0` |
+|---|---|---|---|---|
+| x | 5.3e-4 | **6.755e-1 m** | 4.79 | 1e-4 |
+| y | 2.7e-4 | **1.718e-1 m** | 4.30e-1 | 1e-4 |
+| z | 8.7e-3 | **2.745e-1 m** | 1.53 | 1e-4 |
+
+A contact-position measurement uncertainty of **0.68 m**. For scale, the other
+term in the same innovation, `N = J Sigma_q J^T`, is 1.26e-5 m^2 (3.5e-3 m std,
+`config.py`). `Sigma_C` now exceeds it by ~4 orders of magnitude in variance and
+therefore *is* `S`.
+
+### Measured, not argued
+
+Contact-update Kalman gain on the measured `P0` (`artifacts/p0.npz`), one
+contact block, `S = H P H^T + N + Sigma_C`:
+
+| `Sigma_C` | tr(S) | ‖K‖_F |
+|---|---|---|
+| init, `sigma_0^2 I` | 3.785e-05 | 2.3424e-03 |
+| trained, median | 5.612e-01 | **8.3895e-07** |
+
+**2793x gain suppression.** The contact update is off. The argument is
+rotation-invariant in the part that matters (`rotate_measurement_covariance`
+preserves the trace), so the frame conjugation does not rescue it.
+
+The network did move off init — head.W delta 0.235, trunk.W delta 0.185, output
+anisotropy 10.7x median, off-diag/diag mass 0.30, temporal CoV 37%. It learned a
+rich, time-varying, anisotropic function. It just learned the wrong one.
+
+### Root cause: our segment seeding is a force-teacher scheme
+
+`dataset.make_segment` seeds `state0.R, v, p` from ground truth at **every**
+segment start, and a segment is `L = 128` ticks = **128 ms**. The filter
+therefore begins each training sample perfect and only has to survive 0.128 s —
+a horizon over which IMU dead-reckoning beats any contact correction. The
+globally optimal `Sigma_C` under that objective is **infinity**, and 10 000
+steps of Adam found it. `nis_over_dof` = 0.03 is the same fact seen from the
+innovation side, and it was never going to recover with more steps.
+
+CoCo-InEKF (arXiv 2605.15122) reports exactly this, Sec. III-B:
+
+> "We experimented with re-initializing the InEKF state to the ground-truth
+> state at the start of each rollout in a force-teacher fashion, but observed a
+> degradation in the filter's learning performance."
+
+They instead **carry (X, P) across consecutive buffers** up to an episode length
+T (100 s for dancing, 6 s for ground motions), letting the filter drift away
+from truth. With accumulated drift, the contact update is the only thing that
+can correct it, so `Sigma_C` acquires a finite optimum. Same `L = 128`, same L2
+body-frame-velocity loss, same 6-element lower-triangular `Sigma = L L^T`
+parameterisation as ours — the seeding is the difference.
+
+**Fix before run 2:** carry the filter carry across consecutive segments within
+a rollout rather than re-seeding from truth. This is a `dataset.py` /
+`train.py` change, not a filter change. Note the interaction with (d) in
+`dataset.py`'s docstring: batches are currently composed *across* rollouts with
+uniform random starts, which is incompatible with a carried state; segments
+within a rollout will have to advance in order, and B independent chains will
+have to be maintained in parallel.
+
+Do not treat this as a hyperparameter to tune around. Inflating `Sigma_C` is not
+a local minimum the optimiser fell into — it is the correct answer to the
+question we asked.
+
+---
+
+## CoCo-InEKF comparison — why 31 min vs their 5 days (2026-07-28)
+
+arXiv **2605.15122**, Baumgartner, Mueller, Serifi, Grandia, Knoop, Gross,
+Baecher (Disney Research / ETH). PDF at `~/Downloads/2605.15122v1.pdf`.
+
+Recorded because "our training is 200x faster" is the kind of number that reads
+as an advantage and is mostly a difference in what is being counted.
+
+### The gap decomposes exactly
+
+Their Table VII (BPTT unroll ablation) reports iterations reached inside the
+5-day cap, at **L = 128 — identical to `ContactNetConfig.L`**:
+
+| | iters in 5 days | s/iter |
+|---|---|---|
+| L = 64 | 89 600 | 4.8 |
+| **L = 128 (theirs and ours)** | **64 600** | **6.7** |
+| L = 256 | 18 800 | 23.0 |
+
+Their iteration: 6.7 s. Ours: 0.196 s. **34x.** Their iteration count: 64 600 to
+our 10 000, **6.5x**. Product **220x**; 5 days / 31 min = 225x. No residual.
+
+The 34x is two things: physics regenerated *every iteration* ("Per learning
+iteration, we collect a training dataset ... by forward-simulating a pretrained
+policy in E environments"), and **E = 1280 parallel envs vs our B = 32** — a 40x
+batch. They use a **pretrained policy and do not train it**, same as us; the 5
+days contains no RL.
+
+Segments seen: theirs 64 600 x 1280 = **82.7M**, freshly simulated. Ours
+10 000 x 32 = **320k**, drawn from ~1 100 independent contact events. 258x on
+count, and the independence gap is larger than the count gap.
+
+### Architecture is near-identical — we under-fed, not under-built
+
+| | CoCo-InEKF | ours |
+|---|---|---|
+| params | 240 344 | 374 790 |
+| BPTT unroll L | 128 | 128 |
+| history H | 20 | 50 |
+| loss | L2, body velocity in body frame | `l2_velocity` — same |
+| output | 6 lower-tri elements, `Sigma = L L^T`, body frame | same |
+| inputs | `omega, a, q, qd, tau, p_B->Ci, v_B->Ci` | our 24 channels, same families |
+| filter state as NN input | **excluded, deliberately** | excluded (CLAUDE.md §7) |
+| MLP not CNN | yes, for onboard real-time | yes |
+
+Convergent design, arrived at independently. Their H = 150 variant reached 1.74M
+params and got *worse* (RMSE 0.052 vs 0.046), which retires the §8 parameter-
+budget worry as a first-order concern.
+
+### The four gaps, ranked
+
+1. **Fresh physics per iteration vs 300x replay of 552 s.** Structural.
+2. **Friction and disturbance-force randomization.** They randomize both; their
+   *test* set adds periodic disturbances specifically "to induce slippage". We
+   randomize terrain only. Already flagged above under dataset narrowness — the
+   paper confirms it is the right thing to have flagged.
+3. **Force-teacher seeding** — see the run-1 entry above. This one is a defect,
+   not a scale gap.
+4. **Difficulty.** Their headroom on dancing is 15x (heuristic-contact InEKF
+   2.675 velocity RMSE vs 0.176 with GT contacts). On a straight-line
+   `vx = 0.4` walk the heuristic baseline is likely already near the GT-contact
+   bound, so **our dataset may contain almost no headroom for ContactNet to
+   capture**. Also `N = 2` contact points against their 4/10/18, where accuracy
+   improved monotonically (0.134 -> 0.099 -> 0.069).
+
+We are **not** compute-bound and they are: their L = 256 lost to L = 128 only
+because it cost 3.4x the iterations. Our 34x-cheaper iteration is a real asset
+and should be spent on more and harder data, not more steps over the same data.
+
+### Bearing on the beta-NLL decision
+
+Their consistency result comes from **pure L2, no NLL term**. Heuristic and
+learned-binary-contact baselines sat inside the 95% chi^2 band 18-20% of the
+time (37.7% for GT contacts) and were *underconfident*; CoCo-InEKF improved on
+that. Caveat: their NEES is on the core state (dof 9, band [2.7, 19]) and our
+`nis_over_dof` is contact-*innovation* NIS at dof 6 — different quantities, do
+not map one onto the other. But it weakens the premise that L2 must leave the
+filter miscalibrated, and combined with the run-1 root cause above it suggests
+**fixing the seeding before reaching for beta-NLL**.
