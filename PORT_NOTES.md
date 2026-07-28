@@ -2647,3 +2647,93 @@ from `ContactTrust` (the Schmitt-trigger port of
 `FootSwitchContactProbabilityProvider`), off normal force `f_n/(0.5 m g)`. It is
 a sensor-derived contact estimate, the same one the deployed filter uses — not
 the sim's binary contact truth.
+
+---
+
+## The run-2 fix: chained segments + unfrozen process socket (2026-07-28)
+
+Both causes from the two entries above, addressed. Commits `09c2d39`, `f778e60`.
+
+### 1. `contact_chol` passes through (primary, 10.2x)
+
+`ContactNetConfig.freeze_contact_chol` defaults to `False`; `make_segment` no
+longer overwrites the field. `True` reproduces run 1.
+
+The leak argument that motivated the freeze does not hold — the network's input
+is the 24 feature channels and `contact_chol` reaches only the *filter's process
+model*, so the value changes the filter ContactNet is differentiated through,
+not the information it receives. `sim/sensors.py` drives it from `ContactTrust`
+(Schmitt trigger off `f_n/(0.5 m g)`), a sensor-derived estimate, so the deployed
+filter and the trained one now see the same signal.
+
+### 2. `dataset.ChainedBatcher` (secondary, weak-signal)
+
+`B` chains walk the rollouts in order, carrying `(X̂, P)` **and the gravity
+reference** between steps. Lifecycle: seed from truth → warm in `warm_in_s`
+untrained → walk `L` ticks per step → re-seed on episode end, rollout end, or a
+non-finite carry.
+
+* **`warm_in_s = 2.0`**, from the `T*` table: with the process socket correct the
+  contact update is 0.92x of dead reckoning at 128 ms, 0.72x at 2 s, 0.16x at
+  4 s. Two seconds is where it is clearly earning without spending the episode
+  warming up.
+* **`episode_s = 20.0`** bounds drift. CoCo-InEKF uses 100 s / 6 s for the same
+  purpose.
+* **The carry is `stop_gradient`'d.** Truncated BPTT is the only reason `L`
+  bounds anything. Note this is a *different* edge from CLAUDE.md §7's "no
+  `stop_gradient` between provider output and either filter" — that forbids
+  detaching `Σ_C`, not detaching the carry across a truncation boundary.
+* **Carrying the gravity reference retires open item 6** from the 2026-07-27
+  report (`make_segment_loss` cold-started it every segment, τ = 5 s against
+  0.128 s).
+
+**Phase stagger — found live, worth recording.** The first run-2 launch seeded
+every chain at `ticks = warm_in_ticks`, so all `B` reached `episode_ticks` on the
+same step: they re-seeded in a synchronised wave and then marched in lockstep,
+leaving the batch permanently at one common time-since-seed. Any phase-dependent
+effect is then perfectly correlated across the batch, costing most of the `B`
+independent samples the batch is sized by. Visible as the reseed counter jumping
+12 → 37 between steps 100 and 150. Initial phase is now uniform over
+`[warm_in_ticks, episode_ticks)`; the counter climbs at a steady ~0.29/step.
+
+**Known cost, not fixed:** `_seed` calls `make_segment` purely to obtain
+`state0`, which gathers a full window tensor and discards it, and each re-seed
+runs a 2000-tick warm-in scan. Run 2 costs **0.53 s/step against run 1's
+0.196** — ~2.7x. Worth reclaiming before a larger dataset makes it matter.
+
+### The gate: `experiments/alpha_sweep.py`
+
+Sweep a global scale `alpha` on `Sigma_C`, evaluate the real training loss, and
+require an interior `argmin`. This is theory-doc §7.2.1 Claim 1 pointed at the
+objective actually in use rather than at the β-NLL quadratic term, and it is the
+check that would have caught run 1 in thirty seconds.
+
+| config | argmin | verdict |
+|---|---|---|
+| run 1 (frozen chol, truth-seeded) | `alpha = 1e4` (largest) | **FAIL** — monotone; loss 4.44e-2 → 3.25e-4, a 136x improvement bought purely by disabling contacts |
+| run 2 (chained, pass-through) | `alpha = 1e2`, i.e. `Sigma_C` ≈ 1 cm | **PASS** — interior, and the loss *rises* beyond it |
+
+### `experiments/check_sigma.py`
+
+Reports what a checkpoint does to the contact-update Kalman gain on the measured
+`P0`. Loss curves cannot see the run-1 failure; this can. On a 60-step chained
+smoke train:
+
+| | run 1 (10k steps) | run-2 smoke (60 steps) |
+|---|---|---|
+| velocity-gain suppression | **3835x** | **1.2x** |
+| `Sigma_C` median std x/y/z [m] | 0.68 / 0.17 / 0.27 | 1.1e-4 / 3.3e-3 / 1.4e-2 |
+| conditioning proxy | 7.7e7 | 8.2e5 |
+
+The learned anisotropy is physically readable: tightest along x, loosest in z at
+~1.4 cm, which is where sole compliance and ground penetration live — and it
+agrees with the alpha sweep's independent interior optimum of ~1 cm.
+
+### Tests
+
+29 in `tests/contactnet` (full suite **715 passed**). The 8 `ChainedBatcher`
+tests were mutation-checked against 8 mutants, **8/8 caught**. One initially
+survived: `test_cursor_starts_after_the_warm_in` derived the seed index *from*
+the cursor it was meant to verify — a circular assertion, the exact failure mode
+that file's docstring warns about. It now locates the warm-in slice's last
+`omega` row back in the source rollout instead.
