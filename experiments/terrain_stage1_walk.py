@@ -3,104 +3,115 @@
 Plain MuJoCo, no MJX: swap `run_policy`'s floor plane for a heightfield rasterised from the
 IsaacLab sub-terrain parameters (TERRAIN.md §1) and walk the baseline policy across each one.
 
-This is the cheapest gate in the plan and it PASSES — all four terrains, 0.38 m/s against a
-commanded 0.4, upright for 20 s. Also doubles as the reference rasteriser for §4: `waves`,
-`stepping_stones` and `hard_stepping_stones` here are the functions to lift into the MJX path.
+This is the cheapest gate in the plan and it PASSES — all four terrains, ~0.38 m/s against a
+commanded 0.4, upright for 20 s.
+
+The rasterisers and the floor spec now live in `invariant_estimation.sim.terrain`; this script is
+just the driver. Nothing here rebuilds the sim model — `terrain.build_terrain_model` calls
+`run_policy.build_sim_model(floor=...)`, so the collision set, contact parameters and actuators
+have exactly one definition.
 
     uv run python experiments/terrain_stage1_walk.py
+    uv run python experiments/terrain_stage1_walk.py --secs 30 --terrain waves
 """
-import sys, xml.etree.ElementTree as ET
-import numpy as np, mujoco
-sys.path.insert(0,'/home/llibshutz/alex/invariant-estimation')
-import run_policy as rp
-from invariant_estimation.pipeline import main_estimator as me
+import argparse
+import sys
+from pathlib import Path
 
-HSCALE = 0.1               # IsaacLab horizontal_scale, m/px
-EXTENT = 16.0              # m of terrain (bigger than the 8 m tile so we can walk a while)
-N = int(EXTENT / HSCALE)
-EZ = 0.15                  # hfield elevation scale; every terrain is a fraction of this
+import mujoco
+import numpy as np
 
-def flat():
-    return np.zeros((N, N), np.float32)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # `run_policy` lives at the repo root
+import run_policy as rp                                        # noqa: E402
+from invariant_estimation.sim import terrain as tr             # noqa: E402
 
-def waves(amplitude=0.10, num_waves=2.0):
-    x = np.linspace(0, 1, N)
-    return (amplitude * 0.5 * (1 + np.sin(2*np.pi*num_waves*x))[None, :] * np.ones((N,1))).astype(np.float32)
+CONTROL_DT = rp.DT * rp.DECIMATION      # 0.02 s; travel is compared per SECOND, never per tick
+SETTLE_TICKS = 100                      # 2 s of standing before the walk command
 
-def stepping_stones(grid=0.45, hi=0.03, seed=0, platform=0.0):
-    blk = max(1, int(round(grid / HSCALE)))
-    nb = int(np.ceil(N / blk))
-    r = np.random.default_rng(seed)
-    z = np.kron(r.uniform(0.0, hi, (nb, nb)), np.ones((blk, blk)))[:N, :N]
-    if platform > 0:                       # flat spawn pad at the centre
-        p = int(platform / HSCALE); c = N // 2
-        z[c-p:c+p, c-p:c+p] = 0.0
-    else:
-        c, p = N // 2, 8
-        z[c-p:c+p, c-p:c+p] = 0.0          # always give it somewhere flat to start
-    return z.astype(np.float32)
 
-def build(field):
-    urdf = rp.cycloid_forearm_urdf(rp.URDF)
-    root = ET.fromstring(me.alex_spec_from_urdf(urdf).mjcf)
-    opt = ET.SubElement(root, 'option')
-    for k,v in dict(timestep=str(rp.DT), gravity='0 0 -9.81', integrator='implicitfast',
-                    solver='Newton', iterations='25', noslip_iterations='5',
-                    impratio='1', cone='pyramidal').items():
-        opt.set(k, v)
-    asset = ET.SubElement(root, 'asset')
-    hf = ET.SubElement(asset, 'hfield')
-    hf.set('name','terrain'); hf.set('nrow',str(N)); hf.set('ncol',str(N))
-    hf.set('size',f'{EXTENT/2} {EXTENT/2} {EZ} 0.1')
-    g = ET.SubElement(root.find('worldbody'), 'geom')
-    g.set('name','floor'); g.set('type','hfield'); g.set('hfield','terrain')
-    g.set('contype', rp.TERRAIN_GROUP['contype']); g.set('conaffinity', rp.TERRAIN_GROUP['conaffinity'])
-    for k, v in rp.CONTACT.items():
-        g.set(k, v)
-    bodies={b.get('name'):b for b in root.iter('body')}
-    for body,typ,size,pos,quat in rp.SCS2_COLLISION_GEOMS:
-        e=ET.SubElement(bodies[body],'geom'); e.set('name',f'{body}_collision_0')
-        e.set('type',typ); e.set('size',size); e.set('pos',pos); e.set('quat',quat)
-        e.set('contype',rp.ROBOT_GROUP['contype']); e.set('conaffinity',rp.ROBOT_GROUP['conaffinity'])
-        for k, v in rp.CONTACT.items():
-            e.set(k, v)
-    act=ET.SubElement(root,'actuator')
-    for j in root.iter('joint'):
-        n=j.get('name')
-        if n in rp._FALLBACK:
-            fb=rp._FALLBACK[n]
-            j.set('damping', repr(POL['kd'].get(n,float(fb['kd']))))
-            a=ET.SubElement(act,'position'); a.set('name',n); a.set('joint',n)
-            a.set('kp',repr(POL['kp'].get(n,float(fb['kp']))))
-            tau=POL['tau'].get(n,float(fb['maxEffort']))
-            a.set('forcelimited','true'); a.set('forcerange',f'{-tau} {tau}')
-    m = mujoco.MjModel.from_xml_string(ET.tostring(root,encoding='unicode'))
-    m.hfield_data[:] = (field / EZ).clip(0,1).ravel()          # hfield_data is normalised
-    return m
+def run(label, field, policy, vx=0.4, secs=20.0):
+    """Settle, then walk +x for `secs`. Returns the measurements the gate is judged on."""
+    floor = tr.HeightfieldFloor(field)
+    m = rp.build_sim_model(policy, with_visuals=False, floor=floor)
 
-POL = rp.load_policy('baseline')
+    # The compiled model must actually carry this terrain. A flat hfield behind a "terrain" label
+    # is the failure mode TERRAIN.md §7's last bullet warns about, and it passes every other check.
+    got = m.hfield_data.reshape(field.shape) * tr.EZ
+    assert np.allclose(got, field, atol=1e-6), "hfield_data does not match the rasterised field"
 
-def run(label, field, vx=0.4, secs=20.0):
-    m = build(field); maps = rp.make_maps(m, POL)
-    loop = rp.Loop(m, POL, maps)
-    loop.d.qpos[2] += float(field.max()) + 0.02                # start clear of the terrain
+    loop = rp.Loop(m, policy, rp.make_maps(m, policy))
+    loop.d.qpos[2] += tr.spawn_lift(field)          # start clear of the terrain
     mujoco.mj_forward(m, loop.d)
-    loop.set_height_target(loop.height_target)                 # re-seed the ramp from the new pose
-    for _ in range(100):
-        loop.control_tick()                                    # settle standing
-    x0 = loop.d.qpos[0]; tilts=[]; zs=[]
-    for k in range(int(secs/0.02)):
-        loop.cmd[0:3]=(vx,0.0,0.0); loop.cmd[3]=0.0
-        loop.control_tick(); tilts.append(loop.tilt_deg()); zs.append(loop.d.qpos[2])
-    t=np.array(tilts); dx=loop.d.qpos[0]-x0
-    fell=(t>45).any()
-    print(f"  {label:34s} relief={field.max()*100:5.1f}cm  travelled={dx:+6.2f}m "
-          f"({dx/secs:+.2f} m/s)  tilt_max={t.max():5.1f}  "
-          + ("FELL" if fell else f"UPRIGHT {secs:.0f}s"))
+    loop.set_height_target(loop.height_target)      # re-seed the height ramp from the new pose
+    for _ in range(SETTLE_TICKS):
+        loop.control_tick()
 
-print(f"hfield {N}x{N} px over {EXTENT} m at {HSCALE} m/px, elevation scale {EZ} m\n")
-print("IsaacLab's four sub-terrains, walking baseline at vx=0.4 for 20 s:")
-run("flat (control)",                flat())
-run("waves  a=0.10 n=2",            waves(0.10, 2.0))
-run("stepping_stones 0.45m/0.03m",   stepping_stones(0.45, 0.03, seed=1))
-run("hard_stepping   0.75m/0.07m",   stepping_stones(0.75, 0.07, seed=2, platform=0.5))
+    rest_z = float(loop.d.qpos[2])
+    x0 = loop.d.qpos[0]
+    feet = [mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, b) for b in ("LEFT_FOOT", "RIGHT_FOOT")]
+    tilts, soles, under = [], [], []
+    for _ in range(int(secs / CONTROL_DT)):
+        loop.cmd[0:3] = (vx, 0.0, 0.0)
+        loop.cmd[3] = 0.0
+        loop.control_tick()
+        tilts.append(loop.tilt_deg())
+        # The sole plane of the LOWER foot: the height of the ground the robot is actually on.
+        soles.append(min(loop.d.xpos[b][2] - rp.ANKLE_HEIGHT for b in feet))
+        under.append(float(tr.sample(field, loop.d.qpos[0], loop.d.qpos[1])))
+    t, sole, ter = np.array(tilts), np.array(soles), np.array(under)
+    dx = float(loop.d.qpos[0] - x0)
+    fell = bool((t > 45).any()) or not np.all(np.isfinite(loop.d.qpos))
+    print(f"  {label:34s} relief={floor.relief * 100:5.1f}cm  travelled={dx:+6.2f}m "
+          f"({dx / secs:+.2f} m/s)  tilt_max={t.max():5.1f}  "
+          f"sole_z={sole.mean() * 100:+5.1f}+-{sole.std() * 100:4.1f}cm  "
+          f"terrain_under={ter.mean() * 100:5.1f}cm  "
+          + ("FELL" if fell else f"UPRIGHT {secs:.0f}s"))
+    return dict(label=label, relief=floor.relief, dx=dx, speed=dx / secs,
+                tilt_max=float(t.max()), rest_z=rest_z, fell=fell,
+                sole_mean=float(sole.mean()), sole_std=float(sole.std()),
+                terrain_mean=float(ter.mean()))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--policy", default="baseline")
+    ap.add_argument("--vx", type=float, default=0.4)
+    ap.add_argument("--secs", type=float, default=20.0)
+    ap.add_argument("--terrain", action="append", choices=list(tr.TERRAINS),
+                    help="run only these (default: all four)")
+    args = ap.parse_args()
+
+    policy = rp.load_policy(args.policy)
+    names = args.terrain or list(tr.TERRAINS)
+    fields = {n: tr.TERRAINS[n]() for n in names}
+
+    print(f"hfield {tr.N}x{tr.N} px over {tr.EXTENT} m at {tr.HSCALE} m/px, "
+          f"elevation scale {tr.EZ} m, {tr.N * tr.N * 4 / 1e6:.1f} MB of hfield_data")
+    print(f"physics dt={rp.DT} decimation={rp.DECIMATION} -> control {1 / CONTROL_DT:.0f} Hz\n")
+    print(f"IsaacLab's sub-terrains, walking {args.policy} at vx={args.vx} for {args.secs:.0f} s:")
+    out = {n: run(n, fields[n], policy, vx=args.vx, secs=args.secs) for n in names}
+
+    # A run that "completed" over silently flat ground proves nothing (TERRAIN.md §7, last bullet),
+    # and neither does the RESTING pose: `hard_stepping` deliberately spawns on a flat 1 m platform,
+    # so its resting height matches flat by design. The load-bearing statement is that the sole
+    # plane RISES ONTO the terrain over the 7.6 m walk, and tracks the field we rasterised.
+    print("\n  terrain-is-real check (mean over the walk, cm):")
+    for n, r in out.items():
+        gap = (r["sole_mean"] - r["terrain_mean"]) * 100
+        print(f"    {n:18s} sole {r['sole_mean'] * 100:+5.1f}   terrain under pelvis "
+              f"{r['terrain_mean'] * 100:5.1f}   sole-terrain {gap:+5.1f}")
+        # The sole rides on the sampled terrain to within the size of one foot box (0.26 x 0.14 m),
+        # which can bridge a stone edge or a wave crest -- hence cm-scale, not mm-scale, agreement.
+        assert abs(gap) < 2.5, f"{n}: sole plane is {gap:.1f} cm off its own terrain"
+    for n in ("waves", "hard_stepping"):
+        if n in out and "flat" in out:
+            lift = out[n]["sole_mean"] - out["flat"]["sole_mean"]
+            assert lift > 0.01, (f"{n}: sole averaged only {lift * 100:.1f} cm above flat -- the "
+                                 "robot is walking on flat ground, whatever the label says")
+
+    if any(r["fell"] for r in out.values()):
+        raise SystemExit("FAILED: fell on " + ", ".join(r["label"] for r in out.values() if r["fell"]))
+
+
+if __name__ == "__main__":
+    main()

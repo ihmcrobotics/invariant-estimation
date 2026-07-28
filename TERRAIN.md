@@ -131,28 +131,51 @@ Gate: `jax.devices()` shows a GPU.
 
 ### Stage 1 — one heightfield under the existing (non-MJX) sim  ✅ DONE, PASSED
 
-`uv run python experiments/terrain_stage1_walk.py`. Swaps `run_policy`'s floor plane for a 160×160
+`uv run python experiments/terrain_stage1_walk.py`. Swaps `run_policy`'s floor plane for a 640×640
 heightfield rasterised from §1's parameters, keeps `SCS2_COLLISION_GEOMS` and everything else
-untouched, and walks `--policy baseline` at `vx = 0.4` for 20 s across each sub-terrain:
+untouched, and walks `--policy baseline` at `vx = 0.4` for 20 s across each sub-terrain.
+
+Measured at 1 kHz physics / 50 Hz control (`run_policy.DT = 0.001`, `DECIMATION = 20`):
 
 ```
-  terrain                        relief   travelled          tilt_max   result
-  flat (control)                  0.0cm   +7.59 m (0.38 m/s)     2.4    upright 20 s
-  waves  a=0.10 n=2              10.0cm   +7.64 m (0.38 m/s)     2.3    upright 20 s
-  stepping_stones 0.45m/0.03m     3.0cm   +7.67 m (0.38 m/s)     3.1    upright 20 s
-  hard_stepping   0.75m/0.07m     7.0cm   +7.50 m (0.38 m/s)     3.6    upright 20 s
+  terrain                        relief   travelled          tilt_max   sole_z         result
+  flat (control)                  0.0cm   +7.66 m (0.38 m/s)     2.3    +0.5±0.1 cm    upright 20 s
+  waves  a=0.10 n=2              10.0cm   +7.70 m (0.39 m/s)     2.4    +5.5±3.5 cm    upright 20 s
+  stepping_stones 0.45m/0.03m     3.0cm   +7.69 m (0.38 m/s)     3.1    +1.8±0.9 cm    upright 20 s
+  hard_stepping   0.75m/0.07m     7.0cm   +7.66 m (0.38 m/s)     3.9    +3.5±1.9 cm    upright 20 s
 ```
+
+Unchanged from the original 200 Hz measurement to within ±0.16 m of travel and ±0.3° of tilt.
+Compare travel per SECOND, never per control tick — see the comment above `run_policy.DT`.
+
+`sole_z` is the load-bearing column: it is the mean height of the LOWER foot's sole plane over the
+walk, and it tracks the terrain sampled under the robot to within 0.9 cm on every sub-terrain. A
+"the run completed" check passes just as happily over silently flat ground (§7, last bullet), and
+so does resting height — `hard_stepping` spawns on a flat 1 m platform by design, so its resting
+pose matches flat's exactly. The script asserts both the sole-tracks-terrain agreement and that the
+waves / hard_stepping soles average >1 cm above flat's.
 
 So the policy already handles the terrain it was trained on, in our sim, with no retraining and no
 MJX. That is the single most encouraging datapoint in this document: whatever else follows is an
 engineering/throughput question, not a "can the robot do it" question.
 
-That script's `waves` / `stepping_stones` functions are the reference rasterisers for §4 — lift them
-into the MJX path rather than rewriting.
+The rasterisers and the floor spec now live in **`src/invariant_estimation/sim/terrain.py`** — the
+`TERRAINS` registry (`flat`, `waves`, `stepping_stones`, `hard_stepping`) is what §4 and Stage 4
+should iterate. The experiment is only a driver: `terrain.HeightfieldFloor` is passed to
+`run_policy.build_sim_model(floor=...)`, so the collision set, contact parameters, solver options
+and actuators have exactly ONE definition and a terrain model differs from a flat one in the floor
+and nothing else (`tests/sim/test_terrain.py` asserts that geom-by-geom).
 
-Two things the plane→hfield swap changes, worth carrying forward: an hfield is **finite** (the robot
-can walk off the edge — size it for your episode length; 16 m here) and it needs a nonzero base
-thickness so it is solid rather than a shell.
+Three things the plane→hfield swap changes, worth carrying forward:
+
+- An hfield is **finite**. `EXTENT = 64 m` (was 16 m): at 0.38 m/s a centre spawn gets ~84 s before
+  the edge, where 16 m gave ~21 s — not enough once a warm-up prefix is discarded. `hfield_data` is
+  1.6 MB at 0.1 m/px; no contact-budget or spawn effect was observed.
+- It needs a nonzero **base thickness** (`size`'s 4th component) or it is a shell, not solid.
+- `waves`'s `num_waves` is a count **per 8 m tile**, not per field, so the wavelength stays 4 m at
+  any `EXTENT`. The prototype spread it over its whole 16 m field (8 m wavelength); keeping that
+  formula at 64 m would have stretched it to 32 m — a gentle ramp relabelled as waves. Both give
+  the same result here (8 m: +7.66 m, tilt 2.3; 4 m: +7.70 m, tilt 2.4).
 
 ### Stage 2 — port the sim to MJX, verify parity on flat ground
 

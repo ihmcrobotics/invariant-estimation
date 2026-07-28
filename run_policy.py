@@ -268,7 +268,26 @@ def _add_visual_meshes(root, urdf_path):
              contype="0", conaffinity="0", group="1", material="robot")
 
 
-def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
+class PlaneFloor:
+    """The default floor: MuJoCo's infinite plane at z = 0.
+
+    A floor is an OBJECT rather than a couple of attributes because the interesting alternative --
+    a heightfield (`invariant_estimation.sim.terrain.HeightfieldFloor`) -- needs to touch the model
+    at two separate moments: declare an `<asset><hfield>` before compilation, and write
+    `hfield_data` after it. Anything that can satisfy `geom_attrs` + `finalize` is a floor, so
+    terrain lives outside this file while the rest of the assembly below stays single-sourced.
+    """
+
+    def geom_attrs(self, root, with_visuals):
+        """Attributes for the `floor` geom. May append to `root` (e.g. an `<asset>` entry)."""
+        return dict(type="plane", size="20 20 0.1",
+                    **({"material": "groundplane"} if with_visuals else {}))
+
+    def finalize(self, model):
+        """Hook for post-compilation model data (an hfield's normalised elevation samples)."""
+
+
+def build_sim_model(policy, with_visuals=True, with_imu_sensors=False, floor=None):
     """Free-base Alex: estimator MJCF + floor + SCS2's collision set + per-joint position servos.
 
     kd is applied as MuJoCo joint damping, which with a kp-only `position` actuator reproduces
@@ -277,7 +296,12 @@ def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
     `with_imu_sensors` adds a gyro + accelerometer on each of the estimator's 8 IMU sites, for
     `run_estimator.py`. Sensors are massless and stateless, so the dynamics are bit-identical
     either way (`tests/sim/test_sensors.py::test_sensors_do_not_change_the_dynamics`).
+
+    `floor` swaps out what the robot stands on and NOTHING else -- default `PlaneFloor()`, or a
+    `terrain.HeightfieldFloor` for TERRAIN.md's uneven ground. This is the one seam terrain work is
+    allowed to use; duplicating the assembly below is how the two copies drift apart.
     """
+    floor = floor or PlaneFloor()
     urdf = cycloid_forearm_urdf(URDF)
     root = ET.fromstring(me.alex_spec_from_urdf(urdf).mjcf)
 
@@ -288,8 +312,7 @@ def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
     # compile the same dynamics with neither.
     if with_visuals:
         _add_scene_look(root)
-    _geom(root.find("worldbody"), "floor", TERRAIN_GROUP, type="plane", size="20 20 0.1",
-          **({"material": "groundplane"} if with_visuals else {}))
+    _geom(root.find("worldbody"), "floor", TERRAIN_GROUP, **floor.geom_attrs(root, with_visuals))
     bodies = {b.get("name"): b for b in root.iter("body")}
     for body, typ, size, pos, quat in SCS2_COLLISION_GEOMS:
         _geom(bodies[body], f"{body}_collision_0", ROBOT_GROUP,
@@ -313,7 +336,9 @@ def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
     if with_imu_sensors:
         from invariant_estimation.sim.sensors import add_imu_sensors
         add_imu_sensors(root, me.ALEX_IMU_SITES)
-    return mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+    m = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+    floor.finalize(m)
+    return m
 
 
 # ---------------------------------------------------------------------------
@@ -687,9 +712,9 @@ class Loop:
 # ---------------------------------------------------------------------------
 # Entry points
 # ---------------------------------------------------------------------------
-def make_loop(policy_name, with_visuals):
+def make_loop(policy_name, with_visuals, floor=None):
     policy = load_policy(policy_name)
-    m = build_sim_model(policy, with_visuals=with_visuals)
+    m = build_sim_model(policy, with_visuals=with_visuals, floor=floor)
     return Loop(m, policy, make_maps(m, policy))
 
 
