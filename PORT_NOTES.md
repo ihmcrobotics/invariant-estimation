@@ -1669,3 +1669,116 @@ by the learning rate, so `lr=0` zeroes the decay term too. A mask test built on
 wrong one. The valid form is two steps at the same nonzero lr with
 `weight_decay=0` vs large, asserting the trunk differs and the head is bitwise
 identical. Verified in that form: trunk max|Δ| 4.9e-2 / 9.6e-2, head bit-equal.
+
+---
+
+## ContactNet feature channels + the torque seam (2026-07-27)
+
+### Feature vector (CoCo's, per contact `i`)
+
+    o_i := (ᴮω, ᴮa, q, τ, ᴮp_{B→C_i}, ᴮv_{B→C_i})
+
+Everything body-frame, so no filter state is required — which is forced, not
+chosen: expressing any of it in world needs `R̂`, and §1 forbids that.
+
+| term | source | note |
+|---|---|---|
+| `ᴮω` | `FusedSensors.gyros[base_imu]` | **raw**, never bias-corrected — the correction is the joint KF's `b̂_ω` (I1), i.e. a filter output |
+| `ᴮa` | `FusedSensors.accel_base` | raw |
+| `q` | `encoders` + `q_unfiltered` | the base→foot chain spans both arrays |
+| `τ` | `FusedSensors.torques` | new field, see below |
+| `ᴮp_{B→C_i}` | `ContactFrames.y` | already computed every tick |
+| `ᴮv_{B→C_i}` | finite difference of `ᴮp` | **not** `J q̇` — see below |
+
+`ᴮp` is the highest-value channel and the only nonlinear one: `FK(q)` cannot be
+recovered from `q` history by the first dense layer at any `H`, so it is real
+information gain rather than reconditioning. `kinematics(q_encoders, zeros).y`
+yields it from raw encoders — `y` does not depend on `q̇`, only `J_dot` does — so
+the whole channel is joint-KF-free.
+
+`ᴮv = J_{C_i}(q) q̇` would reintroduce the joint-KF dependency the feature set
+was chosen to avoid, and is redundant anyway: given `H` ticks of `ᴮp`, a
+difference is a linear function of inputs already present. Computed instead as
+`(ᴮp[k] − ᴮp[k−1])/dt` — same first-order content, sensor-only, and it fixes the
+conditioning problem (`ᴮp` carries a ~0.9 m DC leg-length offset, against which
+the velocity signal is a small residual after frozen standardization).
+
+Do **not** feed `FusedSensors.contact`: it comes from `trust.update(foot_loads(d))`,
+the same foot-load oracle deliberately frozen out of `contact_chol` for training.
+
+### Count — this resolves `F`
+
+    per subchain joint (J_sub = 6):  q, τ        -> 12
+    per contact:                     ᴮp, ᴮv      ->  6
+    shared per tick:                 ᴮω, ᴮa      ->  6
+                                             F   = 24
+
+`D_in = H·F = 20 × 24 = 480`; ~190K params at `480→256→256→6`, inside §8's ~240K
+budget. `B` is now the only §0 number still open.
+
+Base→foot chain is `HIP_X, HIP_Z, HIP_Y, KNEE_Y, ANKLE_Y, ANKLE_X`. Only the
+first four are filter states — the ankles are the unfiltered off-path joints.
+Rather than carry two index spaces, `build_subchain_indices` resolves names into
+the single `concat(filtered, unfiltered)` space that `FusedSensors.torques`
+already uses, so `q` and `τ` share one convention.
+
+**Hard dependency: ContactNet requires `contact_fk_unfiltered=True`.**
+`SimSensorReader` only populates `q_unfiltered` under that flag; without it the
+ankle angles never reach `FusedSensors` and two of the six subchain joints have
+no `q` channel. (The flag is wanted anyway — the 2026-07-2x contact-FK entry
+records that pinning the ankles at `qpos0` roughly doubled attitude error.)
+`contact_channels` raises with that instruction rather than failing on a width
+mismatch, which is how it first surfaced.
+
+Verified end to end on the real Alex model, 80 policy-driven ticks: windows
+`(80, 2, 20, 24)`, all finite, float64; `p_bc` mirror-symmetric at
+`y = ±0.121 m`, `z = −0.917 m`; `base_accel_z ≈ 9.86` at rest; `q_knee_y ≈ 0.84`
+rad against `tau_knee_y ≈ −50.5 ± 8.2 N·m`. Straight into the network at init,
+`Σ_C − σ₀²I` is `1.3e-23`.
+
+### `FusedSensors.torques` — new field
+
+Torque existed only in `replay/logsource.py` (which parses `q|qd|tau` from
+hardware logs); nothing in the sim path read it. Added:
+
+* `FusedSensors.torques: (n + n_u,)`, optional, defaulting to `()` — the same
+  "field absent" encoding `q_unfiltered` uses, so every existing construction
+  site keeps working. **The estimator never reads it**; it exists purely as a
+  ContactNet channel.
+* `SimSensorReader` gains `enc_dofadr` and reads
+  `d.qfrc_actuator[concat(enc_dofadr, unf_dofadr)]`. `qfrc_actuator` is the
+  actuator contribution in *generalised* coordinates, so it indexes by DOF and
+  lines up with the encoder ordering; `actuator_force` would be per-actuator and
+  need the transmission map.
+* Order is `concat(filtered, unfiltered)` — the same concatenation
+  `fused_inputs` already uses to widen `q̂` for the contact FK.
+
+Verified: 13 entries (9 filtered + 4 ankles); standing values are physical
+(both knees −50.9 N·m, ankles ≈ +29.5, `SPINE_Z` ≈ 0.03, near mirror-symmetric).
+Ordering is locked by `test_torques_are_gathered_in_concat_filtered_unfiltered_order`,
+which drives one actuator at a time and checks against MuJoCo's own
+`actuator_trnid`; swapping the concat order fails it with
+`driving LEFT_HIP_X (index 0) landed on index 4 (RIGHT_HIP_X)`.
+
+### Torque noise — AWGN placeholder, deliberately not grounded
+
+`IMUNoise` gains `torque_std = 0.5 N·m` and `corrupt_torques` (plain additive
+white Gaussian, no bias term unlike the gyro). Chosen for one reason: leaving
+`torques` uncorrupted while gyro, accel, encoders and velocities are all noised
+would teach ContactNet that torque is the one trustworthy channel — a lie that
+does not survive hardware.
+
+Scale sanity: 0.5 N·m is ~1% of Alex's measured standing knee torque (−50.9),
+against 0.02–0.5% relative noise on the other channels. Same order, slightly
+noisier, which is the right direction *if* Alex's torque is current-derived.
+
+Verified: empirical std 0.5033 over 400 seeds (target 0.5), zero-mean,
+reproducible per seed, and `noise=None` leaves the channel bit-identical to
+`qfrc_actuator`.
+
+**Still open, and it matters before any absolute calibration claim:** whether
+the logged `tau` is *measured* (a sensor — this model is then the right shape,
+only the number needs fitting) or *commanded* (a controller output, which
+carries no sensor noise at all and would want a different treatment entirely).
+The Java/SCS2 side was not consulted; this is a deliberate placeholder chosen
+for speed, to be revisited if run 1 shows torque-driven pathologies.

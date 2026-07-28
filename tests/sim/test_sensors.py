@@ -182,6 +182,35 @@ def test_sensor_shapes_match_what_the_filter_declares(rest_data, reader, fused):
     assert s.accel_base.shape == (3,)
     assert s.contact.shape == (fused.n_contacts,)
     assert s.contact_chol.shape == (fused.n_contacts, 3, 3)
+    # ContactNet feature channel: concat(filtered, unfiltered).
+    assert s.torques.shape == (fused.n_joints + len(reader.unfiltered_names),)
+
+
+def test_torques_are_gathered_in_concat_filtered_unfiltered_order(rest_data, reader, fused):
+    """Driving ONE actuator must move exactly its own torque entry.
+
+    The estimator never reads `torques`, so a permuted gather would surface only
+    as a ContactNet that trains and is quietly worse — the same silent class as
+    a rotated gyro or a mis-ordered encoder vector. Checked against MuJoCo's own
+    transmission map (`actuator_trnid`), not against another call to the reader.
+    """
+    m, _, _ = rest_data
+    names = list(fused.build.joint_names) + list(reader.unfiltered_names)
+    for probe, name in enumerate(names):
+        jid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_JOINT, name)
+        acts = [a for a in range(m.nu) if m.actuator_trnid[a, 0] == jid]
+        assert acts, f"{name} has no actuator; the probe cannot isolate it"
+
+        d = mujoco.MjData(m)
+        d.ctrl[acts[0]] = 5.0
+        mujoco.mj_forward(m, d)
+
+        tau = reader.read(d).torques
+        assert np.count_nonzero(np.abs(tau) > 1e-9) == 1, (
+            f"driving {name} moved more than one torque entry: {tau}")
+        assert int(np.argmax(np.abs(tau))) == probe, (
+            f"driving {name} (index {probe}) landed on index {int(np.argmax(np.abs(tau)))} "
+            f"({names[int(np.argmax(np.abs(tau)))]})")
 
 
 def test_noise_is_reproducible_and_bias_is_constant():

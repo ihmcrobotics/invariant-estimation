@@ -68,6 +68,18 @@ class IMUNoise:
     `sigma_gyro_floor` (1e-6 (rad/s)² ⇒ 1e-3 rad/s), encoder noise at the
     measured per-joint values (~2e-4 rad), and a CONSTANT per-IMU gyro bias — the
     quantity the joint KF exists to estimate and hand to the InEKF (I1).
+
+    `torque_std` is the exception: it is **not** grounded in hardware. Plain AWGN
+    at 0.5 N·m, chosen so the ContactNet torque channel is not the one clean
+    signal in an otherwise-corrupted bundle. For scale, that is ~1% of Alex's
+    standing knee torque (measured: −50.9 N·m), against 0.02–0.5% relative noise
+    on the other channels — the same order, slightly noisier, which is the right
+    direction if Alex's torque is current-derived rather than directly sensed.
+
+    Revisit before trusting any absolute ContactNet calibration result: the real
+    question is whether the logged `tau` is measured (a sensor, so this model is
+    the right shape) or commanded (a controller output, which carries no sensor
+    noise at all and would want a different treatment entirely).
     """
 
     gyro_std: float = 1.0e-3          # [rad/s]
@@ -75,6 +87,7 @@ class IMUNoise:
     encoder_std: float = 2.0e-4       # [rad]
     encoder_vel_std: float = 5.0e-3   # [rad/s]
     gyro_bias_std: float = 1.0e-2     # [rad/s] one draw per IMU, then constant
+    torque_std: float = 5.0e-1        # [N.m] PLACEHOLDER — see below
     seed: int = 0
     _rng: np.random.Generator = field(init=False, repr=False)
     _bias: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -100,6 +113,10 @@ class IMUNoise:
 
     def corrupt_velocities(self, qd: np.ndarray) -> np.ndarray:
         return qd + self.encoder_vel_std * self._rng.standard_normal(qd.shape)
+
+    def corrupt_torques(self, tau: np.ndarray) -> np.ndarray:
+        """AWGN only — no bias term, unlike the gyro (see the class docstring)."""
+        return tau + self.torque_std * self._rng.standard_normal(tau.shape)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +215,11 @@ class SimSensorReader:
         # -- encoders: the 9 filtered joints, in filter state order ----------
         self.enc_qadr = np.array(
             [m.jnt_qposadr[sid(n, mujoco.mjtObj.mjOBJ_JOINT)] for n in build.joint_names])
+        # DOF addresses for the same joints. qposadr != dofadr in general, and
+        # torque is a generalised force, so it indexes by DOF, not by qpos.
+        self.enc_dofadr = np.array(
+            [m.jnt_dofadr[sid(n, mujoco.mjtObj.mjOBJ_JOINT)] for n in build.joint_names],
+            dtype=int)
 
         # -- the unfiltered anchor-chain joints (Alex's 4 ankles) ------------
         self.unfiltered_names = _dof_joint_names(
@@ -244,12 +266,20 @@ class SimSensorReader:
         # Only read when the estimator was built with `contact_fk_unfiltered`; an empty array
         # otherwise, which is the "field absent" encoding `FusedSensors` expects.
         q_u = (d.qpos[self.unf_qadr].copy() if self.fused.n_aux else np.zeros(0))
+        # ContactNet feature channel only — the estimator never reads it.
+        # `qfrc_actuator` is the actuator contribution in GENERALISED (joint)
+        # coordinates, so it indexes by dofadr and lines up with the encoder
+        # ordering directly; `actuator_force` would be per-actuator and need the
+        # transmission map.  Ordered concat(filtered, unfiltered), matching how
+        # `fused_inputs` widens q̂ for the contact FK.
+        tau = d.qfrc_actuator[np.concatenate([self.enc_dofadr, self.unf_dofadr])].copy()
         if self.noise is not None:
             gyros = self.noise.corrupt_gyros(gyros)
             accel = self.noise.corrupt_accel(accel)
             enc = self.noise.corrupt_encoders(enc)
             qd_u = self.noise.corrupt_velocities(qd_u)
             q_u = self.noise.corrupt_encoders(q_u)
+            tau = self.noise.corrupt_torques(tau)
 
         trusted = self.trust.update(self.foot_loads(d))
         # The InEKF has NO contact mask: contact condition rides ENTIRELY in
@@ -264,6 +294,7 @@ class SimSensorReader:
             contact=trusted,
             contact_chol=chol * np.tile(np.eye(3), (len(self.foot_gids), 1, 1)),
             q_unfiltered=q_u,
+            torques=tau,
         )
 
     # -- ground truth --------------------------------------------------------

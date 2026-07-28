@@ -283,6 +283,16 @@ class FusedSensors(NamedTuple):
         estimator was built with `contact_fk_unfiltered=True`, which lets the
         contact FK stand on the live ankle angles instead of `qpos0`; ignored
         otherwise, so the field is optional and defaults to empty.
+    torques : (n + n_u,), optional
+        Measured joint torques, ordered `concat(filtered, unfiltered)` — the same
+        concatenation `fused_inputs` already uses to widen `q̂` for the contact FK.
+
+        **The estimator does not read this.** It exists solely as a ContactNet
+        feature channel (`contactnet/features.py`): torque is the only available
+        signal that carries contact *force*, which is what distinguishes a
+        planted foot from a sliding one (`network_plan.md` §5.5). Empty when the
+        producer does not supply it, matching `q_unfiltered`'s "field absent"
+        encoding, so every existing call site keeps working unchanged.
     """
 
     encoders: Array
@@ -292,6 +302,7 @@ class FusedSensors(NamedTuple):
     contact: Array
     contact_chol: Array
     q_unfiltered: Array = ()
+    torques: Array = ()
 
 
 class FusedOutputs(NamedTuple):
