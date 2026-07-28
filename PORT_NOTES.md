@@ -1927,3 +1927,140 @@ Limitation to state when it is run: an energy channel is rectified, so it carrie
 how much HF content arrived and when, but not its spectral character. If slip and
 firm contact ring at different frequencies, per-band energies (3 bands x 3 axes)
 would be needed to separate them — same mechanism, more channels, still no state.
+
+---
+
+## Measured sensor noise floors — the table `normalize.py` cites (2026-07-28)
+
+`normalize.NOISE_FLOOR` cited this file for its values and this file did not have
+them. Recording them, from the 2026-07-17 Alex001 log analysis (walking window
+t = 200–220 s, read at stride 1; cross-checked through both `ihmclog` and this
+repo's `replay/logsource`, which agreed to within 0.1%).
+
+| channel | noise std | how obtained |
+|---|---|---|
+| base gyro | 1.5–4e-3 rad/s | quiet-window 2–60 Hz PSD plateau |
+| base accel | 0.04–0.05 m/s² | ditto; PSD flat to Nyquist, so partly aliased |
+| joint `q` | ~4e-6 rad | quiet-window plateau — **a LOWER BOUND**: the log's `raw_q` is already low-passed (−18.6 dB at 50 Hz), so intrinsic encoder noise is probably 1–2e-5 |
+| joint `tau` | 0.20 N·m median (0.10–0.28 per joint) | quiet-window plateau; SNR 37–196 while walking |
+| `p_bc` | ~5e-6 m | **propagated**, `J σ_q`, not measured |
+| `v_bc` | 7.1e-3 m/s | **propagated**, `sqrt(2)·σ_p/dt` — see below |
+
+Method note worth keeping: the PSD-plateau and direct-quiet-window methods agree
+within 2–4x on gyro/accel/torque and disagree by **10–40x on the encoders**. The
+walking-window HF "plateau" sits ~1000x above the quiet-window floor, i.e. that
+content is real mechanical vibration rather than sensor noise, so the walking
+method over-reads badly. The quiet 2–60 Hz plateau is the defensible number.
+
+### Bug: the `v_bc` floor was 7071x too small, and therefore inert
+
+`v_bc` is a first difference at 1 kHz, so it amplifies position noise by
+`sqrt(2)/dt` — from `σ_p = 5e-6 m` that is **7.1e-3 m/s**. The table shipped
+`1e-6`.
+
+The error came from applying a reduction that does not apply. `features.window`
+boxcar-averages before subsampling, and the two operations telescope:
+
+    boxcar_s(diff(p)/dt)[k] = (p[k] - p[k-s]) / (s*dt)
+
+so it is tempting to divide by `stride`. But **`normalize.fit`/`apply` run on the
+`(T, N_c, F)` channels BEFORE windowing** — that ordering is the whole point of
+the split — so at the moment the floor is compared against `raw_std`, the boxcar
+has not happened. The amplification is the full `sqrt(2)/dt`.
+
+Consequence of the old value: the floor could never fire for `v_bc`. It would
+have gone unnoticed while walking and failed exactly the case the floor exists
+for — a standing calibration set, where `v_bc` is almost entirely noise.
+Verified after the fix: `v_bc_x/y/z` now appear in `floored` on a noise-only set.
+
+---
+
+## β-NLL's β is dimension-dependent, and 0.5 at k=6 is not the paper's 0.5
+
+Flagged during the theory write-up; **not yet acted on**, because run 1 is the L2
+baseline (`config.objective` defaults to `l2_velocity`) so it does not block.
+
+The β-NLL reweight in the source formulation is **per dimension**: each term is
+weighted by that dimension's `σ^{2β}`. `losses.beta_nll_from_diagnostics` instead
+weights the whole joint NLL by `det(S)^β`. For isotropic `S = s·I_k`:
+
+    det(S)^β = s^{k·β}
+
+so at `k = 3N = 6` contacts-stacked and `β = 0.5` the weight goes as **`s³`**,
+where the per-dimension intent is `s^0.5`. Matching the paper's semantics would
+need `β_ours = β_paper / k ≈ 0.083`.
+
+Two consequences worth checking before run 2:
+
+1. The weight is `det(S)^β`, so **small `S` ⇒ small weight**. An overconfident
+   filter has small `S` and large NIS, so the reweight *down-weights the most
+   overconfident ticks* — the wrong direction for an estimator, and at `s³` the
+   effect is severe rather than marginal.
+2. `losses.py` has two entry points at different `k` — `beta_nll` (k=3, single
+   contact) and `beta_nll_from_diagnostics` (k=6, stacked). **The same `β` means
+   different things in each**, which is a trap for whoever tunes it.
+
+Not a bug in the L2 path. Decide before switching objectives.
+
+---
+
+## BUG FIXED — the contact measurement noise was never rotated to world (2026-07-28)
+
+Found while writing the theory document; verified from source and quantified
+before fixing.
+
+`correct.innovation` returns a **world-frame** residual — its own docstring says
+so:
+
+    nu = y @ state.R.T - rel          # R̄ y_i − (d̄_i − p̄), measurement − model, WORLD frame
+
+but `Np = J_C Σ_q J_Cᵀ` and ContactNet's `Σ_C` are both **body-frame**, and
+`filter.step` passed them straight into `linear_update`. So `S = H P Hᵀ + N`
+mixed frames.
+
+The port already contained the fix and never called it.
+`correct.rotate_measurement_covariance`, docstring verbatim:
+
+> Java `ContactUpdater.computeMeasurementCovariance`. The residual lives in the
+> world frame (`contact_residual`), so the body-frame FK noise must be
+> conjugated by the estimated attitude before it enters `S`.
+
+and `map_encoder_noise` says its output "is the **body-frame** FK covariance,
+which `rotate_measurement_covariance` then takes to world". `network_plan.md` §1
+specifies `N̄ = R̂(J_C Σ_q J_Cᵀ + Σ_C)R̂ᵀ`. Three independent sources agree; only
+the wiring was missing.
+
+### Why nothing caught it, and why it matters *here*
+
+Measured on the test fixture with a genuinely non-identity `R̂` (‖R̂−I‖ = 2.82):
+
+| `Σ_C` | max\|N_body − N_world\| | relative Kalman-gain error |
+|---|---|---|
+| isotropic `1e-6·I` | **6.4e-22** | 1.2e-21 |
+| anisotropic slip `diag(1e-3, 1e-3, 1e-8)` | 3.3e-4 | **2.7e-3** |
+
+`R̂(σ²I)R̂ᵀ = σ²I` exactly, so for the shipped isotropic default the bug is
+*machine-zero invisible* — which is why 653 tests passed over it.
+
+It is not a no-op for anisotropy, and **anisotropy is ContactNet's entire
+justification**. `inEKF/filter.py`'s own DECISION note argues `Σ_C` is "strictly
+more expressive than a scalar trust weight: a full covariance can say 'this foot
+slides along the surface but not through it'". That statement was false in the
+scan body: the sideways-vs-through distinction was being partially discarded
+before it reached `S`. And the network cannot compensate, because §1 forbids it
+from seeing `R̂`.
+
+Training against the unfixed path would have produced a network optimised
+through a filter that throws away the thing it is learning.
+
+### Fix
+
+`filter.step` now conjugates on the **prior** state, matching `innovation`:
+
+    N_world = rotate_measurement_covariance(state, Np + Nc)
+    state, diag = linear_update(state, ekf.params.H, nu, measurement_noise(N_world))
+
+Full suite **667 passed**, no failures — the ported Java tests are silent on this
+because they use isotropic noise, so they neither caught the bug nor object to
+the fix. Worth a dedicated anisotropic regression test when the ContactNet suite
+is written.

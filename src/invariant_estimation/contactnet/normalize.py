@@ -36,7 +36,9 @@ NOISE_FLOOR: dict[str, float] = {
                               #            noise is probably 1-2e-5
     "tau_": 2.0e-1,           # N.m     -- median; per-joint 0.10-0.28
     "p_bc": 5.0e-6,           # m       -- propagated, J sigma_q, not measured
-    "v_bc": 1.0e-6,           # m/s     -- propagated; see `channel_floor`
+    "v_bc": 7.1e-3,           # m/s     -- propagated, = sqrt(2)*sigma_p/dt; see
+                              #            `channel_floor` for why there is no
+                              #            1/stride here
 }
 
 
@@ -56,16 +58,27 @@ def channel_floor(
     override that tightened a floor, which is the direction a per-joint table
     would most likely refine.
 
-    Note on ``v_bc``: it is a first difference at 1 kHz, which would normally
-    amplify position noise by ``sqrt(2)/dt ~ 1400x``.  It does not here, because
-    `features.window` boxcar-averages before subsampling and the two operations
-    telescope::
+    Note on ``v_bc`` -- read this before "correcting" its floor downward.
+    ``v_bc`` is a first difference at 1 kHz, so it amplifies position noise by
+    ``sqrt(2)/dt``: from ``sigma_p = 5e-6 m`` that is ``7.1e-3 m/s``, three
+    orders above the position floor.
+
+    It is tempting to divide that by ``stride``, because `features.window`
+    boxcar-averages before subsampling and the two operations telescope::
 
         boxcar_s(diff(p)/dt)[k] = (p[k] - p[k-s]) / (s*dt)
 
-    so the ``s=8`` window turns a 1-tick difference into an 8-tick one and the
-    amplification is ``sqrt(2)/(s*dt)``.  The floor above assumes that pipeline;
-    it is wrong by 8x if the boxcar is ever removed.
+    **That reduction does not apply here.**  `fit` and `apply` run on the
+    ``(T, N_c, F)`` channels *before* windowing -- that ordering is the whole
+    point of the split (see this module's docstring) -- so at the moment the
+    floor is compared against ``raw_std``, the boxcar has not happened.  The
+    amplification is the full ``sqrt(2)/dt``.
+
+    An earlier version of this table carried ``1e-6`` here, which is ``7071x``
+    too small and therefore inert: the floor could never fire for ``v_bc``.  It
+    would have gone unnoticed while walking, and failed exactly the case the
+    floor exists for -- a standing calibration set, where ``v_bc`` is almost
+    entirely noise.
 
     Raises
     ------

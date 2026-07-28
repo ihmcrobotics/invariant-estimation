@@ -115,6 +115,7 @@ from .correct import (
     linear_update,
     map_encoder_noise,
     measurement_noise,
+    rotate_measurement_covariance,
 )
 from .ekf import InvariantEKF
 from .gravity_update import (
@@ -317,8 +318,24 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
         # through the boundary so adding it later is a change here only.
 
         nu = innovation(state, frames.y)
+
+        # ᴮ -> ᵂ.  `innovation` returns `R̂y - (d̂-p̂)`, which is a WORLD-frame
+        # residual, while `Np` and `Nc` are both body-frame.  `S = H P Hᵀ + N`
+        # therefore needs `R̂ N R̂ᵀ` (Java `ContactUpdater.computeMeasurementCovariance`;
+        # network_plan.md §1's `N̄ = R̂(J_C Σ_q J_Cᵀ + Σ_C)R̂ᵀ`).
+        #
+        # This was missing until 2026-07-28 and is INVISIBLE for isotropic noise,
+        # where `R̂(σ²I)R̂ᵀ = σ²I` -- measured 6.4e-22, i.e. machine zero.  It is
+        # not a no-op for anisotropic noise: an anisotropic slip covariance
+        # diag(1e-3, 1e-3, 1e-8) shifts the Kalman gain by 2.7e-3 relative.
+        # Anisotropy is exactly what ContactNet exists to produce (see the
+        # DECISION note above: "this foot slides along the surface but not
+        # through it"), and the network cannot compensate because §1 forbids it
+        # from seeing R̂.  Conjugation on the PRIOR state, matching `innovation`.
+        N_world = rotate_measurement_covariance(state, Np + Nc)
+
         state, contact_diagnostics = linear_update(
-            state, ekf.params.H, nu, measurement_noise(Np + Nc)
+            state, ekf.params.H, nu, measurement_noise(N_world)
         )
 
         # -- 3. gravity leveling (G4), gated --------------------------------

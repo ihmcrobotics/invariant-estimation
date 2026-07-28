@@ -7,7 +7,7 @@ Per-contact feature extraction and history windowing for ContactNet
 Two halves, deliberately separated:
 
 * **Windowing** (`window_indices`, `window`) — pure plumbing with an exact
-  oracle in ``tests/contactnet/test_features.py``.  Mechanical.
+  oracle (spec'd in PORT_NOTES.md; NOT YET WRITTEN).  Mechanical.
 * **Channel extraction** (`contact_channels`) — **HAND-AUTHOR**.  Which
   channels, which subchain joints, what ordering: convention-bound, with no
   cheap oracle.  A wrong choice here produces a network that trains, converges
@@ -33,7 +33,8 @@ def window_indices(T: int, H: int, stride: int = 1) -> Array:
 
     ``idx[k, h] = k - (H - 1 - h)·stride``, so every row **ends** at ``k``.
     Causality is structural, not incidental: ``idx[k, h] <= k`` holds for every
-    entry, and ``tests/contactnet/test_features.py`` asserts exactly that.  A
+    entry.  The oracle asserting that is spec'd in PORT_NOTES.md and is NOT
+    YET WRITTEN -- it is the highest-value test in this module.  A
     window that peeks at ``k + 1`` trains beautifully and cannot be deployed, and
     nothing anywhere raises — which is why it gets its own oracle.
 
