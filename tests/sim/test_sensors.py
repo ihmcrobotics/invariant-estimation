@@ -234,6 +234,22 @@ def _drive(trust, load, ticks):
     return out
 
 
+def _ticks(seconds):
+    """Tick count for a DURATION. Never hardcode a count in these tests.
+
+    `ContactTrust` accumulates `dwell` in seconds and runs its EMA off `dt/tau`,
+    so a literal tick count silently means a different duration at a different
+    `DT` -- three tests here broke exactly that way when DT went 5 ms -> 1 ms.
+    Same trap `run_policy.DT`'s comment names for travel-per-tick.
+    """
+    return int(np.ceil(seconds / DT))
+
+
+def _settle(trust):
+    """Ticks to clear the dwell AND let the load EMA reach it (5 time constants)."""
+    return _ticks(trust.dwell + 5.0 * trust.ema_tau) + 1
+
+
 def test_a_lightly_loaded_foot_is_never_trusted():
     t = ContactTrust(n_feet=1, dt=DT)
     assert _drive(t, 0.30, 400)[0] == 0.0        # below `enter` = 0.35, however long
@@ -250,9 +266,9 @@ def test_entering_requires_the_dwell():
 def test_hysteresis_holds_a_trusted_foot_between_stay_and_enter():
     """A foot that has landed keeps anchoring while unloading down to `stay`."""
     t = ContactTrust(n_feet=1, dt=DT, ema_tau=0.0)
-    _drive(t, 1.0, 20)
+    _drive(t, 1.0, _settle(t))
     assert t.trusted[0] == 1.0
-    assert _drive(t, 0.30, 50)[0] == 1.0          # between stay (0.25) and enter (0.35)
+    assert _drive(t, 0.30, _settle(t))[0] == 1.0  # between stay (0.25) and enter (0.35)
     assert _drive(t, 0.20, 1)[0] == 0.0           # below stay -> released immediately
 
 
@@ -267,7 +283,7 @@ def test_release_is_immediate_but_re_entry_is_not():
 
 def test_feet_are_independent(rest_data, reader):
     t = ContactTrust(n_feet=2, dt=DT, ema_tau=0.0)
-    for _ in range(20):
+    for _ in range(_settle(t)):
         out = t.update(np.array([1.0, 0.0]))
     np.testing.assert_array_equal(out, [1.0, 0.0])
 
@@ -280,7 +296,7 @@ def test_standing_robot_trusts_both_feet_and_swing_inflates_sigma_c(rest_data, r
     """
     m, d, _ = rest_data
     reader.trust.__init__(n_feet=2, dt=DT)
-    for _ in range(30):
+    for _ in range(_settle(reader.trust)):
         s = reader.read(d)
     np.testing.assert_array_equal(s.contact, [1.0, 1.0])
     np.testing.assert_allclose(s.contact_chol[0], np.eye(3) * reader.stance_chol)
@@ -289,7 +305,7 @@ def test_standing_robot_trusts_both_feet_and_swing_inflates_sigma_c(rest_data, r
     d2.qpos[:] = d.qpos
     d2.qpos[2] += 1.0
     mujoco.mj_forward(m, d2)
-    for _ in range(30):
+    for _ in range(_settle(reader.trust)):
         s = reader.read(d2)
     np.testing.assert_array_equal(s.contact, [0.0, 0.0])
     np.testing.assert_allclose(s.contact_chol[0], np.eye(3) * reader.swing_chol)

@@ -57,13 +57,19 @@ URDF = os.environ.get("ALEX_URDF", os.path.join(ASSETS, "alex_with_imus.urdf"))
 RL_MODELS = os.environ.get("ALEX_RL_MODELS", os.path.join(ASSETS, "rl_models"))
 MESHDIR = os.environ.get("ALEX_MESHDIR", os.path.join(ASSETS, "alex_virtual_description"))
 
-# 200 Hz physics / 50 Hz control, matching IsaacLab's SIM_DT = 0.005 and CONTROL_DT = 0.02. The
-# policy is queried at exactly the rate it was trained at; changing DT without changing DECIMATION
-# changes the CONTROL rate, which silently rescales how far the robot travels per tick. (This was
-# briefly left at 0.001 during a rate sweep -- 250 Hz control -- which reads as a walking
-# regression if you measure travel per control tick rather than per second.)
-DT = 0.005             # physics timestep
-DECIMATION = 4         # physics steps per control tick -> 50 Hz
+# 1 kHz physics / 50 Hz control. CONTROL_DT = DT * DECIMATION = 0.02 is IsaacLab's and is the rate
+# the policy was TRAINED at -- it is the invariant here. DT is finer than IsaacLab's SIM_DT = 0.005
+# so that the estimator, which ships at 1 kHz (CLAUDE.md §8) and is validated against a 1 kHz
+# hardware log, runs at its real rate in sim. ContactNet's history window is specified in seconds
+# and derives its tick stride from DT, so a rate mismatch here would silently change what the
+# network sees (PORT_NOTES.md, "H is not 20").
+#
+# THE TWO MOVE TOGETHER. Changing DT without changing DECIMATION changes the CONTROL rate, which
+# silently rescales how far the robot travels per tick. (This was briefly left at DT=0.001 with
+# DECIMATION=4 during a rate sweep -- 250 Hz control -- which reads as a walking regression if you
+# measure travel per control tick rather than per second.)
+DT = 0.001             # physics timestep
+DECIMATION = 20        # physics steps per control tick -> 50 Hz
 
 # `alex_with_imus.urdf` is the FULL_ROBOT_ABILITY_HANDS assembly; the policies were trained on
 # AlexV2Version.CYCLOID_FOREARMS. Dropping the two hand-adapter subtrees reproduces the Java cycloid
