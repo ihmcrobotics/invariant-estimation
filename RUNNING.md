@@ -517,9 +517,16 @@ From nothing to a trained network is four commands; only the first is slow.
 uv run python -m invariant_estimation.sim.collect --seconds 60 --seeds 0 1 2  # ~50 min, 1.5 GB
 uv run python train_contactnet.py cache        # ~25 min: MJX features -> data/cache/ (23 MB each)
 uv run python train_contactnet.py norm         # seconds: freezes data/norm_constants.npz
-uv run python train_contactnet.py train --steps 10000 --objective l2_velocity \
-    --B 32 --no-remat --out artifacts/contactnet_run1.npz --p0 artifacts/p0.npz
+JAX_PLATFORMS=cuda uv run python -u train_contactnet.py train --steps 10000 \
+    --objective l2_velocity --B 32 --no-remat \
+    --out artifacts/contactnet_run2.npz --p0 artifacts/p0.npz
 ```
+
+**Use `-u`.** The first launch of run 1 buffered and showed nothing for 3.5
+minutes despite 70% GPU load. Chaining, the pass-through process socket, and the
+measured `warm_in_s`/`episode_s` are all defaults — the command above is the
+current recommended run. `--no-chained` and `--freeze-contact-chol` restore
+run-1 behaviour for ablations.
 
 `cache` and `norm` are idempotent and are re-run automatically by `train` when
 their artifacts are missing, so once the data exists **the real run is the last
@@ -545,14 +552,23 @@ globally so only a gather remains (`test_segment_windows_are_bit_identical_to_fe
 
 **What the loader guarantees**, each with a mutation-checked test:
 
-* `inputs.contact_chol` is overwritten with `ContactNetConfig.contact_chol_const`.
-  The sim switches it 1e-4 ↔ 1e1 off a contact detector (`sim/sensors.py`) and
-  keeping it would hand the network a free ground-truth stance flag.
+* `inputs.contact_chol` is **passed through unchanged** (since 2026-07-28).
+  Run 1 froze it at the stance constant and that was the primary cause of its
+  collapse — pinning a *swinging* foot as world-static costs 10.2× in body-frame
+  velocity error versus not using contacts at all. `--freeze-contact-chol`
+  restores the old behaviour for the ablation. The leak argument for freezing
+  does not hold: the network's input is the 24 feature channels, and
+  `contact_chol` reaches only the filter's *process* model.
 * Segment starts avoid the 16 000-tick warm-up **and** the following
   `(H-1)·stride = 392` ticks. 545 772 legal starts over 12 rollouts.
 * Batches are drawn from a fresh permutation of the rollouts each step, so a
   batch touches `min(B, n_rollouts)` distinct trajectories. Starts are uniform
   random inside a rollout, never tiled.
+* Segments are **chained**, not independently seeded (`dataset.ChainedBatcher`).
+  `B` filter chains walk the rollouts in order carrying `(X̂, P)` and the gravity
+  reference between steps, so a segment starts at whatever error the filter has
+  actually accumulated. See "Run 2 and the chained batcher" below — this is the
+  single most important thing to understand before launching a run.
 * `state0` is `truth.R/v/p` at the start tick, with contact anchors
   `d = R_true·y(q̂) + p_true` from the FK at the **recorded filter** `q̂` — so the
   first contact residual is exactly zero. The joint KF is *not* reseeded: it ran
@@ -564,6 +580,99 @@ globally so only a gather remains (`test_segment_windows_are_bit_identical_to_fe
   `diag(v) = 7.6e-4`, `diag(p) = diag(d) = 0.34` (absolute position unobservable;
   only `p − d` is). At that seed the pre-ContactNet filter starts at
   `NIS/dof = 1.46`, i.e. already nearly calibrated.
+
+### Run 2 and the chained batcher — read before launching
+
+Run 1 (10 000 steps, `l2_velocity`) looked healthy by every process metric —
+loss down 82×, `applied_frac` 1.000 throughout, gradients finite — and was
+**degenerate**. It learned `Σ_C` with a median per-axis std of 0.68 m, four
+orders above the `N = J Σ_q Jᵀ` term in the same innovation, suppressing the
+contact-update velocity gain **3835×**. The filter had learned to ignore its
+feet. Loss curves cannot see this; see the two gates below.
+
+Two causes, both fixed and both now the default:
+
+1. **The frozen process socket** (primary, 10.2×) — above.
+2. **Force-teacher seeding** (secondary) — every segment was re-seeded from
+   ground truth, so it began at *zero* error and ran 128 ms. Over that horizon
+   IMU dead-reckoning beats any contact correction, so the loss-minimising `Σ_C`
+   is infinite. `ChainedBatcher` carries the state instead. CoCo-InEKF
+   (arXiv 2605.15122 §III-B) reports the same failure for force-teacher seeding.
+
+Three config fields govern chaining, all measured rather than chosen:
+
+| field | default | why |
+|---|---|---|
+| `warm_in_s` | 1.0 | a fresh chain starts at zero error; the filter's error saturates at ~8.5e-2 m/s and is there by 1 s. Untrained-on. |
+| `episode_s` | 43.0 | **the ceiling this dataset allows** — 62 s rollout − 16 s joint-KF warm-up = 45.5 s usable. Setting 100 s would never fire; the rollout-end re-seed trips first. A true 100 s episode needs `--seconds 120`+ at collection. |
+| `freeze_contact_chol` | False | run-1 ablation only |
+
+Chains also re-seed on a non-finite carry (a diverged chain would poison every
+later step) and their initial episode phase is staggered — seeding them all at
+`ticks = warm_in_s` makes them re-seed in a synchronised wave and then march in
+lockstep, costing most of the `B` independent samples.
+
+### The two gates — run both, in this order
+
+```bash
+uv run python -m experiments.alpha_sweep                       # before training
+uv run python -m experiments.check_sigma  artifacts/<run>.npz  # after
+uv run python -m experiments.replay_eval  artifacts/<run>.npz  # after — the verdict
+```
+
+**`alpha_sweep`** scales `Σ_C` by a global factor and requires an interior
+`argmin`. It is theory-doc §7.2.1 Claim 1 aimed at the objective actually in use,
+runs in ~30 s, and needs no training. Run-1's config **FAILS** it (monotone to
+α=1e4 — loss down 136× purely from disabling contacts); run-2's **PASSES** with
+the optimum at `Σ_C ≈ 1 cm`. Run this whenever you change seeding, the horizon,
+or the process socket.
+
+**`check_sigma`** reports the per-axis contact gain against initialization. Treat
+it as a **diagnostic, not a verdict** — a gain ratio cannot distinguish "switched
+off because the objective was degenerate" from "switched off because that
+residual direction carries little velocity information". It gave the wrong answer
+twice on run 2, in opposite directions.
+
+**`replay_eval`** is the verdict: it runs the filter under the heuristic `σ₀²I`
+and under the trained `Σ_C`, identical otherwise, and compares error in what L2
+scores *and* what it does not. Run 2, 20 s horizons:
+
+| metric | heuristic | run-2 `Σ_C` | ratio |
+|---|---|---|---|
+| body-frame velocity RMS | 0.0844 m/s | 0.0254 | 0.301 |
+| position RMS | 0.790 m | 0.245 | 0.310 |
+| height RMS | 0.780 m | 0.0918 | 0.118 |
+| height final | 1.347 m | 0.125 | 0.093 |
+| mean tilt | 0.689° | 0.353° | 0.513 |
+
+`nis_over_dof` finishing far below 1 (run 2: 7.5e-3) is **expected** under L2 and
+is not a failure — L2 constrains the gain sequence and says nothing about the
+covariance. It means the *estimate* is good and the *covariance* is not
+calibrated; that gap is what β-NLL exists to close.
+
+### GPU, timing, and what does not help
+
+Measured on an RTX 4070 SUPER (12 GB), B=32, `--no-remat`:
+
+| setting | s/step | 10k steps | 100k steps |
+|---|---|---|---|
+| `warm_in_s=2, episode_s=20` (run 2 as launched) | 0.598 | 1.66 h | 16.6 h |
+| `warm_in_s=1, episode_s=43` (current default) | ~0.36 | ~1.0 h | ~10 h |
+
+Over half of run 2's wall time was re-seed warm-in scans (1118 ms each at
+`warm_in_s=2`, 0.305/step). The current defaults cut that to ~0.18/step at
+~559 ms.
+
+**Larger `B` does not help on a 12 GB card** — B=32 450 ms, B=64 1333 ms
+(2.96×), B=128 2227 ms. Scaling is superlinear, so the GPU is not
+under-occupied at B=32 and buying throughput with batch size does not work here.
+Re-measure on a bigger card before assuming otherwise.
+
+**More iterations is probably the wrong purchase.** 100k steps × B=32 = 3.2M
+segment draws over ~1 100 independent contact events in the current dataset —
+2 900 replays of each. The gap to CoCo-InEKF is ~10⁵ in *sample diversity*
+(they regenerate physics every iteration across 1 280 envs), not in iteration
+count. Friction randomisation and a wider `vx`/yaw sweep buy more than steps do.
 
 ### Sizing `B` — measured, not guessed
 
