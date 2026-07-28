@@ -517,8 +517,18 @@ class ChainedBatcher:
         self.rng = np.random.default_rng(seed)
         self.chains: list[_Chain] = []
         self.carries: list = []
-        for _ in range(cfg.B):
-            c, carry = self._seed()
+        for b in range(cfg.B):
+            # Stagger the initial episode phase.  Seeding every chain at
+            # `ticks = warm_in_ticks` makes all B of them reach `episode_ticks`
+            # on the SAME step, so they re-seed in a synchronised wave and then
+            # march in lockstep forever: the batch is always at one common
+            # "time since seed", and any phase-dependent effect is perfectly
+            # correlated across it.  That would quietly cost most of the B
+            # independent samples the batch is sized by.  Spreading the initial
+            # phase over the episode desynchronises them permanently, at the
+            # price of a short burn-in for chains started late in an episode.
+            phase = int(self.rng.integers(cfg.warm_in_ticks, cfg.episode_ticks))
+            c, carry = self._seed(ticks=phase)
             self.chains.append(c)
             self.carries.append(carry)
 
@@ -528,8 +538,12 @@ class ChainedBatcher:
         """Ticks a chain needs beyond its start: warm-in plus one segment."""
         return self.cfg.warm_in_ticks + self.cfg.L
 
-    def _seed(self) -> tuple[_Chain, object]:
-        """Pick a rollout and start, seed from truth, and warm in."""
+    def _seed(self, *, ticks: int | None = None) -> tuple[_Chain, object]:
+        """Pick a rollout and start, seed from truth, and warm in.
+
+        `ticks` overrides the chain's initial episode counter; only the
+        constructor uses it, to stagger the chains' re-seed phases.
+        """
         cfg = self.cfg
         # Only rollouts with room for warm-in plus at least one scored segment.
         room = [i for i, p in enumerate(self.preps)
@@ -549,7 +563,8 @@ class ChainedBatcher:
             warm = warm._replace(contact_chol=jnp.asarray(
                 _constant_contact_chol(cfg, cfg.warm_in_ticks, p.y_fk.shape[1])))
         carry = self._warm_in(jax.tree.map(jnp.asarray, state0), warm)
-        return _Chain(rollout=i, t=t_seed + cfg.warm_in_ticks, ticks=cfg.warm_in_ticks), carry
+        return _Chain(rollout=i, t=t_seed + cfg.warm_in_ticks,
+                      ticks=cfg.warm_in_ticks if ticks is None else ticks), carry
 
     def _needs_reseed(self, c: _Chain, carry) -> bool:
         p = self.preps[c.rollout]

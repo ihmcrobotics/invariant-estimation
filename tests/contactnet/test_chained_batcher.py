@@ -124,7 +124,6 @@ def test_cursor_starts_where_the_warm_in_ended(preps):
         # Warm-in ended at tick `c.t - 1`, so the segment starts at `c.t`.
         assert np.array_equal(np.asarray(p.inputs.omega[c.t - 1]), call.last), (
             "trained segment does not begin where the warm-in ended")
-        assert c.ticks == cfg.warm_in_ticks
         assert p.t_lo <= c.t <= p.t_hi
 
     # Non-vacuity: `omega` is not constant, so the row match really pins the
@@ -214,6 +213,9 @@ def test_episode_length_forces_a_reseed(preps):
     b = dataset.ChainedBatcher(preps, cfg, P0, _warm_in_fn(calls), seed=4)
     n_seed = len(calls)
     b.chains[0].t = preps[b.chains[0].rollout].t_lo
+    # Undo the constructor's phase stagger: this test is about the episode
+    # bound, not about where in an episode a chain happens to start.
+    b.chains[0].ticks = cfg.warm_in_ticks
 
     # ticks: 20 at seed, +L per step; reseed on the step that reaches 100.
     expect = int(np.ceil((cfg.episode_ticks - cfg.warm_in_ticks) / cfg.L))
@@ -308,3 +310,28 @@ def test_rollouts_too_short_for_warm_in_are_rejected_loudly(preps):
     cfg = _cfg(warm_in_s=5.0, episode_s=10.0)      # 5000 ticks vs a 1200-tick fixture
     with pytest.raises(ValueError, match="no rollout has room"):
         dataset.ChainedBatcher(preps, cfg, P0, _warm_in_fn([]), seed=8)
+
+
+def test_initial_episode_phases_are_staggered(preps):
+    """Chains must not all reach `episode_ticks` on the same step.
+
+    Seeding every chain at `ticks = warm_in_ticks` makes them re-seed in a
+    synchronised wave and then march in lockstep: the batch sits at one common
+    time-since-seed forever, so any phase-dependent effect is perfectly
+    correlated across it and most of the B independent samples are lost.
+    Observed live in run 2's first launch as the reseed counter jumping 12 -> 37
+    between steps 100 and 150.
+
+    Kills: `ticks=cfg.warm_in_ticks` for every chain at construction.
+    """
+    cfg = _cfg(B=16)
+    b = dataset.ChainedBatcher(preps, cfg, P0, _warm_in_fn([]), seed=11)
+
+    phases = [c.ticks for c in b.chains]
+    assert len(set(phases)) > cfg.B // 2, f"phases barely vary: {sorted(phases)}"
+    assert all(cfg.warm_in_ticks <= t < cfg.episode_ticks for t in phases)
+
+    # The property that matters: steps-until-reseed is spread, not a single value.
+    remaining = sorted((cfg.episode_ticks - t + cfg.L - 1) // cfg.L for t in phases)
+    assert remaining[-1] - remaining[0] > 1, (
+        f"every chain reseeds within one step of the others: {remaining}")
