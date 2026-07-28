@@ -2367,3 +2367,43 @@ leaves a knob whose label lies.
 
 Whichever is chosen, make the two entry points agree, and re-record any β result
 measured before the change.
+
+---
+
+## Run 1's dataset is narrow — read the result accordingly (2026-07-28)
+
+Recording this because a good run-1 number is easy to over-read.
+
+Run 1 trains on **12 rollouts**: 4 terrains x 3 seeds, 62 s each, all at a single
+straight-line command `vx = 0.4`, one policy, one gait. After the 16 s warm-up
+and the lead-in that is ~552 s of usable trajectory, 1.104M pooled samples.
+
+**Count contact events, not samples.** Samples within a stride are near
+duplicates. At roughly a 1 s stride that is ~550 strides x 2 feet ≈ **1 100
+independent contact events** against a 374 790-parameter network. It is less
+alarming than it sounds — the output is 6 numbers with a strong prior (§4 init at
+the shipped filter) — but 1 100 is the number to reason with.
+
+### The specific gap is friction, not volume
+
+`Sigma_C` is contact *measurement* uncertainty: sole compliance, contact
+geometry, and slip. The dataset varies terrain and (after the planned sweep)
+speed and yaw. It does **not vary friction**, and `TERRAIN.md` §5 records that
+`randomize.py` already implements the Brax/MJX domain-randomisation pattern for
+Alex (`geom_friction`, `dof_frictionloss`, `dof_armature`, `body_ipos`,
+`body_mass`) — none of which is in use.
+
+If the sim never slips, ContactNet can only learn "`Sigma_C` ≈ constant,
+modulated slightly by load and geometry". That is a real result but a small one,
+and **a good L2 number would be exactly what you would expect for the wrong
+reason**.
+
+### Do this before collecting a large dataset
+
+Instrument the collector for slip — tangential foot-sole velocity while loaded,
+per contact — and report event counts. If slip is near-zero across all rollouts,
+add `geom_friction` randomisation in the same collection pass rather than
+collecting twice. That measurement is ~20 minutes; a 40-rollout sweep is hours.
+
+Run 1 remains worth running as the §9 step 8 plumbing proof. Its number means
+"the machinery works", not "ContactNet helps".

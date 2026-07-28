@@ -16,11 +16,52 @@ step in any workflow below.
 and harmless**: `mujoco-mjx` probes for the optional Warp backend and falls back
 to XLA. Pipe through `| grep -v warp` if it bothers you.
 
+## GPU vs CPU — which to use for what
+
+`jax[cuda12]` is a dependency, so `uv sync` installs a CUDA-enabled jaxlib.
+Confirm with:
+
+```bash
+uv run python -c "import jax; print(jax.devices())"   # -> [CudaDevice(id=0)]
+JAX_PLATFORMS=cpu uv run ...                          # force CPU for any command
+```
+
+**Use the GPU for training. Use the CPU for the test suite.** Measured on this
+machine (RTX 4070 SUPER, 20-core CPU), on the real training step at `B=32`,
+`L=128`, no remat, with marginal cost separated from setup:
+
+| | marginal | setup | 10k steps |
+|---|---|---|---|
+| GPU | **0.188 s/step** | 56.8 s (CUDA init) | **31 min** |
+| CPU | 0.440 s/step | 39.2 s | 73 min |
+
+Three gotchas, all of which cost time once:
+
+* **A naive total-time comparison inverts the answer.** At 60 steps the GPU
+  looks *slower* (68.2 s vs 65.8 s) purely because CUDA init makes its setup
+  17 s longer. Always difference two step counts to isolate the marginal cost.
+* **Do not run the full suite on GPU.** It took >20 min against 17.5 on CPU and
+  was abandoned — a suite of small unit tests is the worst case for a GPU
+  (kernel-launch overhead per test). Worse, XLA **preallocates 75% of VRAM**
+  regardless of use, so a running suite holds ~10 GB and blocks anything else on
+  the device. The targeted subset that matters for training,
+  `tests/inEKF tests/contactnet tests/pipeline`, runs on GPU in 5 min (312 tests).
+* **Consumer NVIDIA runs FP64 at 1/64 of FP32.** A 4070 SUPER is ~0.5 TFLOPS
+  FP64, comparable to this CPU, and I8 mandates float64 at the filter boundary.
+  The GPU wins anyway because the workload is latency- and memory-bound rather
+  than FLOP-bound — which is also why `B=32` (2.34x) beats the 1.5x previously
+  recorded for the batch-1 estimator loop. Do not assume the ratio transfers to
+  a differently-shaped workload; measure it.
+
+**Logging a long run: use `python -u`.** Python block-buffers stdout when
+redirected, so a `nohup ... > run.log` shows *nothing* for minutes and leaves an
+empty file if the run dies. `PYTHONUNBUFFERED=1` / `-u` fixes it.
+
 ## Test suites
 
 | command | what it covers |
 |---|---|
-| `uv run pytest -q` | everything |
+| `uv run pytest -q` | everything (**run on CPU** — see above) |
 | `uv run pytest tests/inEKF -q` | gates G2–G5, the ported Java InEKF suite |
 | `uv run pytest tests/jointKF -q` | gates G6–G8, the ported Java joint-KF suite |
 | `uv run pytest tests/model -q` | the MJX model seam |

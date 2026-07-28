@@ -232,3 +232,46 @@ dropping below 1.0 is the signal to stop and look.
    it is a train/deploy difference.
 7. Pre-existing, unrelated: 6 `ruff` errors in `jointKF/measure.py` and two test
    files, including a full `L Σ Lᵀ` computed and discarded at `measure.py:326`.
+
+
+---
+
+## Addendum — GPU, and run 1 launched (2026-07-28 morning)
+
+**CUDA jaxlib installed** (`TERRAIN.md` Stage 0, previously deferred). Every
+number measured before this point in the project is a CPU number.
+
+Measured on the real training step, marginal cost isolated from setup:
+**GPU 0.188 s/step vs CPU 0.440** — 2.34x, so 10k steps is 31 min not 73.
+Validated with `tests/inEKF tests/contactnet tests/pipeline` on GPU: **312
+passed**. The full suite on GPU was abandoned at >20 min (vs 17.5 on CPU) and is
+documented in RUNNING.md as something not to do.
+
+**Run 1 is training.** Log: `artifacts/run1.log` (unbuffered — the first launch
+buffered and showed nothing for 3.5 minutes despite 70% GPU load).
+
+```bash
+JAX_PLATFORMS=cuda uv run python -u train_contactnet.py train \
+  --steps 10000 --objective l2_velocity --B 32 --no-remat \
+  --log-every 50 --out artifacts/contactnet_run1.npz --p0 artifacts/p0.npz
+```
+
+### What to check when you read it
+
+* **`applied_frac`** — if it drops below 1.00 the conditioning gate has started
+  rejecting updates. The proxy climbed 1.9 → 1.8e8 against `cond_max = 1e9` in
+  200 smoke steps, so 10k plausibly reaches it, and a gated update leaves
+  `(X, P)` bit-unchanged. This is the failure mode most likely to be silent.
+* **`nis_over_dof`** was ~0.02 by step 600 — expected under L2, not a fault. The
+  filter is becoming ~50x *under*confident as the optimiser inflates `Sigma` to
+  buy velocity accuracy. It is the concrete demonstration of why beta-NLL exists.
+* **The number is a plumbing proof, not a result.** See the dataset-narrowness
+  entry in PORT_NOTES: ~1 100 independent contact events, one command velocity,
+  and no friction randomisation, so quite possibly no slip in the data at all.
+
+### Next, in order
+
+1. Instrument the collector for slip and count events (~20 min).
+2. If slip is absent, add `geom_friction` randomisation, then collect the wider
+   `vx`/yaw sweep in one pass rather than twice.
+3. Decide beta-NLL's `beta` semantics before run 2 (PORT_NOTES).
