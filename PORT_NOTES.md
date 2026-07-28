@@ -2064,3 +2064,240 @@ Full suite **667 passed**, no failures — the ported Java tests are silent on t
 because they use isotropic noise, so they neither caught the bug nor object to
 the fix. Worth a dedicated anisotropic regression test when the ContactNet suite
 is written.
+
+---
+
+## ContactNet dataset + first real training runs (2026-07-28)
+
+`contactnet/dataset.py` (segment loader) and `train_contactnet.py` (entry point)
+close the gap between `sim/collect.py` and `contactnet/train.py`. Data collected:
+**12/12 rollouts**, 4 terrains x 3 seeds, 62 s each (2 s settle + 60 s walk at
+vx = 0.4), 1.5 GB. Every rollout stayed upright (tilt max 2.3-5.2 deg against the
+15 deg bound) and on the field; none were skipped. Cost 3.5-6.0 wall-s per
+simulated second, ~50 min total, matching the collector's own measurement.
+
+### Segment construction — the three decisions that were open
+
+**1. Windows are computed by a global boxcar plus a gather, not per segment.**
+`features.window` is `boxcar(channels, stride)` then a strided gather. The boxcar
+is a cumulative sum, so running it on a 128-tick slice gives a *different* (and
+equally valid) float64 answer from running it on the full 62 000. Doing it once
+globally, at prepare time, makes a segment's windows **bit-identical** to
+`features.window(...)[t0:t0+L]` and turns the whole per-segment path into one
+`np.take`. That equality is the loader's strongest oracle
+(`test_segment_windows_are_bit_identical_to_features_window`) and it is only
+available because of this ordering.
+
+**2. `state0`'s contact anchors come from the FK at the FILTERED `q̂`, not truth
+`q`.** `R, v, p` are ground truth at the start tick; the anchors are
+`d_i = R_true · y_i(q̂) + p_true` with `y_i` evaluated at `inputs.joint.q` — the
+same vector the filter measures against on tick 1 — so the first contact residual
+is exactly zero. Seeding from truth `q` instead injects the filter-vs-truth joint
+offset as a step at tick 1, which is the failure `init_fused_carry` already
+documents for the ankles. Note `truth["q"]` does not even carry the off-path
+ankles, so the truth-`q` option is not fully available.
+
+The joint KF is **not** reseeded. It ran continuously through collection and its
+outputs are frozen into `inputs`; there is nothing to reseed.
+
+**3. `P0` is measured, not chosen.** Seeding a mid-trajectory segment with the
+diffuse `initial_covariance = 1.0` prior would put `NIS/dof` on a ramp from ~0
+that has nothing to do with the network. `dataset.measure_p0` instead runs the
+InEKF alone over 3 000 ticks of recorded input under *training* conventions
+(`contact_chol` frozen at the constant, `contact_meas_chol = 0`) and takes the
+converged `P`. On `flat/seed0`:
+
+    diag(R) = [6.90e-5, 6.91e-5, 1.000]     yaw at the prior — unobservable, correct
+    diag(v) = [7.6e-4, 7.6e-4, 2.2e-4]      ~2.8 cm/s
+    diag(p) = diag(d) = 0.34 (all six)      absolute position unobservable; only p − d is
+    eigenvalues in [4.2e-10, 1.03]
+
+The `diag(p) == diag(d)` coincidence is the structure, not a bug: the InEKF sees
+only `R̂ᵀ(d − p)`, so the common mode is untouched by the contact update. A
+converged Joseph-form `P` also lands a hair below zero in its smallest direction
+(measured -1.4e-16 against a spectral radius of 1.0); `measure_p0` nudges that to
+strictly PD and raises only if the violation exceeds `1e-8 · λ_max`.
+
+A per-gait-phase `P0` would be more faithful (store `P` at every tick, 111 MB per
+rollout) and is the obvious refinement if the seeding transient shows up.
+
+### Normalization — the `floored` gate passes clean
+
+Fit over the pooled post-warm-up region of all 12 rollouts: **1 104 000 samples**
+(12 x 46 000 ticks x 2 contacts). **`floored` is empty.** The failure this gate
+exists to catch — a standing-only calibration set flooring `base_gyro_y/z` and
+`base_accel_x` — does not occur here, and by a wide margin: the closest channel to
+its floor is `base_gyro_x` at std 9.6e-2 against a 3.0e-3 floor (32x), and
+`base_accel_x` sits at 0.87 against 4.5e-2 (19x). Physical spot-checks all land:
+`base_accel_z` mean **9.807** (specific force at rest), `p_bc_z` mean
+**-0.866 m** (foot below the pelvis), `q_knee_y` **0.99 rad** against
+`tau_knee_y` **-57.6 N·m**.
+
+### `B` — the last §0 open number
+
+Measured with `train_contactnet.py measure-b`: one subprocess per point (because
+`ru_maxrss` is a high-water mark that cannot be reset), and an **ahead-of-time
+compile** so XLA's own peak is a separate column from the gradient's. 20 CPU
+cores, L = 128, 4 rollouts resident.
+
+| B | remat | compile Δ [MB] | exec Δ [MB] | peak [MB] | compile [s] | step [s] |
+|---:|---|---:|---:|---:|---:|---:|
+| 8 | on | 732 | -13 | 2521 | 24.4 | 0.20 |
+| 8 | off | 464 | 24 | 2232 | 16.5 | 0.13 |
+| 16 | on | 717 | 35 | 2545 | 24.7 | 0.38 |
+| 16 | off | 468 | 101 | 2386 | 17.3 | 0.24 |
+| 32 | on | 753 | 135 | 2729 | 24.6 | 0.63 |
+| 32 | off | 471 | 242 | 2541 | 16.8 | 0.44 |
+| 64 | on | 718 | 305 | 3037 | 24.8 | 1.23 |
+| 64 | off | 472 | 533 | 2933 | 16.9 | 0.84 |
+
+**`B` is not memory-bound at this `L`.** Forward+backward costs ~8.5 MB per unit
+`B` without remat, ~5.7 with; B = 64 peaks at 2.9 GB of a 94 GB machine, and the
+largest single allocation in the whole process is the XLA *compiler*, not the
+gradient. That was not the expected answer — the prior was that BPTT through 128
+InEKF ticks would be the constraint. It is not, because the scan carry is a
+15x15 covariance and the network runs *outside* the scan, batched over the whole
+time axis at once (`rollout.contact_factors`).
+
+`remat` does exactly what it advertises (43% less execution memory at B = 64) but
+costs +250 MB of compile-time peak and **+47% step time**, so at L = 128 on CPU it
+is a net loss. Gradients are identical with it on or off (max abs difference
+4.4e-11 against a gradient norm of 0.915, i.e. 4.8e-11 relative) — it is purely a
+space/time trade, as it should be.
+
+**Recommendation: `B = 32`, `remat = False`.** 0.44 s/step -> 10 000 steps in
+~75 min. 32 is ~2.7 segments per rollout; beyond that the extra segments come
+from trajectories already in the batch, and with only 12 independent trajectories
+the effective sample size grows far slower than `B`. Revisit remat when `B·L`
+passes ~10 000 tick-segments, or on GPU where device memory binds.
+
+`config.py` ships `remat = True` and `B = 32`. The `B` default is confirmed by
+measurement; the `remat` default is worth flipping for the CPU run — not changed
+here, since `config.py` is committed.
+
+### §4 init parity holds end to end on real feature windows
+
+`train_contactnet.py check-init`, B = 32 real segments:
+
+    Σ_C − σ₀²I           1.3e-23 absolute, 1.3e-15 relative
+    trunk gradient       exactly 0.0 (bitwise, every leaf)
+    head gradient        max 0.949
+    windows finite       True
+
+So the zero-head initialisation survives normalization, windowing, the vmapped
+network, the 128-tick scan and the reverse pass. `d_in = H·F = 50 · 24 = 1200`
+and the network is **374 790 params** — worth noting that `network_plan.md` §8's
+"~240K budget" was written against `H = 20` (`d_in = 480`, ~190K) and is stale
+since the "H is not 20" entry raised `H` to 50. The budget question is a Java
+inference-cost question, so it should be re-decided rather than silently exceeded.
+
+### First real training runs — two findings the fixture could not show
+
+**Run A — `l2_velocity`, 200 steps, B = 32, remat on, lr 1e-4, warmup 100.**
+140 s. Gradients finite and nonzero throughout, no NaN, `applied_frac = 1.000`
+every step, params moved (trunk max |Δ| 9.9e-3, head.b 1.3e-2).
+
+| step | loss | ‖g‖ | NIS/dof | cond proxy |
+|---:|---:|---:|---:|---:|
+| 0 | 4.82e-2 | 4.30 | 1.456 | 1.9 |
+| 32 | 3.34e-2 | 1.04e-1 | 1.004 | 4.5e4 |
+| 96 | 3.76e-2 | 2.48e-1 | 0.955 | 2.4e5 |
+| 128 | 3.92e-3 | 1.03 | 0.224 | 1.1e7 |
+| 160 | 8.40e-4 | 9.47e-2 | 0.0436 | 1.8e8 |
+| 199 | 5.90e-4 | 1.21e-1 | 0.0422 | 1.8e8 |
+
+The loss falls **82x** and is monotone in trend, as expected for L2. But
+**`NIS/dof` moves away from 1, not toward it** — 1.46 down through 1.0 to 0.034,
+i.e. the trained filter is ~30x under-confident. This is not a bug: it is the
+pathology `losses.l2_velocity`'s own docstring names. Σ reaches an L2 loss only
+through the Kalman gain, so only *ratios* of Σ are constrained and the absolute
+scale is free; the optimiser buys velocity accuracy by inflating Σ_C. So under L2
+the success criterion is the loss, and `nis_over_dof` is a diagnostic, not a
+target. Two consequences worth acting on before a 10 000-step run:
+
+* the conditioning proxy climbs 1.9 -> 1.8e8 over 200 steps against
+  `cond_max = 1e9`. It has not gated an update yet (`applied_frac` never left
+  1.000), but the trend is toward the gate, and a gated update means the loss is
+  scoring innovations that never corrected anything. Watch `applied_frac`.
+* the big move lands right after the warmup ends at step 100, which is the
+  expected schedule shape, not instability.
+
+**Run B — `beta_nll`, 150 steps, B = 32, warmup 20. It does not train at all.**
+Loss stuck at -2.2e-19, ‖g‖ at 5e-18, `NIS/dof` flat at 1.3-1.6 for 150 steps.
+Diagnosed:
+
+    nis        mean 11.80  (dof 6 -> NIS/dof 1.97)
+    logdet_S   mean -93.42   (per-axis innovation std ~ 4.2e-4 m)
+    exp(0.5 · logdet_S)      5.2e-21     <- the detached beta weight
+    nll = 0.5(nis + logdet)  -40.8
+    loss = weight · nll      -2.1e-19
+
+**This is a units problem, not an optimisation problem.** `S` is in m², the
+contact block is 6-dimensional, and `det(S)` is therefore ~`σ¹²` — at
+`σ ≈ 4e-4 m` that is `e^-93`. `beta_nll_from_diagnostics`'s detached weight
+`exp(β · logdet S)` underflows to 5e-21, and while Adam is scale-invariant in
+principle, `optax.adamw`'s default `eps = 1e-8` is nine orders above `sqrt(v)`
+here, so `m/(sqrt(v) + eps)` collapses and the updates are ~1e-13.
+
+The fixture did not show this because its `S` was ~1e5 times larger
+(`P = 0.1·I`), giving `logdet ≈ -14` and a workable weight of ~1e-3 — which is
+why the earlier "15810 -> 472" fixture result cannot be carried over.
+
+Two fixes, neither applied here because `losses.py`/`train.py` are committed:
+
+1. **Offset the detached weight by a constant**:
+   `weight = stop_grad(exp(β·(logdet_S − c)))` with `c` a fixed reference (e.g.
+   -93.4, the value at init). Because the weight is detached and `c` is constant,
+   this multiplies the whole loss by `exp(-βc)` and is therefore a **pure loss
+   rescale** — mathematically the same optimisation, lifted off the floor. One
+   line, provably harmless, and it is the recommended fix.
+2. Shrink `optax.adamw(eps=...)` to ~1e-30. Fixes the symptom, leaves the loss
+   denormal-adjacent, and does nothing about `float64` headroom if `L` grows.
+
+A third option worth considering separately: Seitzer's β-NLL is defined
+per-dimension (`stop_grad(σ_i^{2β})` per output), where the exponent does not
+scale with the measurement dimension. The multivariate `det^β` generalisation
+used here makes the weight scale as `σ^{2kβ}`, which is what makes `k = 6` fatal.
+
+### Deliberate deviations, recorded
+
+* **The stance/swing `contact_chol` freeze cuts both ways.** Freezing it at the
+  *stance* value (trap: it must be frozen, or the network gets a free ground-truth
+  contact flag) also means the process model insists a swinging foot is
+  world-static, so ContactNet must reject swing through the *measurement*
+  covariance — the lever `inEKF/filter.py`'s DECISION note argues is the wrong one
+  for contact condition. This is coherent only if the deployed filter also drops
+  the heuristic swing inflation, which PORT_NOTES already lists as "a candidate
+  for removal once the learned path is trained". If it is kept at deploy, the two
+  mechanisms double-count. Decide this before run 2.
+* **The gravity reference cold-starts every segment.** `make_segment_loss` calls
+  `inEKF.filter.init_carry`, which returns an *unseeded* `GravityRef`, so each
+  128-tick segment re-seeds the complementary filter from its first accelerometer
+  sample rather than inheriting the converged direction a continuously-running
+  filter would have. With `reference_tau = 5 s` against a 0.128 s segment, the
+  reference barely moves within a segment, so the effect is a constant offset in
+  the leveling residual rather than a transient — but it is a train/deploy
+  difference and it lives in a committed module.
+* **Segment starts skip `warmup + (H-1)·stride` ticks.** The lead-in term is
+  strictly unnecessary as implemented — channels are windowed over the *full*
+  stream, so windows at `warmup + 0` are real rather than boxcar-clamped — but it
+  costs 0.9% of the usable starts and removes the question. 545 772 legal starts
+  remain over 12 rollouts.
+* **`rollout_paths` is structural, not name-based** (regression): the first
+  training run wrote its checkpoint into `data/`, and a glob-based loader promoted
+  it to a rollout. It now checks for the `sensors.encoders` key in the archive
+  directory. Training artifacts go to `artifacts/` (gitignored).
+
+### Verification
+
+`tests/contactnet/test_dataset.py`: 17 tests, no MJX (rollouts are fabricated in
+`collect.save_rollout`'s own format; `measure_p0` runs against the analytic
+kinematics fixture from `tests/inEKF/test_filter.py`). **Mutation-tested: 16
+mutants applied to `dataset.py`, 16 killed** — dropped `swapaxes`, stride ignored
+in the window indices, segment slice off by one, `contact_chol` not overwritten,
+`contact_chol` frozen at the swing value instead, lead-in dropped, warm-up
+dropped, iid rollout draw instead of a permutation, tiled starts instead of
+random, warm-up ignored in the normalization fit, `normalize.apply` skipped,
+contacts not rotated into world, `v` seeded from the wrong tick, `measure_p0`
+keeping the sim `contact_chol`, boxcar dropped, and the name-based
+`rollout_paths`. Full suite **704 passed**.

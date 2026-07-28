@@ -468,25 +468,89 @@ thing (`inEKF/filter.py`, "Two contact covariance sockets"; `PORT_NOTES.md`):
 ContactNet feeds `contact_meas_chol`. Zeros there reproduce the pre-ContactNet
 filter bit-for-bit, which is what `pipeline/main_estimator.py` passes today.
 
-**Driving a run.**
+### Driving a run — `train_contactnet.py`
 
-```python
-from invariant_estimation.contactnet.network import init
-from invariant_estimation.contactnet.rollout import make_batch_loss
-from invariant_estimation.contactnet.train import train
+From nothing to a trained network is four commands; only the first is slow.
 
-params = init(jax.random.key(0), d_in=H * F, widths=(256, 256),
-              sigma_0=SIGMA_0, eps=EPS)
-batch_loss = make_batch_loss(ekf, kinematics, EPS, beta=0.5,
-                             objective="beta_nll")     # or "l2_velocity"
-params, opt_state, history = train(params, batch_loss, batches,
-                                   dof=3 * n_contacts)
+```bash
+uv run python -m invariant_estimation.sim.collect --seconds 60 --seeds 0 1 2  # ~50 min, 1.5 GB
+uv run python train_contactnet.py cache        # ~25 min: MJX features -> data/cache/ (23 MB each)
+uv run python train_contactnet.py norm         # seconds: freezes data/norm_constants.npz
+uv run python train_contactnet.py train --steps 10000 --objective l2_velocity \
+    --B 32 --no-remat --out artifacts/contactnet_run1.npz --p0 artifacts/p0.npz
 ```
 
-`batches` yields `rollout.Segment` pytrees with a leading batch axis. Hold
-`contact_chol` at a **constant** during training so the network cannot lean on
-the sim's swing/stance oracle (`sim/sensors.py` switches it 1e-4 ↔ 1e1 from a
-contact detector).
+`cache` and `norm` are idempotent and are re-run automatically by `train` when
+their artifacts are missing, so once the data exists **the real run is the last
+command alone** (≈75 min for 10 000 steps at B=32 on 20 CPU cores). `--force`
+rebuilds them. Two more modes:
+
+```bash
+uv run python train_contactnet.py check-init   # the §4 init-parity properties, on real windows
+uv run python train_contactnet.py measure-b    # peak RSS vs B, remat on/off (subprocess per point)
+```
+
+**Pass structure** (`contactnet/dataset.py`). Only pass 1 needs MJX:
+
+| pass | what | cost |
+|---|---|---|
+| `cache` | `features.make_contact_channels` + contact FK over each rollout → `(T, N_c, F)` and `(T, N_c, 3)` | ~2 min/rollout, 23 MB each |
+| `norm` | pools every rollout's post-warm-up region → `normalize.NormConstants` | seconds |
+| `prepare` | normalize + global boxcar, per-rollout, in NumPy | ~10 s/rollout, ~210 MB resident each |
+
+Segments are then pure indexing. A segment's windows are **bit-identical** to
+`features.window` over the whole rollout, sliced — the boxcar is done once
+globally so only a gather remains (`test_segment_windows_are_bit_identical_to_features_window`).
+
+**What the loader guarantees**, each with a mutation-checked test:
+
+* `inputs.contact_chol` is overwritten with `ContactNetConfig.contact_chol_const`.
+  The sim switches it 1e-4 ↔ 1e1 off a contact detector (`sim/sensors.py`) and
+  keeping it would hand the network a free ground-truth stance flag.
+* Segment starts avoid the 16 000-tick warm-up **and** the following
+  `(H-1)·stride = 392` ticks. 545 772 legal starts over 12 rollouts.
+* Batches are drawn from a fresh permutation of the rollouts each step, so a
+  batch touches `min(B, n_rollouts)` distinct trajectories. Starts are uniform
+  random inside a rollout, never tiled.
+* `state0` is `truth.R/v/p` at the start tick, with contact anchors
+  `d = R_true·y(q̂) + p_true` from the FK at the **recorded filter** `q̂` — so the
+  first contact residual is exactly zero. The joint KF is *not* reseeded: it ran
+  continuously and its outputs are frozen into `inputs`.
+* `P0` is **measured**, not chosen: `dataset.measure_p0` runs the InEKF alone over
+  3 000 ticks of recorded input under training conventions and takes the converged
+  covariance. Measured on `flat/seed0`:
+  `diag(R) = [6.9e-5, 6.9e-5, 1.0]` (yaw unobservable, as it must be),
+  `diag(v) = 7.6e-4`, `diag(p) = diag(d) = 0.34` (absolute position unobservable;
+  only `p − d` is). At that seed the pre-ContactNet filter starts at
+  `NIS/dof = 1.46`, i.e. already nearly calibrated.
+
+### Sizing `B` — measured, not guessed
+
+`measure-b`, 20 CPU cores, L = 128, ahead-of-time compile so XLA's own peak is a
+separate column:
+
+| B | remat | compile Δ [MB] | exec Δ [MB] | process peak [MB] | compile [s] | step [s] |
+|---:|---|---:|---:|---:|---:|---:|
+| 8 | on | 732 | -13 | 2521 | 24.4 | 0.20 |
+| 8 | off | 464 | 24 | 2232 | 16.5 | 0.13 |
+| 16 | on | 717 | 35 | 2545 | 24.7 | 0.38 |
+| 16 | off | 468 | 101 | 2386 | 17.3 | 0.24 |
+| 32 | on | 753 | 135 | 2729 | 24.6 | 0.63 |
+| 32 | off | 471 | 242 | 2541 | 16.8 | 0.44 |
+| 64 | on | 718 | 305 | 3037 | 24.8 | 1.23 |
+| 64 | off | 472 | 533 | 2933 | 16.9 | 0.84 |
+
+Read it as: **`B` is not memory-bound at this `L`.** The forward+backward costs
+~8.5 MB per unit of `B` without remat and ~5.7 with; even B = 64 peaks at 2.9 GB
+of a 94 GB machine, and the largest single allocation is the XLA *compiler*, not
+the gradient. `remat` does what it claims (43% less execution memory at B = 64)
+but costs +250 MB of compile and **+47% step time**, so on CPU at L = 128 it is a
+net loss. Gradients are identical either way (checked: 4.8e-11 relative).
+
+**Use `B = 32, --no-remat`.** 0.44 s/step, and 32 is ~2.7 segments per rollout —
+past that the extra segments are drawn from trajectories already in the batch and
+buy less than they cost. Turn `remat` back on when `B·L` grows past ~10 000
+tick-segments or on a GPU, where device memory is the binding constraint.
 
 ### Collecting the training data (`sim/collect.py`)
 
@@ -533,6 +597,25 @@ over the whole time axis — it needs ~38 GB on a 62 s rollout, so use
 * The **first optimiser step is a no-op** (`init_value=0.0` ⇒ `lr(0) == 0`), and
   the second moves the head only (the §4 zero-init head makes the trunk gradient
   exactly zero until the head is nonzero). Not a broken loop.
+
+### Two things measured on the REAL model that the fixture did not show
+
+Both from the first 200-step run (2026-07-28; `PORT_NOTES.md`, "First real
+ContactNet runs"), and both change how you read a run:
+
+* **β-NLL does not train on the real model as written.** `S` is in m² and the
+  contact block is 6-dimensional, so `logdet S ≈ -93` and the detached β-weight
+  `exp(β·logdet S)` is **5.2e-21**. `‖g‖` lands at 5e-18, which AdamW's
+  `eps = 1e-8` divides into oblivion: 150 steps moved nothing (`NIS/dof` flat at
+  1.3–1.6). This is a units problem, not a gradient problem — the fix is to
+  offset the *detached* weight by a constant (a pure loss rescale) or to shrink
+  Adam's `eps`. **Do not read a flat β-NLL run as "converged".**
+* **Under L2, `NIS/dof` moves away from 1, not toward it.** Measured 1.46 → 0.034
+  while the loss fell 82x. `losses.l2_velocity` says exactly why: Σ reaches the
+  loss only through the Kalman gain, so only *ratios* are constrained and the
+  network is free to inflate the absolute scale. Expected, and the reason β-NLL
+  exists — but it means the L2 baseline's success criterion is the **loss**, and
+  its `NIS/dof` should be logged as a diagnostic, not a target.
 
 ## Documentation
 

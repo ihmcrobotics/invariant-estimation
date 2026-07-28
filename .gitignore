@@ -228,3 +228,6 @@ experiments/sim_runs/*.npz
 
 # ContactNet training data (regenerate with `python -m invariant_estimation.sim.collect`)
 data/
+
+# ContactNet training checkpoints / measured P0 (regenerate with `train_contactnet.py train`)
+artifacts/
