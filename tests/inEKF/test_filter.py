@@ -26,6 +26,9 @@ import pytest
 
 from invariant_estimation.inEKF import ekf as ekf_mod
 from invariant_estimation.inEKF import state as s
+from invariant_estimation.inEKF.contact import digest, reconstruct_cov
+from invariant_estimation.inEKF.correct import innovation, linear_update, measurement_noise
+from invariant_estimation.inEKF.propagate import propagate
 from invariant_estimation.inEKF.filter import (
     ContactFrames,
     InEKFInputs,
@@ -446,3 +449,75 @@ def test_joint_outputs_do_not_reach_the_propagation():
 
     assert jnp.array_equal(predicted.P, predicted_loud.P)
     assert jnp.array_equal(predicted.as_matrix, predicted_loud.as_matrix)
+
+
+def test_contact_measurement_noise_is_rotated_to_world():
+    """`S` must use `R̂ (J Σ_q Jᵀ + Σ_C) R̂ᵀ`, not the body-frame noise.
+
+    `innovation` returns a WORLD-frame residual (`R̄y − (d̄−p̄)`), while `Np` and
+    `Σ_C` are body-frame, so the conjugation is required for `S = H P Hᵀ + N` to
+    be frame-consistent. It was missing until 2026-07-28.
+
+    This test exists because **no other test in the suite can see the bug**: every
+    contact-update test uses isotropic noise, and `R̂(σ²I)R̂ᵀ = σ²I` exactly, so
+    the buggy and correct paths agree to ~1e-21 there. 653 tests passed over it.
+    The noise here is deliberately ANISOTROPIC -- diag(1e-3, 1e-3, 1e-8), the
+    "slides along the surface but not through it" case that is ContactNet's whole
+    justification (see filter.py's DECISION note).
+
+    Checked on the POSTERIOR STATE, not on `logdet S`. `logdet S` is the obvious
+    observable and it is useless here: with the fixture's isotropic `P = 0.1·I`,
+    `H P Hᵀ` is `M ⊗ I₃`, which commutes with the per-contact rotation `I_N ⊗ R̂`,
+    so `det(S)` is invariant under the conjugation and a test built on it passes
+    against the bug. The correction itself is not invariant.
+
+    The unconjugated form is kept as a NEGATIVE control -- a test asserting only
+    the positive would also pass on a filter that conjugated twice, or by the
+    wrong rotation.
+    """
+    rng = np.random.default_rng(11)
+    ekf, state, kinematics = _setup(rng)
+    assert jnp.linalg.norm(state.R - jnp.eye(3)) > 0.5, "need a non-identity R̂ to see it"
+
+    slip = jnp.diag(jnp.array([1.0e-3, 1.0e-3, 1.0e-8]))
+    # Large raw gyro closes the quasi-static gate, so the gravity update that
+    # follows the contact update in `step` is masked out and leaves (X, P)
+    # bit-unchanged. Without this the gravity correction dominates the base
+    # position and the comparison below is noise -- an earlier version of this
+    # test passed against a mutant with the conjugation removed for exactly that
+    # reason.
+    spin = jnp.array([0.0, 0.0, 5.0])
+    inputs = _inputs(rng, omega=spin,
+                     contact_meas_chol=jnp.tile(jnp.linalg.cholesky(slip),
+                                                (N_CONTACTS, 1, 1)))
+
+    step = make_step(ekf, kinematics)
+    carry, out = step(init_carry(state), inputs)
+    assert float(out.quasi_static) == 0.0, "gravity gate must be shut for this test"
+
+    # Reproduce the contact update both ways and see which one `step` matches.
+    prior = propagate(state, inputs.omega, inputs.accel,
+                      digest(inputs.contact_chol, ekf.params), ekf.params)
+    frames = kinematics(inputs.joint.q, inputs.joint.q_dot)
+    body = (contact_position_noise(frames.J, inputs.joint.sigma_q)
+            + reconstruct_cov(inputs.contact_meas_chol))
+    world = jnp.einsum("ij,njk,lk->nil", prior.R, body, prior.R)
+    nu = innovation(prior, frames.y)
+
+    def posterior(N):
+        st, _ = linear_update(prior, ekf.params.H, nu, measurement_noise(N))
+        return np.asarray(st.p)
+
+    p_world, p_body = posterior(world), posterior(body)
+    sep = np.max(np.abs(p_world - p_body))
+    assert sep > 1e-9, "the two paths are indistinguishable here -- degenerate test"
+
+    got = np.asarray(carry.state.p)
+    d_world = np.max(np.abs(got - p_world))
+    d_body = np.max(np.abs(got - p_body))
+    assert d_world < 1e-12, (
+        f"step's posterior does not match the world-frame update ({d_world:.3e}); "
+        f"separation between the two candidate paths is {sep:.3e}")
+    assert d_body > 1e-9, (
+        "step's posterior also matches the UNCONJUGATED update -- "
+        "the frame conjugation is missing or the test is degenerate")
