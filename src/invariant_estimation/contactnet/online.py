@@ -158,16 +158,23 @@ def make_provider(subchain, base_imu: int, kinematics, cfg: ContactNetConfig,
     The deployment seam: one tick of sensors in, the ``(N_c, 3, 3)`` Cholesky
     factor `InEKFInputs.contact_meas_chol` wants out.
 
-    Before the buffer is full this returns the analytic ``sigma_0 * I`` — the
-    network's own initialization, and the value under which
-    `dataset.measure_p0` and every pre-ContactNet test were taken, so the
-    warm-up period reproduces the shipped filter rather than an arbitrary guess.
+    Before the buffer is full this returns **zeros**, which is exactly what
+    `pipeline.main_estimator._boundary` passes in the analytic filter and what
+    `dataset.measure_p0` ran under.  So the warm-up reproduces the
+    pre-ContactNet filter bit-for-bit rather than approximating it -- a property
+    worth having, because the warm-up is the one window where the network's
+    output would be built on padded history it never saw.
+
+    ``sigma_0 * I`` would be the other defensible choice (the network's own
+    initialization, hence continuous with what it emits once ready), but the
+    discontinuity either way is ~1e-8 m^2 against ``N = J Sigma_q J^T`` =
+    1.26e-5, three orders below, so bit-exactness with the shipped filter wins.
+
     The fallback is a `jnp.where`, not a branch, so the graph stays constant (I7).
     """
     feats = make_online_features(subchain, base_imu, kinematics, cfg, constants)
     n_c = jnp.asarray(subchain).shape[0]
-    fallback = jnp.broadcast_to(
-        cfg.sigma_0 * jnp.eye(3, dtype=jnp.float64), (n_c, 3, 3))
+    fallback = jnp.zeros((n_c, 3, 3), dtype=jnp.float64)
 
     def step(state: OnlineState, sensors):
         state, win, ready = feats(state, sensors)

@@ -166,12 +166,14 @@ def test_online_window_matches_the_offline_window(fitted):
 
 
 def test_warmup_emits_the_analytic_fallback_not_a_garbage_window(fitted):
-    r"""Before the buffer fills, the provider returns ``sigma_0 * I`` exactly.
+    r"""Before the buffer fills, the provider returns **zeros** exactly.
 
-    The warm-up window is built on zero-padded history, which is a region of
-    input space the network never saw.  Emitting its output would be a silent
-    transient at every filter start.  Kills: a provider that runs the network
-    regardless of `ready`.
+    Zeros is what `pipeline.main_estimator._boundary` passes in the analytic
+    filter, so the warm-up reproduces the pre-ContactNet filter bit-for-bit. The
+    warm-up window is built on zero-padded history — a region of input space the
+    network never saw — so emitting its output would be a silent transient at
+    every filter start.  Kills: a provider that runs the network regardless of
+    `ready`.
     """
     cfg, sensors, chan, nc = fitted
     params = network.init(jax.random.PRNGKey(0), cfg.d_in, cfg.widths,
@@ -184,7 +186,7 @@ def test_warmup_emits_the_analytic_fallback_not_a_garbage_window(fitted):
     step = online.make_provider(SUBCHAIN, BASE_IMU, _kinematics, cfg, nc, params)
     st = online.init_state(cfg, N_C)
     span = online.span_ticks(cfg)
-    want = cfg.sigma_0 * np.eye(3)
+    want = np.zeros((3, 3))
 
     out = []
     for k in range(span + 5):

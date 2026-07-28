@@ -59,6 +59,7 @@ Frames — THREE of them, kept distinct (guide §G9.3; the real-Alex trap)
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Callable, NamedTuple, Sequence
 
@@ -367,6 +368,18 @@ class FusedEstimator:
     aux_encoder_var: np.ndarray   # (n_u,) their encoder position variance
     aux_qd_var: float             # their velocity variance (config `sigma_qd_unfiltered`)
 
+    contactnet: "ContactNetSeam | None" = None
+    """The learned contact measurement noise, or `None` for the analytic filter.
+
+    `None` is the default and reproduces the pre-ContactNet filter bit-for-bit —
+    `contact_meas_chol` stays zero and the fused carry stays the 2-tuple
+    `(jkf_carry, inekf_carry)` every existing caller and test expects.
+
+    When set, the carry gains a third slot holding the provider's ring buffer and
+    `contact_meas_chol` comes from `contactnet.step`.  Attach one with
+    `with_contactnet`.
+    """
+
     @property
     def n_joints(self) -> int:
         return self.build.n_joints
@@ -587,6 +600,55 @@ def _make_contact_kinematics(
 # The fused scan body
 # ---------------------------------------------------------------------------
 
+class ContactNetSeam(NamedTuple):
+    """A trained ContactNet, reduced to what `fused_step` needs.
+
+    `step` is `contactnet.online.make_provider`'s return value:
+    ``(state, sensors) -> (state, contact_meas_chol)``, fixed-shape and
+    branch-free so the fused graph stays constant (I7).  `init` builds the
+    ring-buffer carry.
+    """
+    step: Callable
+    init: Callable
+
+
+def with_contactnet(fused: FusedEstimator, params, cfg, constants,
+                    subchain) -> FusedEstimator:
+    r"""Attach a trained ContactNet to a built estimator.
+
+    Everything the provider needs that the estimator already knows — the contact
+    kinematics and the base-IMU ordinal — is taken from `fused`, so the two
+    cannot disagree about which IMU or which FK the features were built on.  That
+    matters: the network was trained on `features.make_contact_channels` closed
+    over exactly these, and a mismatch would silently move the input
+    distribution rather than raise.
+
+    Parameters
+    ----------
+    params : contactnet.network.ContactNetParams
+        Trained weights (`contactnet.train.load_params`).
+    cfg : contactnet.config.ContactNetConfig
+        Must be the config the weights were trained under — `H`, `stride` and
+        `F` define the window geometry the weights expect.
+    constants : contactnet.normalize.NormConstants
+        The **frozen** training constants.  Re-fitting on deployment data would
+        shift the input distribution; `data/norm_constants.npz` is the artifact.
+    subchain : (N_c, J_sub) int array
+        From `contactnet.features.build_subchain_indices`.
+    """
+    from ..contactnet import online as cn_online
+
+    n_c = np.asarray(subchain).shape[0]
+    if n_c != fused.n_contacts:
+        raise ValueError(
+            f"subchain has {n_c} contacts but the estimator has "
+            f"{fused.n_contacts}; they index the same slots and must agree")
+    step = cn_online.make_provider(subchain, fused.base_imu, fused.kinematics,
+                                   cfg, constants, params)
+    return dataclasses.replace(fused, contactnet=ContactNetSeam(
+        step=step, init=lambda: cn_online.init_state(cfg, n_c)))
+
+
 def make_fused_step(fused: FusedEstimator) -> Callable:
     """Build the jitted `lax.scan` body `fused_step(carry, sensors)`.
 
@@ -609,8 +671,16 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
                        if fused.n_aux else None)
     aux_qd_var = fused.aux_qd_var
 
+    contactnet = fused.contactnet
+
     def fused_step(carry, sensors: FusedSensors):
-        jkf_carry, inekf_carry = carry
+        # The third slot exists only when a ContactNet is attached, so the
+        # analytic filter's carry stays exactly `(jkf, inekf)`.
+        if contactnet is None:
+            jkf_carry, inekf_carry = carry
+            cn_state = None
+        else:
+            jkf_carry, inekf_carry, cn_state = carry
 
         # -- (a) MJX eval at the PREVIOUS q̂ (the EKF linearisation point) -------
         # One position-level FK pass; R_rel is derived from site rotations rather
@@ -643,6 +713,14 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
             contact_meas_var, aux_encoder_var, aux_qd_var,
         )
 
+        # ContactNet reads RAW sensors only — never `bias`, `q_hat` or any other
+        # joint-KF output (CLAUDE.md §7: `Features` carries sensor history, no
+        # filter mean states).  Running it here rather than inside `_boundary`
+        # keeps that visible.
+        if contactnet is not None:
+            cn_state, meas_chol = contactnet.step(cn_state, sensors)
+            inekf_inputs = inekf_inputs._replace(contact_meas_chol=meas_chol)
+
         # -- (d/e) InEKF step --------------------------------------------------
         inekf_carry, inekf_out = inekf_step(inekf_carry, inekf_inputs)
 
@@ -652,7 +730,9 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
             jkf=jkf_diag, inekf=inekf_out,
             inekf_inputs=inekf_inputs,
         )
-        return (jkf_carry, inekf_carry), outputs
+        new_carry = ((jkf_carry, inekf_carry) if contactnet is None
+                     else (jkf_carry, inekf_carry, cn_state))
+        return new_carry, outputs
 
     return fused_step
 
@@ -729,7 +809,14 @@ def init_fused_carry(
     seed_gravity: bool = True,
     q0_unfiltered: Array | None = None,
 ):
-    """Seed `(jkf_carry, inekf_carry)` for a level, planted start.
+    """Seed the fused carry for a level, planted start.
+
+    `(jkf_carry, inekf_carry)`, or `(jkf_carry, inekf_carry, contactnet_state)`
+    when a ContactNet is attached (`with_contactnet`).  The ContactNet slot
+    starts empty: its provider emits the analytic ``sigma_0 * I`` until the ring
+    buffer holds a full window, so the first ~400 ticks reproduce the
+    pre-ContactNet filter exactly rather than running the network on padded
+    history it never saw.
 
     The InEKF contacts are seeded at the FK foot positions consistent with the
     initial base pose, so the first contact residual is exactly zero. The gravity
@@ -774,7 +861,9 @@ def init_fused_carry(
     # (identical jaxpr, different `Argument mapping`). Uniform commitment keeps the
     # jitted `fused_step` at a single compiled executable — the operational I7
     # property the G9 gate asserts.
-    return jax.device_put((jkf_carry, inekf_carry), jax.devices()[0])
+    carry = ((jkf_carry, inekf_carry) if fused.contactnet is None
+             else (jkf_carry, inekf_carry, fused.contactnet.init()))
+    return jax.device_put(carry, jax.devices()[0])
 
 
 def run_fused(fused: FusedEstimator, carry, sensors: FusedSensors):
