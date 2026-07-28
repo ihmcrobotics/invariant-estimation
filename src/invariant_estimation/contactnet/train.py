@@ -93,16 +93,18 @@ def make_train_step(batch_loss, tx, dof: int):
         Measurement dimension `3 * N_contacts`, for `nis_over_dof`.
     """
     @jax.jit
-    def train_step(params, opt_state, batch):
+    def train_step(params, opt_state, batch, carry0=None):
         #has_aux=True nests as ((loss, aux),grads)
-        (loss, aux), grads = jax.value_and_grad(batch_loss, has_aux=True)(params,batch)
+        (loss, aux), grads = jax.value_and_grad(batch_loss, has_aux=True)(
+            params, batch, carry0)
         grad_norm = optax.global_norm(grads)
 
         # AdamW needs `params`: decoupled decay is computed against them.
         updates, opt_state = tx.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
 
-        d = aux.contact_diagnostics
+        outputs, carry = aux
+        d = outputs.contact_diagnostics
         # Plain mean, never a NaN: a NaN reaching the *metrics* is a good thing
         # to see, but not something to use as noise.
         metrics = Metrics(
@@ -112,7 +114,7 @@ def make_train_step(batch_loss, tx, dof: int):
             applied_frac=jnp.mean(d.applied),
             cond_proxy_max=jnp.max(d.condition_proxy)
         )
-        return params, opt_state, metrics
+        return params, opt_state, metrics, carry
     return train_step
 
 def save_params(path: str, params: ContactNetParams) -> None:
@@ -135,8 +137,9 @@ def load_params(path: str, like: ContactNetParams) -> ContactNetParams:
 def train(
     params,
     batch_loss,
-    batches,
+    batches=None,
     *,
+    batcher=None,
     peak_lr=1e-4,
     total_steps=1000,
     warmup_steps=100,
@@ -146,23 +149,44 @@ def train(
     log_every=10
 ):
     """
-    Run the training loop over an iterable of batches.
+    Run the training loop.
 
-    `batches` yields `rollout.Segment` pytrees with a leading batch axis.
-    This module deliberately owns no data loading (belongs to `features.py` and a loader),
-    which is what lets the finite difference test drive a four-tick rollout without this.
+    Two modes, and the difference is the error distribution each segment starts from:
+
+    * ``batches`` — an iterable of `rollout.Segment` pytrees with a leading batch
+      axis, each re-seeded from ground truth (run 1).  This module deliberately
+      owns no data loading, which is what lets the finite-difference test drive a
+      four-tick rollout without any of it.
+    * ``batcher`` — a `dataset.ChainedBatcher`, which carries ``(X̂, P)`` between
+      steps so a segment starts wherever the filter actually got to.  This is the
+      default for run 2 onward; see dataset.py docstring (f) for why.
+
+    Exactly one of the two must be supplied.
     """
+    if (batches is None) == (batcher is None):
+        raise ValueError("supply exactly one of `batches` or `batcher`")
+
     tx = make_optimizer(peak_lr, total_steps, warmup_steps, max_norm, weight_decay)
     opt_state = tx.init(params)
     step = make_train_step(batch_loss, tx, dof)
 
-    history = []
-    for i, batch in enumerate(batches):
-        params, opt_state, metrics = step(params, opt_state, batch)
+    stream = (iter(batches) if batcher is None
+              else (batcher.batch() for _ in range(total_steps)))
+
+    history, reseeds = [], 0
+    for i, item in enumerate(stream):
+        if batcher is None:
+            batch, carry0 = item, None
+        else:
+            batch, carry0 = item
+        params, opt_state, metrics, carry = step(params, opt_state, batch, carry0)
+        if batcher is not None:
+            reseeds += batcher.update(carry)
         history.append(metrics)
         if log_every and i % log_every == 0:
             print(f"step {i:5d} loss {float(metrics.loss): .6e}"
                     f"|g| {float(metrics.grad_norm):.3e}"
                     f"NIS/dof {float(metrics.nis_over_dof):.3e}"
-                    f"applied {float(metrics.applied_frac):.2e}")
+                    f"applied {float(metrics.applied_frac):.2e}"
+                    + (f" reseeds {reseeds:4d}" if batcher is not None else ""))
     return params, opt_state, history

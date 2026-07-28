@@ -88,11 +88,72 @@ class ContactNetConfig:
     n_contacts: int = 2
     contact_chol_const: float = 1.0e-4
     """
-    Stance anchor proccess factor, held CONST during training run.
+    Stance anchor process factor used ONLY when `freeze_contact_chol` is set.
 
-    The sim switches this 1e-4 <-> 1e1 from a contact detector (`sim/sensors.py`),
-    freezing it removes that ground truth so the network cannot lean on the GT stance.
+    Kept so the run-1 configuration stays reproducible; see `freeze_contact_chol`
+    for why it is no longer the default.
     """
+
+    freeze_contact_chol: bool = False
+    """
+    Freeze the stance-anchor PROCESS socket at `contact_chol_const` (run-1 behaviour).
+
+    `False` is the default because freezing it was measured to be the primary
+    cause of run 1's collapse. `sim/sensors.py` drives `contact_chol` from
+    `ContactTrust` -- the Schmitt-trigger port of
+    `FootSwitchContactProbabilityProvider`, off normal force `f_n/(0.5 m g)` --
+    switching 1e-4 (stance) <-> 1e1 (swing). Freezing it at the STANCE value
+    pins swing feet as world-static, so the contact update fights a process model
+    that is wrong for half the gait.
+
+    Measured (`experiments/measure_tstar.py`, PORT_NOTES): at the 128 ms segment
+    horizon the frozen config is **10.2x worse** in body-frame velocity error
+    than not using contacts at all, and stays worse out to 4 s. With the recorded
+    value it is 0.92x at 128 ms and 0.16x at 4 s. The network's only defence
+    against the frozen version is `Sigma_C -> infinity`, which is exactly what
+    run 1 learned.
+
+    The original argument for freezing (`dataset.py` docstring (b)) was that the
+    recorded value would hand the network a free ground-truth contact flag. It
+    does not: **the network never sees `contact_chol`.** Its input is the 24
+    feature channels; `contact_chol` enters the *filter's process model* only, so
+    feeding the real value changes the filter ContactNet is differentiated
+    through, not the information ContactNet receives. It is also not ground
+    truth -- `ContactTrust` is a sensor-derived estimate, the same one the
+    deployed filter uses.
+
+    Freezing also fights `inEKF/filter.py`'s DECISION (theory doc S3.2): contact
+    condition belongs in the process noise, and the FK measurement is not wrong
+    during swing. The freeze removes the correct lever and asks the measurement
+    socket to compensate.
+    """
+
+    # chained segments (see `dataset.ChainedBatcher`)
+    warm_in_s: float = 2.0
+    """
+    Seconds a freshly seeded chain runs before its segments are trained on.
+
+    A chain is seeded from ground truth, so it starts at **zero** estimation
+    error -- a state the deployed filter is never in. Until the error grows to
+    its natural level the contact update has nothing to correct and the gradient
+    w.r.t. `Sigma_C` is meaningless (that is the run-1 failure).
+
+    2.0 s from `experiments/measure_tstar.py`: with the process socket correct,
+    the contact update is only 0.92x of dead reckoning at 128 ms but 0.72x by
+    2 s and 0.16x by 4 s. Two seconds is where it is clearly earning its keep
+    without spending most of the episode warming up.
+    """
+
+    episode_s: float = 20.0
+    """
+    Seconds a chain runs before being re-seeded from ground truth.
+
+    Bounds how far the filter may drift. CoCo-InEKF (arXiv 2605.15122) uses
+    T = 100 s (dancing) / 6 s (ground motions) for the same purpose. 20 s sits
+    well past `warm_in_s` while still re-seeding a couple of times per rollout
+    (~46 s usable), so no single chain dominates.
+    """
+
     remat: bool = True
 
     @property
@@ -219,6 +280,24 @@ class ContactNetConfig:
             )
         if self.n_contacts <= 0:
             raise ValueError(f"n_contacts must be positive, got {self.n_contacts}")
+        if self.warm_in_s < 0.0:
+            raise ValueError(f"warm_in_s must be >= 0, got {self.warm_in_s}")
+        if self.episode_s <= self.warm_in_s + self.L * self.dt:
+            # An episode that ends inside its own warm-in scores nothing, and the
+            # chain would re-seed forever without ever contributing a gradient.
+            raise ValueError(
+                f"episode_s ({self.episode_s}) must exceed warm_in_s "
+                f"({self.warm_in_s}) plus one segment ({self.L * self.dt}); "
+                f"otherwise no chain ever produces a trainable segment."
+            )
+
+    @property
+    def warm_in_ticks(self) -> int:
+        return int(round(self.warm_in_s / self.dt))
+
+    @property
+    def episode_ticks(self) -> int:
+        return int(round(self.episode_s / self.dt))
 
 
 

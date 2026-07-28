@@ -90,27 +90,58 @@ def make_segment_loss(ekf, kinematics, eps, beta = 0.5, objective="beta_nll", re
     if remat:
         step = jax.checkpoint(step, prevent_cse=False)
 
-    def segment_loss(params: ContactNetParams, segment: Segment):
+    def segment_loss(params: ContactNetParams, segment: Segment, carry0=None):
         # Network first, over the full segment - see `contact_factors`
         L_c = contact_factors(params, segment.windows, eps)
 
         # The one field ContactNet has - the inputs:
         inputs = segment.inputs._replace(contact_meas_chol=L_c)
 
-        _, outputs = jax.lax.scan(step, init_carry(segment.state0), inputs)
+        # `carry0=None` re-seeds from `segment.state0` (run-1 behaviour, and what
+        # the standalone tests use).  `ChainedBatcher` passes the previous
+        # segment's final carry instead, so the segment starts at the error the
+        # filter actually accumulated rather than at zero -- see dataset.py (f).
+        c0 = init_carry(segment.state0) if carry0 is None else carry0
+        carry, outputs = jax.lax.scan(step, c0, inputs)
 
         d = outputs.contact_diagnostics
         if objective == "beta_nll":
             per_tick = beta_nll_from_diagnostics(d.nis, d.logdet_S, beta)
-            return jnp.mean(per_tick), outputs #NOTE: mean handled outside of beta-NLL, inside of L2.
+            loss = jnp.mean(per_tick) #NOTE: mean handled outside of beta-NLL, inside of L2.
         else:
             # Body-frame, each side by its OWN attitude -- see `l2_velocity`.
-            per_tick = l2_velocity(
+            loss = l2_velocity(
                 outputs.state.v, outputs.state.R, segment.v_true, segment.R_true
             )
-            return per_tick, outputs
-    
+        return loss, (outputs, carry)
+
     return segment_loss
+
+
+def make_warm_in(ekf, kinematics, sigma_0: float):
+    r"""``(state0, inputs) -> carry``: run the filter forward without training on it.
+
+    `dataset.ChainedBatcher` uses this to grow a freshly seeded chain's error to
+    its natural level before the chain contributes a gradient.  ``Σ_C`` is held
+    at the network's initialization ``σ₀²I`` — exact at step 0, and an
+    approximation at later re-seeds that decays over an episode ten times longer
+    than the warm-in.
+
+    Built here rather than in `dataset` so that module keeps its "no MJX, no
+    estimator build" property.
+    """
+    step = make_step(ekf, kinematics)
+
+    @jax.jit
+    def warm_in(state0, inputs: InEKFInputs):
+        L_c = jnp.broadcast_to(
+            sigma_0 * jnp.eye(3, dtype=jnp.float64),
+            inputs.contact_meas_chol.shape)
+        carry, _ = jax.lax.scan(
+            step, init_carry(state0), inputs._replace(contact_meas_chol=L_c))
+        return carry
+
+    return warm_in
 
 def make_batch_loss(*args, **kwargs):
     """
@@ -123,8 +154,12 @@ def make_batch_loss(*args, **kwargs):
     """
     segment_loss = make_segment_loss(*args, **kwargs)
 
-    def batch_loss(params: ContactNetParams, batch: Segment):
-        losses, outputs = jax.vmap(segment_loss, in_axes=(None,0))(params, batch)
-        return jnp.mean(losses), outputs
+    def batch_loss(params: ContactNetParams, batch: Segment, carry0=None):
+        if carry0 is None:
+            losses, aux = jax.vmap(segment_loss, in_axes=(None, 0))(params, batch)
+        else:
+            losses, aux = jax.vmap(segment_loss, in_axes=(None, 0, 0))(
+                params, batch, carry0)
+        return jnp.mean(losses), aux
 
     return batch_loss

@@ -220,46 +220,62 @@ def test_valid_start_range_excludes_warmup_and_lead_in(preps):
 
 
 # ---------------------------------------------------------------------------
-# The ground-truth leak (trap 2)
+# The process socket (`contact_chol`)
 # ---------------------------------------------------------------------------
 
-def test_segment_contact_chol_is_constant_and_the_rollout_is_not(preps):
-    r"""The sim's stance/swing switch must be *destroyed*, and must have been there.
+def test_segment_contact_chol_passes_the_stance_swing_switch_through(preps):
+    r"""By default the sim's stance/swing switch must reach the filter INTACT.
 
-    Two halves, and the second is what makes the first mean anything: the source
-    rollout's `contact_chol` really does switch 1e-4 ↔ 1e1 inside the segment's
-    tick range, and the segment's is a single constant times I₃.  Asserting only
-    the constancy would pass against a rollout that never switched.
+    Freezing it at the stance value pins swing feet as world-static and was
+    measured at 10.2× worse body-frame velocity error than not using contacts at
+    all (`experiments/measure_tstar.py`); it is what made run 1 drive
+    ``Σ_C → ∞``.  Two halves, and the second is what makes the first mean
+    anything: the source really does switch 1e-4 ↔ 1e1 inside the segment's tick
+    range, and the segment reproduces it elementwise.
     """
     cfg = _cfg()
+    assert not cfg.freeze_contact_chol, "pass-through must be the default"
     p = preps[0]
     t0 = (p.t_lo + p.t_hi) // 2
     src = p.inputs.contact_chol[t0:t0 + cfg.L]
     assert np.unique(np.round(src, 12)).size > 2, "fixture lost the stance/swing switch"
 
     seg = dataset.make_segment(p, t0, cfg, P0)
-    want = cfg.contact_chol_const * np.eye(3)
     assert seg.inputs.contact_chol.shape == (cfg.L, N_C, 3, 3)
-    assert np.array_equal(seg.inputs.contact_chol, np.broadcast_to(want, (cfg.L, N_C, 3, 3)))
-    # Information was really destroyed: at least one (tick, contact) inside the
-    # segment was SWING in the source and is stance-valued in the segment.  A
-    # loader that broadcast the segment's first tick would pass the equality
-    # above whenever the segment happened to start in stance; this does not.
+    assert np.array_equal(seg.inputs.contact_chol, src)
+    # Non-vacuity: a swing tick really is inside this segment and really is
+    # swing-valued afterwards.  Without this, a loader that froze everything at
+    # 1e1 would pass the equality above on an all-swing slice.
     swing = np.abs(src[:, :, 0, 0] - 1.0e1) < 1e-9
     assert swing.any(), "no swing tick inside the segment — the check is vacuous"
+    i, j = np.argwhere(swing)[0]
+    assert seg.inputs.contact_chol[i, j, 0, 0] == 1.0e1
+
+
+def test_freeze_contact_chol_restores_run1_behaviour(preps):
+    """The opt-in flag still destroys the switch, for the ablation."""
+    cfg = _cfg(freeze_contact_chol=True)
+    p = preps[0]
+    t0 = (p.t_lo + p.t_hi) // 2
+    src = p.inputs.contact_chol[t0:t0 + cfg.L]
+    swing = np.abs(src[:, :, 0, 0] - 1.0e1) < 1e-9
+    assert swing.any(), "no swing tick inside the segment — the check is vacuous"
+
+    seg = dataset.make_segment(p, t0, cfg, P0)
+    want = cfg.contact_chol_const * np.eye(3)
+    assert np.array_equal(seg.inputs.contact_chol,
+                          np.broadcast_to(want, (cfg.L, N_C, 3, 3)))
     i, j = np.argwhere(swing)[0]
     assert seg.inputs.contact_chol[i, j, 0, 0] == cfg.contact_chol_const
 
 
 def test_every_other_input_field_is_the_untouched_contiguous_slice(preps):
-    """No shuffling within a segment; nothing but `contact_chol` is rewritten."""
+    """No shuffling within a segment; by default NOTHING is rewritten."""
     cfg = _cfg()
     p = preps[0]
     t0 = p.t_lo + 11
     seg = dataset.make_segment(p, t0, cfg, P0)
     for name in InEKFInputs._fields:
-        if name == "contact_chol":
-            continue
         got, want = getattr(seg.inputs, name), getattr(p.inputs, name)
         for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want)):
             assert np.array_equal(np.asarray(g), np.asarray(w)[t0:t0 + cfg.L]), name

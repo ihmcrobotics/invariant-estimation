@@ -45,7 +45,8 @@ import numpy as np
 from invariant_estimation.contactnet import (
     dataset, features, network, normalize, train as train_mod)
 from invariant_estimation.contactnet.config import ContactNetConfig
-from invariant_estimation.contactnet.rollout import contact_factors, make_batch_loss
+from invariant_estimation.contactnet.rollout import (contact_factors, make_batch_loss,
+                                                     make_warm_in)
 from invariant_estimation.sim import collect
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -69,6 +70,9 @@ def make_config(args) -> ContactNetConfig:
         warmup_steps=min(args.warmup_steps, max(1, args.steps - 1)),
         total_steps=args.steps,
         remat=not args.no_remat,
+        freeze_contact_chol=getattr(args, "freeze_contact_chol", False),
+        warm_in_s=getattr(args, "warm_in_s", 2.0),
+        episode_s=getattr(args, "episode_s", 20.0),
     )
 
 
@@ -296,11 +300,23 @@ def run_train(args):
     for k, v in check_init(params, probe, cfg, batch_loss).items():
         print(f"  {k:26s} {v}")
 
+    if args.chained:
+        warm_in = make_warm_in(c.fused.ekf, c.fused.kinematics, cfg.sigma_0)
+        t_build = time.perf_counter()
+        batcher = dataset.ChainedBatcher(preps, cfg, P0, warm_in, seed=args.seed)
+        print(f"chains: {cfg.B} seeded + warmed in "
+              f"({cfg.warm_in_s:.1f}s each, episode {cfg.episode_s:.0f}s) "
+              f"in {time.perf_counter() - t_build:.0f}s")
+        src = dict(batcher=batcher)
+    else:
+        print("chains: DISABLED -- every segment re-seeded from truth (run-1 behaviour)")
+        src = dict(batches=dataset.batch_stream(preps, cfg, P0, steps=args.steps,
+                                                seed=args.seed))
+
     print(f"\ntraining {args.steps} steps, objective={cfg.objective}\n")
     t0 = time.perf_counter()
     params, _, history = train_mod.train(
-        params, batch_loss,
-        dataset.batch_stream(preps, cfg, P0, steps=args.steps, seed=args.seed),
+        params, batch_loss, **src,
         peak_lr=cfg.peak_lr, total_steps=cfg.total_steps, warmup_steps=cfg.warmup_steps,
         max_norm=cfg.max_norm, weight_decay=cfg.weight_decay, dof=cfg.dof,
         log_every=args.log_every)
@@ -361,6 +377,13 @@ def main():
     ap.add_argument("--lr", type=float, default=1.0e-4)
     ap.add_argument("--warmup-steps", type=int, default=100)
     ap.add_argument("--no-remat", action="store_true")
+    # Chained segments are the default (PORT_NOTES, run-1 root cause).  --no-chained
+    # restores run-1's per-segment truth re-seed for the ablation.
+    ap.add_argument("--no-chained", dest="chained", action="store_false", default=True)
+    ap.add_argument("--freeze-contact-chol", action="store_true",
+                    help="run-1 behaviour: pin the process socket at stance (10.2x worse)")
+    ap.add_argument("--warm-in-s", type=float, default=2.0)
+    ap.add_argument("--episode-s", type=float, default=20.0)
     ap.add_argument("--chunk", type=int, default=10_000)
     ap.add_argument("--fk-chunk", type=int, default=2_000)
     ap.add_argument("--batch-sizes", type=int, nargs="+", default=[8, 16, 32, 64])

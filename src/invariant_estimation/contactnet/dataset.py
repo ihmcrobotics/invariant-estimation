@@ -24,19 +24,25 @@ through `collect.contact_channels_chunked` (and `chunked_fk` for the contact FK,
 which has the same shape of problem).  This is why the cache exists at all: it
 converts a pass that cannot be run casually into one `np.load`.
 
-**(b) `inputs.contact_chol` carries the sim's stance/swing ground truth.**
-`sim.sensors.SimSensorReader` switches it ``1e-4 ↔ 1e1`` off a contact detector.
-A training segment that kept it would hand the network a free ground-truth
-contact flag and void the experiment, so `make_segment` overwrites the whole
-field with `ContactNetConfig.contact_chol_const`.  `_constant_contact_chol` is
-the only place that value is materialised, and
-``test_segment_contact_chol_is_constant_and_not_the_sim_truth`` asserts both
-that the segment is constant *and* that the source rollout was not.
+**(b) `inputs.contact_chol` is passed through, not frozen** (since 2026-07-28).
+`sim.sensors.SimSensorReader` switches it ``1e-4 ↔ 1e1`` off `ContactTrust` —
+the Schmitt-trigger port of `FootSwitchContactProbabilityProvider`, driven by
+normal force ``f_n/(0.5 m g)``, i.e. a *sensor-derived* estimate and not the
+sim's binary contact truth.
 
-Note what this does **not** do: the frozen value is the *stance* one, so during
-swing the process model insists a swinging foot is world-static.  That is the
-experiment, not an oversight — the swing/slip signal has to come out of
-ContactNet's measurement covariance, which is the only channel it owns.
+Run 1 froze it at the stance constant, on the argument that keeping it would
+hand the network a free ground-truth contact flag.  That argument does not hold:
+**the network never sees `contact_chol`.**  Its input is the 24 feature channels
+(`features.channel_names`); `contact_chol` enters the *filter's process model*
+only, so passing the real value changes the filter ContactNet is differentiated
+through, not the information ContactNet receives.
+
+The freeze was also measured to be the primary cause of run 1's collapse: at the
+stance value a *swinging* foot is pinned world-static, and the contact update
+then fights a process model wrong for half the gait — 10.2× worse in body-frame
+velocity error than not using contacts at all
+(`experiments/measure_tstar.py`).  `ContactNetConfig.freeze_contact_chol`
+restores the old behaviour for reproducibility and defaults to `False`.
 
 **(c) Warm-up and lead-in.**  `meta["warmup_ticks"]` (16 000, measured) is the
 joint-KF gyro-bias plateau: before it, ``Σ_q`` — hence the InEKF's contact
@@ -57,6 +63,19 @@ batches replay one trajectory in order.
 **(e) Ticks inside a segment are never shuffled.**  The segment is a trajectory:
 `rollout.make_segment_loss` scans the filter along it.  `make_segment` only ever
 slices contiguously.
+
+**(f) Segments are chained, not independently seeded** (since 2026-07-28).
+`ChainedBatcher` walks ``B`` filter chains through the rollouts in order,
+carrying ``(X̂, P)`` and the gravity reference from one segment into the next.
+`state0` below is therefore the *chain seed*, used at chain start and re-seed
+only — not once per segment.
+
+Run 1 re-seeded every segment from ground truth.  That is the force-teacher
+scheme CoCo-InEKF (arXiv 2605.15122, §III-B) reports degrades learning, and the
+reason is structural: a 128 ms segment starting at **zero** error gives the
+contact update nothing to correct, so the loss-minimising ``Σ_C`` is infinite.
+With the state carried, the error at a segment start is whatever the filter has
+actually accumulated, which is the deployment distribution.
 
 Seeding (`state0`)
 ------------------
@@ -372,8 +391,11 @@ def make_segment(prep: PreparedRollout, t0: int, cfg: ContactNetConfig,
     windows = np.swapaxes(windows, 1, 2)                          # (L, N_c, H, F)
 
     inputs = jax.tree.map(lambda a: np.asarray(a[sl]), prep.inputs)
-    inputs = inputs._replace(
-        contact_chol=_constant_contact_chol(cfg, cfg.L, prep.y_fk.shape[1]))
+    if cfg.freeze_contact_chol:
+        # Run-1 behaviour, retained only for reproducibility -- measured at 10.2x
+        # worse than not using contacts at all.  See `ContactNetConfig`.
+        inputs = inputs._replace(
+            contact_chol=_constant_contact_chol(cfg, cfg.L, prep.y_fk.shape[1]))
 
     R0, p0 = prep.R_true[t0], prep.p_true[t0]
     d0 = np.einsum("ij,kj->ki", R0, prep.y_fk[t0]) + p0[None, :]
@@ -413,10 +435,167 @@ def make_batch(preps: Sequence[PreparedRollout], picks: Sequence[tuple[int, int]
 
 def batch_stream(preps: Sequence[PreparedRollout], cfg: ContactNetConfig, P0: np.ndarray,
                  *, steps: int, seed: int = 0) -> Iterator[Segment]:
-    """`steps` batches of `cfg.B` segments, sampled as `sample_starts` describes."""
+    """`steps` batches of `cfg.B` segments, sampled as `sample_starts` describes.
+
+    Run-1 sampler: independent uniform starts, every segment re-seeded from
+    ground truth.  Superseded by `ChainedBatcher` (docstring (f)) and kept for
+    the ablation that shows the difference.
+    """
     rng = np.random.default_rng(seed)
     for _ in range(steps):
         yield make_batch(preps, sample_starts(rng, preps, cfg.B), cfg, P0)
+
+
+# ---------------------------------------------------------------------------
+# Chained segments — the deployment error distribution
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Chain:
+    """One filter chain: where it is, and how long it has been running."""
+    rollout: int
+    t: int                   # next segment start, in rollout ticks
+    ticks: int               # ticks since this chain was seeded
+    reseeds: int = 0
+
+
+class ChainedBatcher:
+    r"""``B`` filter chains walked through the rollouts in order, carrying ``(X̂, P)``.
+
+    Replaces `batch_stream`'s independent uniform starts.  The point is the
+    **error distribution at a segment start**: re-seeding from ground truth every
+    segment means every training sample begins at exactly zero error, and over a
+    128 ms horizon the loss-minimising ``Σ_C`` is then infinite (PORT_NOTES,
+    "Run 1 learned to switch the contact update OFF").  Carrying the state means
+    a segment starts wherever the filter actually got to.
+
+    Lifecycle of one chain:
+
+    1. **Seed** at a random legal start of a random rollout, from ground truth.
+    2. **Warm in** ``cfg.warm_in_ticks`` with the filter run forward but *not*
+       trained on, so the error grows to its natural level before the chain
+       contributes a gradient.
+    3. **Walk** forward ``cfg.L`` ticks per training step, carrying
+       ``(X̂, P, gravity_ref)`` between steps.
+    4. **Re-seed** on any of: the episode reaching ``cfg.episode_ticks``, the
+       cursor running past the rollout's usable end, or the carry going
+       non-finite (a diverged chain would otherwise poison every later step).
+
+    Warm-in runs at ``Σ_C = σ₀² I`` rather than at the current network output.
+    That is exact at step 0 and an approximation at later re-seeds; the
+    discrepancy decays over an episode 10× longer than the warm-in, and the
+    alternative (threading live params into the sampler) couples the data
+    pipeline to the optimiser for a second-order effect.
+
+    The carry is **detached** — chains provide an initial condition, not a
+    gradient path.  Truncated BPTT is the whole reason ``L`` bounds anything;
+    see `rollout.make_segment_loss`.
+
+    Trade-off worth naming: `batch_stream` spread each batch across rollouts on
+    purpose (docstring (d)).  A chain is pinned to one rollout for a whole
+    episode, so that decorrelation now comes from having ``B`` chains seeded
+    independently at different rollouts and phases, rather than from re-drawing
+    every step.  With ``B = 32`` over 12 rollouts that is ~2.7 chains per
+    rollout at unrelated gait phases.
+    """
+
+    def __init__(self, preps: Sequence[PreparedRollout], cfg: ContactNetConfig,
+                 P0: np.ndarray, warm_in_fn, *, seed: int = 0):
+        """
+        Parameters
+        ----------
+        warm_in_fn : callable
+            ``(state0, inputs) -> carry`` — runs the filter forward over the
+            warm-in slice and returns the final carry.  Injected rather than
+            built here so this module keeps its "no MJX, no estimator build"
+            property (module docstring, pass 3); `rollout.make_warm_in` supplies it.
+        """
+        if not preps:
+            raise ValueError("no prepared rollouts")
+        self.preps, self.cfg, self.P0 = list(preps), cfg, np.asarray(P0)
+        self._warm_in = warm_in_fn
+        self.rng = np.random.default_rng(seed)
+        self.chains: list[_Chain] = []
+        self.carries: list = []
+        for _ in range(cfg.B):
+            c, carry = self._seed()
+            self.chains.append(c)
+            self.carries.append(carry)
+
+    # -- internals ---------------------------------------------------------
+
+    def _span(self) -> int:
+        """Ticks a chain needs beyond its start: warm-in plus one segment."""
+        return self.cfg.warm_in_ticks + self.cfg.L
+
+    def _seed(self) -> tuple[_Chain, object]:
+        """Pick a rollout and start, seed from truth, and warm in."""
+        cfg = self.cfg
+        # Only rollouts with room for warm-in plus at least one scored segment.
+        room = [i for i, p in enumerate(self.preps)
+                if p.t_hi - p.t_lo >= self._span()]
+        if not room:
+            raise ValueError(
+                f"no rollout has room for warm_in_ticks + L = {self._span()} "
+                f"ticks; shorten warm_in_s or collect longer rollouts")
+        i = int(self.rng.choice(room))
+        p = self.preps[i]
+        t_seed = int(self.rng.integers(p.t_lo, p.t_hi - self._span() + 1))
+
+        state0 = make_segment(p, t_seed, cfg, self.P0).state0
+        warm = jax.tree.map(
+            lambda a: jnp.asarray(a[t_seed:t_seed + cfg.warm_in_ticks]), p.inputs)
+        if cfg.freeze_contact_chol:
+            warm = warm._replace(contact_chol=jnp.asarray(
+                _constant_contact_chol(cfg, cfg.warm_in_ticks, p.y_fk.shape[1])))
+        carry = self._warm_in(jax.tree.map(jnp.asarray, state0), warm)
+        return _Chain(rollout=i, t=t_seed + cfg.warm_in_ticks, ticks=cfg.warm_in_ticks), carry
+
+    def _needs_reseed(self, c: _Chain, carry) -> bool:
+        p = self.preps[c.rollout]
+        if c.t + self.cfg.L > p.t_hi:
+            return True
+        if c.ticks >= self.cfg.episode_ticks:
+            return True
+        # A diverged chain never recovers and would poison every later step.
+        return not bool(jnp.all(jnp.isfinite(carry.state.P))
+                        and jnp.all(jnp.isfinite(carry.state.v)))
+
+    # -- public ------------------------------------------------------------
+
+    def batch(self) -> tuple[Segment, object]:
+        """``(segment batched over B, carry batched over B)`` for one training step."""
+        segs = [make_segment(self.preps[c.rollout], c.t, self.cfg, self.P0)
+                for c in self.chains]
+        stacked = jax.tree.map(lambda *xs: np.stack(xs), *segs)
+        batch = jax.tree.map(lambda a: jnp.asarray(a, dtype=jnp.float64), stacked)
+        carry = jax.tree.map(lambda *xs: jnp.stack(xs), *self.carries)
+        return batch, jax.lax.stop_gradient(carry)
+
+    def update(self, carry_out) -> int:
+        """Store the step's final carries, advance cursors, re-seed as needed.
+
+        Returns the number of chains re-seeded, which `train` logs: a rate that
+        climbs mid-run means chains are diverging, not that episodes are ending.
+        """
+        n = len(self.chains)
+        per_chain = [jax.tree.map(lambda a, i=i: a[i], carry_out) for i in range(n)]
+        reseeded = 0
+        for b in range(n):
+            c = self.chains[b]
+            c.t += self.cfg.L
+            c.ticks += self.cfg.L
+            self.carries[b] = per_chain[b]
+            if self._needs_reseed(c, per_chain[b]):
+                self.chains[b], self.carries[b] = self._seed()
+                self.chains[b].reseeds = c.reseeds + 1
+                reseeded += 1
+        return reseeded
+
+    def stream(self, steps: int) -> Iterator[tuple[Segment, object]]:
+        """`steps` ``(batch, carry)`` pairs.  Caller must `update` between them."""
+        for _ in range(steps):
+            yield self.batch()
 
 
 # ---------------------------------------------------------------------------
