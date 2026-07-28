@@ -36,7 +36,8 @@ class ContactNetConfig:
     as described in PORT_NOTES.md
     """
     # architecture
-    H: int = 20 # history length per evaluation
+    H: int = 50 # history SAMPLES per evaluation (not span -- see `stride`)
+    stride: int = 8 # ticks between history samples; window spans (H-1)*stride+1
     widths: tuple[int, ...] = (256, 256) # trunk
     eps: float = 1.0e-6 # softplus floor on diag(L)
 
@@ -71,6 +72,17 @@ class ContactNetConfig:
         return self.F * self.H
 
     @property
+    def window_span_ticks(self) -> int:
+        """Ticks the history window reaches back over: ``(H-1)*stride + 1``.
+
+        This, not `H`, is the number to compare against the signal bandwidth.
+        Measured on the 2026-07-17 log, joint position has f99 = 1.10 Hz and
+        torque f99 = 4.25 Hz, so the span must cover a meaningful fraction of a
+        stride (5.47 s there) rather than a fraction of a millisecond.
+        """
+        return (self.H - 1) * self.stride + 1
+
+    @property
     def dof(self) -> int:
         """
         Contact measurement dimension. NIS ~ chi^2(dof), so a calibrated
@@ -83,6 +95,8 @@ class ContactNetConfig:
         # than a bad value coming in later by accident.
         if self.F <= 0 or self.H <= 0:
             raise ValueError(f"H and F must be positive, got H={self.H} and F={self.F}")
+        if self.stride < 1:
+            raise ValueError(f"stride must be >= 1, got {self.stride}")
         if not self.widths or any(w <= 0 for w in self.widths):
             raise ValueError(f"widths must be non-empty and positive, got {self.widths}")
         if not self.sigma_0 > self.eps:

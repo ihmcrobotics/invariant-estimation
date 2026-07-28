@@ -28,20 +28,27 @@ from jax import Array
 # Windowing (mechanical — oracle-tested)
 # ---------------------------------------------------------------------------
 
-def window_indices(T: int, H: int) -> Array:
+def window_indices(T: int, H: int, stride: int = 1) -> Array:
     r"""``(T, H)`` index matrix: row ``k`` holds the ticks feeding the window at ``k``.
 
-    ``idx[k, h] = k - (H - 1) + h``, so every row **ends** at ``k``.  Causality is
-    structural, not incidental: ``idx[k, h] <= k`` holds for every entry, and
-    ``tests/contactnet/test_features.py`` asserts exactly that.  A window that
-    peeks at ``k + 1`` trains beautifully and cannot be deployed, and nothing
-    anywhere raises — which is why it gets its own oracle.
+    ``idx[k, h] = k - (H - 1 - h)·stride``, so every row **ends** at ``k``.
+    Causality is structural, not incidental: ``idx[k, h] <= k`` holds for every
+    entry, and ``tests/contactnet/test_features.py`` asserts exactly that.  A
+    window that peeks at ``k + 1`` trains beautifully and cannot be deployed, and
+    nothing anywhere raises — which is why it gets its own oracle.
 
-    Lower-clamped at 0, so rows before ``H - 1`` repeat the earliest sample.
-    Prefer feeding ``H - 1`` ticks of lead-in and slicing them off afterwards:
-    clamping fabricates windows the network never encounters at deployment, and
-    it does so exactly where the filter state was freshly reseeded, so the two
-    artifacts compound.
+    ``stride`` spreads the window over ``(H-1)·stride + 1`` ticks without adding
+    samples.  This is not a shortcut: measured on the 2026-07-17 Alex log, joint
+    position has ``f99 = 1.10 Hz`` and torque ``f99 = 4.25 Hz``, so at 1 kHz a
+    consecutive-tick window is oversampled by ~200x and carries one value plus a
+    slope.  The sensors also update at 500 Hz behind a 2-tick hold, so
+    ``stride = 1`` literally repeats every second sample.  See PORT_NOTES.md.
+
+    Lower-clamped at 0, so early rows repeat the earliest sample.  Prefer feeding
+    ``(H - 1)·stride`` ticks of lead-in and slicing them off afterwards: clamping
+    fabricates windows the network never encounters at deployment, and it does so
+    exactly where the filter state was freshly reseeded, so the two artifacts
+    compound.
 
     Only the lower bound is clamped.  An upper clamp would *hide* a
     future-peeking bug rather than expose it — JAX silently clamps
@@ -53,19 +60,65 @@ def window_indices(T: int, H: int) -> Array:
     T : int
         Number of ticks.
     H : int
-        History length per evaluation.
+        History length per evaluation (sample count, not span).
+    stride : int
+        Tick spacing between consecutive history samples.
 
     Returns
     -------
     Array, shape (T, H)
     """
+    if stride < 1:
+        raise ValueError(f"stride must be >= 1, got {stride}")
     k = jnp.arange(T)[:, None]                      # (T, 1)
     h = jnp.arange(H)[None, :]                      # (1, H)
-    return jnp.maximum(k - (H - 1) + h, 0)
+    return jnp.maximum(k - (H - 1 - h) * stride, 0)
 
 
-def window(channels: Array, H: int) -> Array:
+def boxcar(x: Array, s: int) -> Array:
+    r"""Causal moving average over ``s`` ticks: ``out[k] = mean(x[k-s+1 … k])``.
+
+    The anti-alias filter for `window`'s ``stride``.  Subsampling every ``s``-th
+    tick folds everything above the new Nyquist back into band; on Alex's
+    accelerometer that is real foot-strike impact energy (~24% of its power sits
+    above 50 Hz, and walking carries 43x more of it than standing), so naive
+    subsampling would scatter impact energy across the low band **and** make the
+    result depend on where the sampling grid happens to land relative to the
+    impact — variance that looks like signal and does not reproduce between sim
+    and hardware.
+
+    A boxcar is crude as filters go, but its first null sits at ``f_s / s``,
+    which is exactly the new sample rate and therefore exactly where the most
+    damaging folding originates (content near ``f_s/s`` folds to near DC).  What
+    makes it the right choice over a real low-pass is that it carries **no
+    state**: nothing crosses the Java boundary (§7) but an ``s``-tap average,
+    where an IIR filter's state would have to be reproduced bit-for-bit in EJML.
+
+    Two free side effects: it attenuates sensor noise by ``sqrt(s)`` on channels
+    that had nothing above Nyquist to lose, and it makes the log's 500 Hz
+    2-tick sensor hold irrelevant.
+
+    Computed by cumulative sum, so cost is O(T) rather than O(T·s).  Early ticks
+    clamp by repeating ``x[0]``, matching `window_indices`.
+    """
+    if s < 1:
+        raise ValueError(f"boxcar width must be >= 1, got {s}")
+    if s == 1:
+        return x
+    pad = jnp.repeat(x[:1], s - 1, axis=0)
+    c = jnp.cumsum(jnp.concatenate([pad, x], axis=0), axis=0)
+    c = jnp.concatenate([jnp.zeros_like(c[:1]), c], axis=0)
+    return (c[s:] - c[:-s]) / s
+
+
+def window(channels: Array, H: int, stride: int = 1) -> Array:
     r"""``(T, N_c, F)`` per-tick channels → ``(T, N_c, H, F)`` windows.
+
+    Boxcar-averages over ``stride`` ticks, then gathers ``H`` samples spaced
+    ``stride`` apart.  The two go together: the average is the anti-alias filter
+    for the subsampling (see `boxcar`), so calling `window_indices` directly on
+    unsmoothed channels at ``stride > 1`` is the thing this function exists to
+    prevent.
 
     One gather on a constant-shape index matrix: jit-safe, no scan, and it lands
     directly in the layout `rollout.contact_factors` expects.
@@ -79,9 +132,12 @@ def window(channels: Array, H: int) -> Array:
     ----------
     channels : Array, shape (T, N_c, F)
         Per-tick, per-contact channels from `contact_channels`, already
-        normalized (see `feature_windows`).
+        normalized (see `make_feature_windows`).
     H : int
-        History length per evaluation.
+        History length per evaluation (sample count, not span).
+    stride : int
+        Tick spacing between history samples; the window spans
+        ``(H-1)·stride + 1`` ticks.
 
     Returns
     -------
@@ -89,9 +145,10 @@ def window(channels: Array, H: int) -> Array:
     """
     if channels.ndim != 3:
         raise ValueError(f"expected (T, N_c, F), got shape {channels.shape}")
-    idx = window_indices(channels.shape[0], H)      # (T, H)
-    gathered = channels[idx]                        # (T, H, N_c, F)
-    return jnp.swapaxes(gathered, 1, 2)             # (T, N_c, H, F)
+    smoothed = boxcar(channels, stride)
+    idx = window_indices(smoothed.shape[0], H, stride)   # (T, H)
+    gathered = smoothed[idx]                             # (T, H, N_c, F)
+    return jnp.swapaxes(gathered, 1, 2)                  # (T, N_c, H, F)
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +300,8 @@ def make_contact_channels(subchain, base_imu: int, kinematics, dt: float):
     return contact_channels
 
 
-def make_feature_windows(subchain, base_imu: int, kinematics, dt: float, H: int):
+def make_feature_windows(subchain, base_imu: int, kinematics, dt: float, H: int,
+                         stride: int = 1):
     r"""Factory → ``feature_windows(sensors) -> (T, N_c, H, F)``.
 
     Composes `make_contact_channels` with `window`, ready for
@@ -258,6 +316,6 @@ def make_feature_windows(subchain, base_imu: int, kinematics, dt: float, H: int)
     channels = make_contact_channels(subchain, base_imu, kinematics, dt)
 
     def feature_windows(sensors) -> Array:
-        return window(channels(sensors), H)
+        return window(channels(sensors), H, stride)
 
     return feature_windows

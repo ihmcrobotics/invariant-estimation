@@ -1782,3 +1782,148 @@ only the number needs fitting) or *commanded* (a controller output, which
 carries no sensor noise at all and would want a different treatment entirely).
 The Java/SCS2 side was not consulted; this is a deliberate placeholder chosen
 for speed, to be revisited if run 1 shows torque-driven pathologies.
+
+---
+
+## H is not 20 — the window span, measured against the 2026-07-17 log (2026-07-27)
+
+`network_plan.md` §3.1 carries `H = 20` from CoCo. At Alex's 1 kHz that is a
+**20 ms** window, and the log says that is degenerate. Analysis on
+`20260717_160126_Alex001UnifiedControlProcess` (walking window t = 200–220 s,
+read at stride 1), cross-checked through two independent readers — `ihmclog`
+and this repo's own `replay/logsource` — which agreed to within 0.1%.
+
+### Finding 1 — the log ticks at 1 kHz but the sensors update at 500 Hz
+
+Every channel shows *exactly* 50% consecutive-identical samples in a strict
+2-tick zero-order hold, and the phases are opposite: IMU latches on even ticks,
+joints on odd. A duplication bug cannot produce opposite phases.
+
+    gyroscope_pelvis_imuX      dup=0.5000   change-parity even=1.00
+    raw_q_LEFT_KNEE_Y          dup=0.5000   change-parity odd =1.00
+
+**True sensor Nyquist is 250 Hz, not 500.** And `stride = 1` literally repeats
+every second sample, so half of an `H = 20` window was duplicated values.
+
+### Finding 2 — the information is far below what a 20 ms window can see
+
+Power below 50 Hz, and the frequency containing 99% of it:
+
+| channel | below 50 Hz | f99 |
+|---|---|---|
+| joint position `q` | **100.000%** | **1.10 Hz** |
+| joint torque `tau` | 99.974% | 4.25 Hz |
+| gyro | 98.703% | 53.9 Hz |
+| **accel** | 76.279% | **155.6 Hz** |
+
+Stride fundamental is 0.183 Hz (5.47 s stride — slow treadmill walking, not the
+1–2 Hz one might assume). A direct shape analysis agrees: at `H = 20`, 1–2
+principal components explain 99% of an encoder window's variance, i.e. the
+window is one value plus a slope.
+
+The accelerometer is the sole exception and its content is real, not noise:
+band-limited above 50 Hz its envelope peaks at 5x the mean in the 800 ms after
+each double-support transition, and walking carries 43x more >50 Hz power than
+standing. That is foot-strike impact ringing.
+
+### The fix: same H, wider spacing — `H = 50, stride = 8`
+
+`H` was never the problem; the window's **span** was. 20 samples is ample for a
+1.1 Hz signal — they just have to be spread over a stride rather than crammed
+into 20 ms. `window_indices` gains a `stride`; the window now spans 393 ticks.
+
+Full-rate `H = 400` was measured and rejected. Benchmarked batch-1, 2 contacts,
+jitted and warmed:
+
+| H | stride | span | D_in | params | float64 | float32 |
+|---|---|---|---|---|---|---|
+| 20 | 20 | 380 ms | 480 | 190,470 | 0.116 ms | 0.072 ms |
+| **50** | **8** | **392 ms** | **1,200** | **374,790** | **0.132 ms** | **0.079 ms** |
+| 100 | 4 | 396 ms | 2,400 | 681,990 | 0.175 ms | 0.101 ms |
+| 400 | 1 | 399 ms | 9,600 | 2,525,190 | **1.779 ms** | 0.361 ms |
+
+`H = 400` exceeds the entire 1 kHz loop budget on its own. `H = 50` costs
++0.016 ms over `H = 20` — 14% more wall clock for 97% more parameters, because
+at this size the forward pass is dominated by dispatch and the fixed 256x256
+hidden layer, not the input layer. A MAC-proportional estimate predicted ~2x and
+was wrong; §8's ~240K parameter budget is exceeded (375K) but §8 says outright
+it is latency-bound, and the latency is fine.
+
+Caveat: this is XLA on CPU, not Java/EJML. The ratio is the transferable part,
+and even that is not guaranteed — EJML with preallocated buffers has less
+dispatch overhead and may be more MAC-bound. Re-measure at the §7 cross-language
+oracle before locking.
+
+### `boxcar` — the anti-alias filter, and why the obvious metric misleads
+
+Subsampling every 8th tick folds everything above the new 62.5 Hz Nyquist back
+into band. `window` therefore boxcar-averages over `stride` ticks first;
+`boxcar` and the strided gather are composed inside `window` so the two cannot
+be separated by accident.
+
+Measured on the log, with the error decomposed into the fold (out-of-band energy
+landing in band) and the droop (in-band attenuation):
+
+| channel | fold, naive | fold, boxcar | reduction | droop |
+|---|---|---|---|---|
+| accel X | 0.394 | 0.129 | **3.07x** | 0.366 |
+| accel Y | 0.277 | 0.107 | 2.58x | 0.375 |
+| accel Z | 0.249 | 0.096 | 2.61x | 0.455 |
+| gyro X | 0.0034 | 0.0015 | 2.34x | 0.011 |
+| tau KNEE_Y | 1.211 | 0.853 | 1.42x | 1.053 |
+
+**The decomposition is the point.** A first pass scored both methods by RMS
+distance from ideally-anti-alias-filtered decimation, and by that metric the
+boxcar looked *worse* (0.26–1.02x) — because it penalises passband droop equally
+with aliasing. They are not equivalent: droop is a deterministic linear
+distortion, identical in sim and on hardware, seen the same way at train and
+deploy. Folded energy is sampling-phase dependent, does not reproduce, and can
+mimic real low-frequency signal. The first metric answered the wrong question.
+
+A boxcar is crude, but its first null sits at `f_s / s` — exactly the new sample
+rate, and exactly where the most damaging folding originates. It was chosen over
+a real low-pass because it carries **no state**: nothing crosses the Java
+boundary (§7) but an `s`-tap average, where an IIR's state would have to be
+reproduced bit-for-bit in EJML. Free side effects: sensor noise down by `sqrt(s)`
+on channels with nothing above Nyquist to lose, and the 500 Hz 2-tick hold
+becomes irrelevant.
+
+What it does **not** do is preserve the >62.5 Hz impact energy — it removes it.
+What survives is the impact's low-frequency envelope, the deceleration bump
+carrying the momentum transfer (~76% of accel power). The structural ring is lost
+either way; naive subsampling does not keep it, it scrambles it.
+
+`stride = 1` is byte-identical to the pre-change behaviour (index matrix equal,
+`boxcar(x, 1) is x`), so this change is purely additive.
+
+### Deviation bookkeeping — forced vs optional
+
+Two deviations from `network_plan.md`, and they are not the same kind:
+
+* **Decimation is forced.** Copying CoCo's `H = 20` at Alex's rate would not
+  reproduce CoCo's experiment; it would run a different, degenerate one.
+* **An HF-energy channel is optional** and is therefore **deferred**, not
+  adopted. See below.
+
+### Deferred experiment 1 — high-frequency accel energy channels
+
+The energy the boxcar discards is recoverable as a slow channel, with no new
+machinery and no filter state:
+
+    hf     = x - boxcar(x, s)          # what the anti-alias filter removed
+    energy = boxcar(hf**2, s)          # its power, as a slow channel
+
+Applied to the 3 base accel axes: `F` 24 -> 27, `D_in` 1200 -> 1350, ~413K
+params, wall clock ~+0.003 ms. The uniform `(N_c, H, F)` layout is preserved, so
+`window`, the H-major flatten, `export.py` and the Java forward pass are all
+unchanged; only `channel_names()` grows.
+
+**Not in run 1, deliberately.** §9 step 8 is a reproduction whose job is to prove
+the BPTT plumbing, and a channel CoCo never had would make a disappointing result
+unattributable. Run it as a clean A/B after beta-NLL: same everything, +/-3
+channels, scored on NEES and velocity RMSE against the run-1 baseline.
+
+Limitation to state when it is run: an energy channel is rectified, so it carries
+how much HF content arrived and when, but not its spectral character. If slip and
+firm contact ring at different frequencies, per-band energies (3 bands x 3 axes)
+would be needed to separate them — same mechanism, more channels, still no state.
