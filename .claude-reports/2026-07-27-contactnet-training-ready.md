@@ -9,7 +9,31 @@ launched with one command in the morning. Not to train it.
 
 ## TL;DR for the morning
 
-*(filled in at the end — see "Status" below for the live picture)*
+**You can launch a real training run immediately:**
+
+```bash
+uv run python train_contactnet.py train --steps 10000 --objective l2_velocity \
+    --B 32 --no-remat --out artifacts/contactnet_run1.npz --p0 artifacts/p0.npz
+```
+
+~75 min. Data (1.5 GB, 12 rollouts), the frozen normalization constants, and the
+measured `P0` all already exist on disk.
+
+**Read these three before you do, in this order:**
+
+1. **A real filter bug was found and fixed** — the contact measurement noise was
+   never rotated to world. Invisible under isotropic noise (6.4e-22), a 2.7e-3
+   relative gain error under the anisotropy ContactNet exists to produce.
+   Training against the unfixed path would have been meaningless.
+2. **β-NLL does not train on the real model** — the detached weight is 5.2e-21
+   and AdamW's `eps` swallows it. Root cause is `det(S)^β` scaling as `σ^{2kβ}`.
+   Does not block run 1 (L2), must be decided before run 2. **Do not just patch
+   the magnitude** — the semantics are also wrong.
+3. **`nis_over_dof` moved away from 1** in the smoke train (1.46 → 0.034) and
+   that is correct behaviour under L2, not a failure. Explained below.
+
+Full suite **704 passed**. Everything committed locally on `contact-net`, nothing
+pushed. Theory PDF: `~/Documents/contactnet_theory.pdf` (21 pp).
 
 ---
 
@@ -20,10 +44,11 @@ launched with one command in the morning. Not to train it.
 | 0. Rates — sim to 1 kHz, stride from duration | ✅ done | `83ede89`, `e8a75df` |
 | 1. Terrain into library code, 64 m hfield | ✅ done | `c4f3f98` |
 | **Filter bug found and fixed** (frame conjugation) | ✅ done | `de73c49` |
-| 2. Collector | ⏳ in progress | — |
-| 3. Calibration (frozen norm constants) | ⏳ pending | — |
-| 4. Segmentation, B measurement, smoke train | ⏳ pending | — |
-| Theory PDF (`~/Documents`) | ✅ 19 pp, being amended | n/a |
+| Regression test for the filter bug | ✅ done | `61cd0b0` |
+| 2. Collector | ✅ done | `2e17add` |
+| 3. Calibration (frozen norm constants) | ✅ done, gate passed | `<dataset>` |
+| 4. Segmentation, B measurement, smoke train | ✅ done | `<dataset>` |
+| Theory PDF (`~/Documents`) | ✅ 21 pp | n/a |
 
 ---
 
@@ -131,3 +156,79 @@ to a test file that does not exist (now marked NOT YET WRITTEN).
 k=6 weights as `s³`, not the source formulation's per-dimension `s^0.5`, and
 `losses.py` has two entry points at different `k` where the same β means
 different things. Doesn't block run 1 (L2 baseline). Decide before run 2.
+
+
+---
+
+## Phases 2–4 — collector, calibration, dataset, smoke train
+
+### Measured numbers you asked for
+
+| quantity | value | how |
+|---|---|---|
+| Joint-KF warm-up | **16 000 ticks (16 s)** | 1 s bias drift < 5% of excursion, worst terrain |
+| `diag(Σ_q)` plateau | 3.2 s | the quantity that actually reaches the contact update |
+| Sim throughput | **3.2 wall-s per sim-s** | 20 cores, CPU-only jaxlib |
+| `B` | **32, no remat** | 0.44 s/step; not memory-bound |
+
+`B` is not memory-bound at all — ~8.5 MB per unit `B`, and `B = 64` peaks at
+2.9 GB of 94 GB. The largest allocation in the process is the **XLA compiler**,
+not the gradient, because the scan carry is a 15×15 covariance and the network
+runs *outside* the scan. remat saves 43% of execution memory at `B = 64` but
+costs +250 MB compile peak and **+47% step time**, so it is a net loss here.
+
+### Calibration gate: PASSED
+
+`floored` is **empty** over 1.104M pooled post-warm-up samples, by a wide margin
+(closest is `base_gyro_x` at 32× its floor). The standing-only failure this gate
+exists to catch does not occur on the gait-spanning set. Physical spot checks:
+`base_accel_z` 9.807, `p_bc_z` −0.866 m, `q_knee_y` 0.99 rad vs `tau_knee_y`
+−57.6 N·m.
+
+### Smoke train — passed, with one result that needs reading correctly
+
+200 steps, `l2_velocity`, `B = 32`: loss down **82×**, gradients finite and
+non-zero throughout, no NaN, `applied_frac = 1.000` every step.
+
+**§4 init parity held end-to-end on real feature windows**: `Σ_C − σ₀²I` =
+1.3e-15 relative, trunk gradient **exactly 0.0 bitwise** on every leaf, head
+gradient 0.949. That is the property the whole initialization design exists for,
+now verified through the real data pipeline rather than on synthetic input.
+
+**`nis_over_dof` went 1.46 → 0.034 — away from 1.** This is correct under L2 and
+was predicted: `losses.l2_velocity`'s own docstring says Σ reaches an L2 loss
+only through the Kalman gain, so only *ratios* are constrained and the optimiser
+buys accuracy by inflating absolute scale. Under L2 the loss is the criterion and
+NIS is a diagnostic. Closing that gap is precisely what β-NLL is for — which is
+why finding #2 above matters.
+
+**Watch this on the long run:** the conditioning proxy climbed 1.9 → 1.8e8 in 200
+steps against `cond_max = 1e9`. No update has been gated yet, but 10 000 steps
+will reach it, and a gated update leaves `(X, P)` unchanged — so `applied_frac`
+dropping below 1.0 is the signal to stop and look.
+
+---
+
+## Open items, ranked
+
+1. **β-NLL semantics** (above). Blocks run 2, not run 1.
+2. **Shin-IMU bias observability.** Six of eight IMU bias states converge to
+   0.007–0.025 rad/s of truth; `left/right_shin_imu` settle **0.21 rad/s off** —
+   5× the injected bias and 97% of the total error. Neither reaches the InEKF
+   (I1 takes the base IMU) nor ContactNet (raw gyro), so it does not block, but
+   it is a real joint-KF question.
+3. **`contact_chol` frozen at stance forces ContactNet to reject swing feet
+   through the measurement covariance**, which `inEKF/filter.py`'s DECISION note
+   argues is the wrong lever. Coherent only if the deployed filter also drops the
+   heuristic swing inflation — otherwise the two double-count at deploy.
+4. **`make_contact_channels` reaches 38 GB at T = 62 000.** Use
+   `collect.contact_channels_chunked`. Anything else running the feature path
+   over a full rollout needs the same treatment.
+5. **`network_plan.md` §8's ~240K parameter budget is stale** — at `H = 50`,
+   `d_in = 1200` gives 374 790 params. It is a Java inference-cost question, so
+   re-decide it rather than silently exceed it.
+6. `make_segment_loss` cold-starts the gravity reference each segment (τ = 5 s
+   against 0.128 s segments), so it is a constant offset, not a transient — but
+   it is a train/deploy difference.
+7. Pre-existing, unrelated: 6 `ruff` errors in `jointKF/measure.py` and two test
+   files, including a full `L Σ Lᵀ` computed and discarded at `measure.py:326`.

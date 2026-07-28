@@ -2301,3 +2301,69 @@ random, warm-up ignored in the normalization fit, `normalize.apply` skipped,
 contacts not rotated into world, `v` seeded from the wrong tick, `measure_p0`
 keeping the sim `contact_chol`, boxcar dropped, and the name-based
 `rollout_paths`. Full suite **704 passed**.
+
+---
+
+## β-NLL does not train on the real model — one root cause, found twice (2026-07-28)
+
+**Not fixed.** Run 1 is the L2 baseline (`config.objective` defaults to
+`l2_velocity`), so this does not block. It must be decided before run 2, and the
+decision is about *semantics*, not just about a magnitude.
+
+Two independent analyses tonight landed on the same place from opposite ends.
+
+### Symptom (measured on real data)
+
+A 150-step β-NLL run moved nothing: ‖g‖ = 5e-18, `nis_over_dof` flat at 1.3–1.6.
+
+`S` is in m² and the stacked contact block is 6-D, so on the real model
+`logdet S ≈ −93.4`, and the detached weight is
+
+    exp(β · logdet S) = exp(0.5 × −93.4) = 5.2e-21
+
+which AdamW's default `eps = 1e-8` then swallows whole. **A units problem, not an
+optimisation one.**
+
+Note this did *not* reproduce on the test fixture, whose `S` is ~1e5 larger — so
+the earlier fixture result recorded above ("15810 → 472") does **not** carry over
+to the real model. That is worth remembering generally: the fixture's scale is
+not Alex's.
+
+### Root cause (derived independently, while writing the theory document)
+
+Seitzer's β-NLL reweight is **per dimension** — each term carries its own
+`σ^{2β}`. `beta_nll_from_diagnostics` instead weights the whole joint NLL by
+`det(S)^β`, and for `S = s·I_k`:
+
+    det(S)^β = s^{k·β}
+
+So at `k = 3N = 6` and `β = 0.5` the weight scales as **`s³`**, where the source
+formulation intends `s^0.5`. Matching the paper's semantics needs
+`β_ours = β_paper / k ≈ 0.083`.
+
+**These are the same fact.** `σ^{2kβ}` is what makes the weight collapse to 1e-21
+at k = 6, *and* what makes `β = 0.5` mean something six times more aggressive
+than the number suggests. Fixing the magnitude without fixing the semantics
+leaves a knob whose label lies.
+
+### Consequences, in order of how much they should worry you
+
+1. `losses.py` has **two entry points at different k** — `beta_nll` (k = 3, one
+   contact) and `beta_nll_from_diagnostics` (k = 6, stacked). The same `β` means
+   different things in each. That is a trap for whoever tunes it.
+2. The weight is `det(S)^β`, so **small `S` ⇒ small weight**: the reweight
+   *down-weights the most overconfident ticks*, which is the wrong direction for
+   an estimator. At `s³` the effect is severe rather than marginal.
+
+### Options (decide, do not patch blindly)
+
+* **Offset the detached weight**: `stop_grad(exp(β·(logdet_S − c)))`. Since the
+  weight is detached and `c` constant, this is exactly a uniform loss rescale, so
+  the optimisation is mathematically identical and only the magnitude moves above
+  `eps`. Fixes the symptom; leaves the semantics wrong.
+* **`adamw(eps=1e-30)`** — same, cruder.
+* **Re-derive β per-dimension**, or set `β = β_paper / k`. Fixes the semantics.
+  Preferred, but changes what previously-recorded β numbers mean.
+
+Whichever is chosen, make the two entry points agree, and re-record any β result
+measured before the change.
