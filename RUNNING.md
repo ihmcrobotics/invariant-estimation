@@ -387,6 +387,11 @@ attitude, gyro, velocity, position drift, joint state) over the whole run and ov
 | `--stance-chol` / `--swing-chol` | the Σ_C factor for a trusted / airborne foot. The InEKF has **no contact mask**; contact condition rides entirely in Σ_C, so a swing foot needs a large factor or the filter keeps believing it is planted |
 | `--contact-meas-var` | flight's `1e-4` contact measurement-noise floor (port default 0) |
 | `--video walk.mp4` | record the run offscreen to H.264 (implies `--headless`, `--video-fps` / `--video-size` tune it) |
+| `--ghost [mode]` | draw a translucent robot at the estimated state: `full` (default) or `attitude`. Viewer only |
+| `--ghost-offset M` | displace the ghost sideways for side-by-side viewing instead of overlaid |
+| `--realtime` | run the estimator on its own thread. Viewer only; the estimate goes slightly stale |
+| `--max-backlog-ticks` | how far the estimator may fall behind before the sim thread waits (default 2). Samples are never dropped |
+| `--wasd` | use the standalone WASD window instead of the passive viewer |
 
 ### Recording a video
 
@@ -397,14 +402,14 @@ attitude, gyro, velocity, position drift, joint state) over the whole run and ov
 `MUJOCO_GL=glfw` if EGL is unavailable. Frame rate is capped by the 50 Hz control loop, so the
 default `--video-fps 50` is real time; `--video-size 1920x1080` is the largest the offscreen
 buffer is declared for (`<visual><global offwidth/offheight>` in `_add_scene_look`). Recording
-costs roughly 15 ms/tick on top of the ~35 ms control tick.
+costs roughly 15 ms/tick on top of the control tick (~17 ms on CPU — see the speed table below).
 
 The scene look — gradient skybox, blue checkered floor (0.5 m tiles, so a stride can be read off
 them), black robot, overhead light — lives in `run_policy._add_scene_look` and rides along with
 the visual meshes, so `--headless` runs without `--video` compile exactly the dynamics they did
 before: it adds no geom, mass or collision, only textures, materials and a light.
 
-**Measured, 30 s at vx = 0.6 (2026-07-26, `experiments/sim_runs/`).** It walks 19–20 m on its
+**Measured, 30 s at vx = 0.6 (2026-07-26).** It walks 19–20 m on its
 own estimate, and closing the loop costs essentially nothing — estimate-driven and truth-driven
 score the same, so the filter is not being destabilised by its own feedback:
 
@@ -416,13 +421,85 @@ score the same, so the filter is not being destabilised by its own feedback:
 
 \* the A/B and noise columns predate `--contact-fk measured`; rerun them for a like-for-like table.
 
-**Speed (CPU-only jaxlib, measured per tick, not inferred).** A control tick costs **~35 ms**
-against its 20 ms real-time budget while walking (~21 ms standing), so the viewer runs at roughly
-**0.6x speed** and a 30 s headless run takes ~1 min. Building the estimator and compiling the step
-costs ~55 s up front; `make_estimated_loop` compiles eagerly, so that is all paid before the first
-tick rather than as an 11 s freeze during it. `--est-every 4` runs the estimator once per control
-tick (50 Hz) instead of per physics step — about 1.6x faster, but tilt error degrades 0.81° → 2.0°,
-so it is a viewing convenience, not a setting to measure with.
+**Speed (measured per tick, not inferred — 2026-07-27).** This used to read "~35 ms per tick, so
+the viewer runs at ~0.6x". **That is fixed: the loop now keeps real time on CPU.** Pinning the
+ONNX session to one non-spinning thread (`run_policy._ort_session`) was the whole fix. ORT
+defaults to one intra-op thread per core *and spins* after each `Run`, so ~9 spinning threads
+were fighting XLA's own pool between control ticks. Interleaved A/B, same process, walking, with
+an offscreen render per tick:
+
+| ORT session | p50 | p90 | mean | vs real time |
+|---|---|---|---|---|
+| default (before) | 24.0 / 29.7 ms | 34.7 / 41.5 | 25.9 / 30.1 | 0.83x / 0.67x |
+| pinned, 1 thread, no spin | **17.8 / 16.1 ms** | 31.5 / 24.6 | 20.5 / 17.7 | **1.12x / 1.24x** |
+
+Building the estimator and compiling the step costs ~55 s up front; `make_estimated_loop` compiles
+eagerly, so that is paid before the first tick rather than as an 11 s freeze during it.
+`--est-every 4` runs the estimator once per control tick (50 Hz) instead of per physics step —
+about 1.6x faster, but tilt error degrades 0.81° → 2.0°, so it is a viewing convenience, not a
+setting to measure with.
+
+**GPU: it wins, which was not the expected answer.** `uv sync --extra gpu` installs a CUDA jaxlib
+alongside the CPU one; `jax.devices()[0]` then picks it up with no code change. Every reason to
+expect a *loss* still holds (batch size 1, no `vmap`, hundreds of tiny kernels, float64 at 1/64
+rate on a consumer card, a blocking host round-trip per tick) — and it is 1.5x faster anyway,
+with the error columns identical to three decimals. Measured on an RTX 4070 SUPER, 250 ticks at
+vx = 0.6, three interleaved repeats (`experiments/bench_estimator_device.py`):
+
+| device | build | p50 | xRT | tilt tail-RMS | drift |
+|---|---|---|---|---|---|
+| cpu | 54 s | 13.59–13.84 ms | 1.45–1.47x | 0.856° | 0.353 m |
+| gpu | 71 s | **8.93–9.05 ms** | **2.21–2.24x** | 0.856° | 0.353 m |
+
+Switch backends with the env var, never a flag — the backend must be chosen before `jax` is
+imported, and `run_estimator.py` imports the whole chain at module scope:
+
+```bash
+JAX_PLATFORMS=cpu  uv run python run_estimator.py --policy baseline    # force CPU
+JAX_PLATFORMS=cuda uv run pytest tests/sim -q                          # deliberate parity check
+uv run python experiments/bench_estimator_device.py --ticks 250        # re-run the A/B
+```
+
+The test suite is pinned to CPU by the repo-root `conftest.py`, so installing the extra cannot
+silently move MJX kinematics onto the GPU and shift every tolerance in `tests/sim`,
+`tests/pipeline` and `tests/replay`. (Checked: `tests/sim` + `tests/pipeline`, 61 tests, pass on
+CUDA too — the pin is precaution, not a workaround for a known failure.) Note `uv lock` resolves
+all extras, so `uv.lock` carries a large `nvidia-*` block even though a default `uv sync`
+downloads none of it.
+
+### Watching the estimate: the ghost, and `--realtime`
+
+```bash
+uv run python run_estimator.py --policy baseline --ghost              # translucent robot at the ESTIMATE
+uv run python run_estimator.py --policy baseline --ghost attitude     # pinned at true position
+uv run python run_estimator.py --policy baseline --ghost --ghost-offset 1.0   # side by side
+uv run python run_estimator.py --policy baseline --ghost --wasd       # WASD window instead
+uv run python run_estimator.py --policy baseline --realtime           # estimator on its own thread
+```
+
+`--ghost` draws a second, translucent robot at the estimated state — physics-free (a second
+`MjData`, `mj_kinematics` only, never `mj_step`ped; a test asserts `qpos` is bit-identical with
+the ghost on and off). Overlaid by default, so a good estimate hides inside the real robot and
+disagreement reads as a separating shadow; the known missing-touchdown-reseed drift shows up as
+the ghost sinking through the floor. Costs 0.08 ms/frame.
+
+Cycle **off → full → attitude** with the **keypad `*`** in the passive viewer, `g` typed at the
+terminal, or plain `G` in `--wasd`. (Letters cannot be viewer keys — MuJoCo reserves every one of
+A–Z for render toggles, hence the keypad.) `full` shows the whole estimated pose and is the honest
+view; `attitude` pins the pelvis at the true position so orientation error is visible without the
+ghost drifting off screen.
+
+`--realtime` moves the estimator to its own thread. It is **viewer-only and off by default**:
+`--headless --realtime` is a hard error, because the policy then reads a slightly stale estimate
+and the run is not reproducible. No sensor sample is ever dropped — when the estimator falls more
+than `--max-backlog-ticks` behind, the sim thread waits for it instead (back-pressure), which
+degrades to the old sub-real-time behaviour rather than silently changing the filter's input.
+
+Honest note on what it buys: **very little, now that the ORT fix landed.** Measured 0.97x headless
+and 1.03x with a render per tick — the sim thread no longer has a deficit to hide. The default
+`--max-backlog-ticks` is **2**, not the 5 originally planned: staleness tracks the allowed backlog
+almost exactly (age ≈ backlog + 1 ticks) and tilt error degrades sharply past ~3 —
+1 → +0.099°, 2 → +0.112°, 3 → +0.456°, 5 → +1.598° against the synchronous run.
 
 **How it is wired** (`src/invariant_estimation/sim/`): `sensors.py` adds real MuJoCo
 `gyro`/`accelerometer` sensors on the 8 estimator IMU sites (site frame = the estimator's

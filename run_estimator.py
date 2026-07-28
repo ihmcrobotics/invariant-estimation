@@ -14,10 +14,13 @@ is the arrangement on the real robot.
 Every run scores the estimate against the sim's own state (attitude, tilt-as-seen-by-the-policy,
 gyro, velocity, position drift, joint state) and can dump the full history to `.npz`.
 
-Speed (CPU-only jaxlib, measured): a control tick costs ~35 ms against its 20 ms real-time
-budget while walking and ~21 ms standing, so the viewer runs at roughly 0.6x speed. Building the
-estimator and compiling the step costs ~55 s up front — `make_estimated_loop` compiles eagerly
-(`EstimatorRuntime.warmup`) so that cost lands there and not as an 11 s freeze on the first tick.
+Speed (measured, 2026-07-27): a control tick costs ~17 ms against its 20 ms real-time budget while
+walking, so the loop KEEPS REAL TIME on CPU (~1.2x) and ~2.2x on GPU. It used to cost ~35 ms and
+run at 0.6x; pinning the ONNX session to one non-spinning thread (`run_policy._ort_session`) was
+the fix — ORT's default pool was fighting XLA's. Building the estimator and compiling the step
+costs ~55 s up front — `make_estimated_loop` compiles eagerly (`EstimatorRuntime.warmup`) so that
+cost lands there and not as an 11 s freeze on the first tick. See RUNNING.md for the A/B tables,
+`--ghost` for seeing the estimate, and `--realtime` for the (now largely unnecessary) threaded mode.
 
 Read `run_policy.py` first — the sim, the policy contract and every magic number live there.
 """
@@ -42,6 +45,8 @@ from invariant_estimation.sim.estimator_loop import (
     attitude_error_deg,
     tilt_error_deg,
 )
+from invariant_estimation.sim.estimator_thread import ThreadedEstimator
+from invariant_estimation.sim.ghost import Ghost
 from invariant_estimation.sim.sensors import IMUNoise, SimSensorReader
 
 # Terms the policy may take from the estimate. `base_ang_vel` and `projected_gravity` are the
@@ -64,7 +69,8 @@ class EstimatedLoop(rp.Loop):
     always exactly DECIMATION samples long, which keeps the scanned graph constant (I7).
     """
 
-    def __init__(self, m, policy, maps, *, fused, reader, sources=DEFAULT_SOURCES, est_every=1):
+    def __init__(self, m, policy, maps, *, fused, reader, sources=DEFAULT_SOURCES, est_every=1,
+                 threaded=False, max_backlog_ticks=2):
         super().__init__(m, policy, maps)
         self.reader = reader
         self.sources = tuple(sources)
@@ -85,12 +91,77 @@ class EstimatedLoop(rp.Loop):
         order = list(policy["order"])
         self.filtered_slots = np.array([order.index(n) for n in fused.build.joint_names])
         self.history = []
+        # Threading is OPT-IN and viewer-only. `run_headless` and every test keep the synchronous
+        # path, which is the one `test_sources_truth_bypasses_the_estimate` pins at atol=0.
+        self.threaded = bool(threaded)
+        self.te = None
+        self._max_backlog_ticks = int(max_backlog_ticks)
+        self._submitted = 0
 
     # -- one control tick ---------------------------------------------------
 
+    def start_thread(self):
+        """Hand the estimator to its own thread. Viewer entry points only; idempotent."""
+        if not self.threaded or self.te is not None:
+            return
+        self.te = ThreadedEstimator(self.rt, max_backlog_ticks=self._max_backlog_ticks)
+        # The priming batch is already exactly `substeps` long, so the first estimate is available
+        # synchronously and the policy never has to read a null one.
+        self.te.prime(self.batch, self.reader.truth(self.d))
+        self._submitted = len(self.batch)
+        self.batch = []
+
+    def stop_thread(self):
+        if self.te is not None:
+            self.te.stop()
+            self.te = None
+
+    def current_estimate(self):
+        """The estimate a viewer should draw: the published one when threaded, else the last."""
+        if self.te is not None:
+            pub = self.te.latest()
+            return None if pub is None else pub.est
+        return self.rt.last
+
     def control_tick(self):
+        if self.threaded and self.te is not None:
+            return self._tick_threaded()
+        return self._tick_sync()
+
+    def _tick_sync(self):
         est = self.rt.advance(self.batch)
         self.batch = []
+        self._act_on(est)
+        self._record(est)
+        for k in range(rp.DECIMATION):
+            mujoco.mj_step(self.m, self.d)
+            if (k + 1) % self.est_every == 0:
+                self.batch.append(self.reader.read(self.d))
+        self._ramp_t += rp.DECIMATION * rp.DT
+
+    def _tick_threaded(self):
+        """Same tick, except the estimate is whatever the worker has published most recently.
+
+        The estimate is therefore a few milliseconds STALE, which is the whole point: the sim
+        thread never waits on the filter. Sensor reading stays here -- `reader.read` advances the
+        contact-trust state machine and reads `MjData`, so it cannot move to the worker.
+        """
+        pub = self.te.latest()
+        self._act_on(pub.est)
+        # Scored against the truth PAIRED with that estimate, never the current MjData: the error
+        # of a 3-tick-old estimate against the present state is not the estimator's error.
+        self._record(pub.est, truth=pub.truth,
+                     age_ticks=(self._submitted - pub.seq) / self.rt.substeps)
+        for k in range(rp.DECIMATION):
+            mujoco.mj_step(self.m, self.d)
+            if (k + 1) % self.est_every == 0:
+                # Truth is snapshotted HERE, alongside the sensors it belongs with (~10 us).
+                self.te.submit(self.reader.read(self.d), self.reader.truth(self.d))
+                self._submitted += 1
+        self._ramp_t += rp.DECIMATION * rp.DT
+
+    def _act_on(self, est):
+        """Estimate -> observation overrides -> policy -> ctrl. Shared by both tick paths."""
         self.cmd[4] = self._height()
 
         overrides = {}
@@ -113,19 +184,15 @@ class EstimatedLoop(rp.Loop):
         self.d.ctrl[self.maps["ALL_AID"]] = self.maps["ALL_HOME"]
         self.d.ctrl[self.maps["AID"]] = self.maps["HOME"] + self.scale * self.last_action
 
-        self._record(est)
-        for k in range(rp.DECIMATION):
-            mujoco.mj_step(self.m, self.d)
-            if (k + 1) % self.est_every == 0:
-                self.batch.append(self.reader.read(self.d))
-        self._ramp_t += rp.DECIMATION * rp.DT
-
     # -- scoring ------------------------------------------------------------
 
-    def _record(self, est):
-        t = self.reader.truth(self.d)
+    def _record(self, est, truth=None, age_ticks=0.0):
+        # `truth=None` means "score against the present", which is correct only when the estimate
+        # was produced from the sensors of this very tick -- i.e. the synchronous path.
+        t = self.reader.truth(self.d) if truth is None else truth
         self.history.append({
             "t": self.d.time,
+            "age_ticks": float(age_ticks),
             "att_deg": attitude_error_deg(est.R, t["R"]),
             "tilt_deg": tilt_error_deg(est.R, t["R"]),
             "omega_err": np.linalg.norm(est.omega_body - t["omega"]),
@@ -148,10 +215,14 @@ class EstimatedLoop(rp.Loop):
 
     def est_status(self):
         h = self.history[-1]
+        # In threaded mode the age is the number worth watching: if it climbs, the estimator is
+        # not keeping up and back-pressure is about to start slowing the sim.
+        age = (f" age={h['age_ticks']:.1f}tk backlog={self.te.backlog}"
+               if self.te is not None else "")
         return (f"est: tilt_err={h['tilt_deg']:5.2f}deg att={h['att_deg']:5.2f}deg "
                 f"|dw|={h['omega_err']:.3f} (|w|={h['omega_norm']:.2f}) "
                 f"|dv|={h['v_err']:.3f} |dp|={h['p_err']:.3f} feet={h['trusted']:.0f} "
-                f"NIS={h['nis']:.1f}")
+                f"NIS={h['nis']:.1f}{age}")
 
 
 def summarise(history, tail_frac=0.5):
@@ -198,7 +269,8 @@ def print_summary(history):
 def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
                         noise=None, est_dt=None, contact_meas_var=0.0,
                         stance_chol=1.0e-4, swing_chol=1.0e1,
-                        contact_fk_unfiltered=True, est_every=1, verbose=True):
+                        contact_fk_unfiltered=True, est_every=1, verbose=True,
+                        threaded=False, max_backlog_ticks=2):
     t0 = time.time()
     policy = rp.load_policy(policy_name)
     m = rp.build_sim_model(policy, with_visuals=with_visuals, with_imu_sensors=True)
@@ -221,7 +293,8 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
               f"noise={'on' if noise else 'off'}; contact FK uses "
               f"{'MEASURED' if fused.n_aux else 'qpos0-pinned'} off-path joints")
     loop = EstimatedLoop(m, policy, maps, fused=fused, reader=reader, sources=sources,
-                         est_every=est_every)
+                         est_every=est_every, threaded=threaded,
+                         max_backlog_ticks=max_backlog_ticks)
     loop.rt.warmup(loop.batch)      # pay the ~11 s XLA compile here, not on the first tick
     if verbose:
         print(f"           built + compiled in {time.time() - t0:.1f}s")
@@ -277,22 +350,39 @@ def run_viewer(loop):
     pad = rp.Gamepad()
     print(f"  gamepad: {pad.name}\n{rp.GAMEPAD_HELP}" if pad.present
           else f"  no gamepad at {rp.JS_DEVICE}; use the keypad or the terminal\n{rp.KEYMAP_HELP}")
-    print("  NOTE: a control tick costs ~35 ms against its 20 ms budget on CPU, so the viewer "
-          "runs at roughly 0.6x speed.")
+    if loop.threaded:
+        print("  --realtime: the estimator runs on its own thread, so the viewer keeps real time "
+              "and the policy reads a slightly stale estimate (age is printed below).")
+    else:
+        print("  a control tick costs ~17 ms against its 20 ms budget on CPU (~9 ms on GPU), so "
+              "this keeps real time. --realtime threads the estimator but buys ~nothing now.")
+    if loop.ghost is not None:
+        print(f"  ghost: {loop.ghost.mode} (keypad * or terminal 'g' to cycle)")
+    loop.start_thread()
     rp.stdin_commands(loop)
-    with mujoco.viewer.launch_passive(loop.m, loop.d, key_callback=loop.key) as v:
-        last_print = 0.0
-        while v.is_running():
-            t0 = time.time()
-            pad.apply(loop, rp.DECIMATION * rp.DT)
-            loop.control_tick()
-            v.sync()
-            if t0 - last_print > 0.5:
-                print(f"  {loop.status()} | {loop.est_status()}   ", end="\r", flush=True)
-                last_print = t0
-            sleep = rp.DECIMATION * rp.DT - (time.time() - t0)
-            if sleep > 0:
-                time.sleep(sleep)
+    try:
+        with mujoco.viewer.launch_passive(loop.m, loop.d, key_callback=loop.key) as v:
+            last_print = 0.0
+            while v.is_running():
+                t0 = time.time()
+                pad.apply(loop, rp.DECIMATION * rp.DT)
+                loop.control_tick()
+                est = loop.current_estimate()
+                if loop.ghost is not None and est is not None:
+                    # `user_scn` persists across frames and is NOT cleared by `sync()`, so the
+                    # ghost would otherwise accumulate a robot every tick until it hit MAX_GEOM.
+                    loop.ghost.update(est, loop.d)
+                    v.user_scn.ngeom = 0
+                    loop.ghost.draw(v.user_scn)
+                v.sync()
+                if t0 - last_print > 0.5:
+                    print(f"  {loop.status()} | {loop.est_status()}   ", end="\r", flush=True)
+                    last_print = t0
+                sleep = rp.DECIMATION * rp.DT - (time.time() - t0)
+                if sleep > 0:
+                    time.sleep(sleep)
+    finally:
+        loop.stop_thread()
     print_summary(loop.history)
 
 
@@ -329,6 +419,22 @@ if __name__ == "__main__":
     ap.add_argument("--video-fps", type=float, default=50.0,
                     help="frame rate, capped by the 50 Hz control loop (default 50 = real time)")
     ap.add_argument("--video-size", default="1280x720", metavar="WxH")
+    ap.add_argument("--ghost", nargs="?", const="full", default="off",
+                    choices=Ghost.MODES,
+                    help="draw a translucent robot at the ESTIMATED state. 'full' is the honest "
+                         "view (it sinks as position drifts); 'attitude' pins it at the true "
+                         "position to isolate orientation error. Cycle live with keypad * or 'g'")
+    ap.add_argument("--ghost-offset", type=float, default=0.0, metavar="METRES",
+                    help="displace the ghost sideways for side-by-side viewing instead of overlaid")
+    ap.add_argument("--wasd", action="store_true",
+                    help="use the standalone WASD window instead of the passive viewer")
+    ap.add_argument("--realtime", action="store_true",
+                    help="run the estimator on its own thread so the viewer keeps real time. The "
+                         "policy then reads a slightly STALE estimate, so a threaded run is not "
+                         "bit-reproducible -- viewer only, never for recording numbers")
+    ap.add_argument("--max-backlog-ticks", type=int, default=2,
+                    help="how far the estimator may fall behind before the sim thread waits for "
+                         "it (default 5 = 100 ms). Samples are never dropped, only delayed")
     args = ap.parse_args()
 
     video_size = tuple(int(v) for v in args.video_size.lower().split("x"))
@@ -341,14 +447,33 @@ if __name__ == "__main__":
     # Recording is a headless run that still needs the visual meshes -- without them there is
     # nothing in the scene but the hidden collision boxes.
     headless = args.headless or bool(args.video)
+    # A threaded run is deliberately not reproducible; letting it write an .npz or a video would
+    # put an irreproducible number somewhere it looks authoritative.
+    if args.realtime and headless:
+        raise SystemExit("--realtime is viewer-only: it makes the estimate slightly stale and the "
+                         "run irreproducible. Drop --headless/--video, or drop --realtime.")
     loop = make_estimated_loop(
         args.policy, with_visuals=not headless or bool(args.video), sources=sources,
         noise=IMUNoise(seed=args.noise_seed) if args.imu_noise else None,
         contact_meas_var=args.contact_meas_var,
         stance_chol=args.stance_chol, swing_chol=args.swing_chol,
-        contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every)
+        contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every,
+        threaded=args.realtime, max_backlog_ticks=args.max_backlog_ticks)
+    # The ghost is a viewer feature: it draws, and headless has nothing to draw into.
+    if args.ghost != "off" and headless:
+        raise SystemExit("--ghost needs a viewer; drop --headless/--video")
+    if not headless:
+        loop.ghost = Ghost(loop.m, loop.maps, loop.filtered_slots,
+                           offset=args.ghost_offset, mode=args.ghost)
     if headless:
         run_headless(loop, args.ticks, cmd=(args.vx, args.vy, args.yaw), out=args.out,
                      video=args.video, video_fps=args.video_fps, video_size=video_size)
+    elif args.wasd:
+        loop.start_thread()
+        try:
+            rp.run_free_viewer(args.policy, loop=loop)
+        finally:
+            loop.stop_thread()
+        print_summary(loop.history)
     else:
         run_viewer(loop)

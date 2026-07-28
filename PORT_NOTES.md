@@ -1546,3 +1546,122 @@ already specifies the congruence and the zero-release property. Second, independ
 still-deferred contact zero-velocity constraint (`J_dot = 0`, `inEKF/filter.py`).
 
 Neither reaches the policy — base position and velocity are not in the 98-term observation.
+
+## G10 (part) — viewer tooling: ORT pinning, the ghost, threading, GPU (2026-07-27)
+
+Four changes aimed at "the estimator loop is too slow to watch, and the comparison is
+numbers-only". Two of the four landed roughly as designed; **two produced the opposite of the
+predicted result**, which is the part worth reading.
+
+### 1. The ONNX session was the speed problem (`run_policy._ort_session`)
+
+`onnxruntime` defaults to one intra-op thread per physical core *and spins* after each `Run`.
+Measured: a default session spawns **9 threads** on this 20-thread box and keeps them hot, so they
+fight XLA's own pool in the gap between control ticks. The policy is a tiny MLP; one thread
+computes it faster than nine can be synchronised.
+
+Pinning it (`intra_op_num_threads=1`, `inter_op_num_threads=1`,
+`session.intra_op.allow_spinning="0"`) takes the median control tick from ~27 ms to ~17 ms and
+carries the loop across the real-time line: **0.67–0.83x → 1.12–1.24x**. Interleaved A/B, one
+session per process (swapping sessions mid-process leaves the first pool alive and measures *more*
+threads, not fewer — an earlier attempt at this measurement got the sign wrong that way).
+
+The planning note had expected this to pay only in the **tail** ("the median is noisy"). On the
+full loop the median moved robustly too, and it alone retired the "viewer runs at 0.6x" problem
+that the other three features were designed around. Everything downstream had to be re-baselined
+against it — which is why it landed first.
+
+### 2. The ghost (`sim/ghost.py`)
+
+A translucent second robot drawn at the estimated state: a second `MjData` on the same `MjModel`,
+`mj_kinematics` only, never `mj_step`ped, appended to the scene with `mjv_addGeoms(mjCAT_DYNAMIC)`.
+
+* `est.p`/`est.R` drop into the free joint with **no frame conversion** — verified: the ghost's
+  pelvis lands on `est.p` to 0.0 and on `est.R` to 8e-16, because `qpos[0:3]` ≡
+  `d.xpos[PELVIS_LINK]` and the free joint's quaternion is world-from-body like `est.R`.
+* The dynamic pass draws **sites too** (32 meshes + 20 sites = 52 geoms), so the ghost carries a
+  dedicated `MjvOption` with `sitegroup[:] = 0`. Collision geoms are group 3 and already hidden;
+  the floor is static and excluded for free (the static pass adds exactly 1 geom).
+* The 9 filtered joints come from `est.q`; the other 20 are copied from the real `qpos`, which is
+  exactly what the estimator knows (on hardware those are raw encoders).
+* Cost **0.083 ms/frame** (update 0.027 + draw 0.057). The planning note said 0.004 ms — 20x
+  optimistic, still irrelevant against a 20 ms budget.
+* Bound to keypad `*` (GLFW `KP_MULTIPLY` 332). MuJoCo reserves every letter A–Z for render
+  toggles and `run_policy.py` raises on a sub-128 binding, so the keypad is not a style choice.
+
+`run_free_viewer` grew an optional pre-built `loop` argument so `run_estimator.py --wasd` can drive
+it; without that the ghost hook there would have been dead code, since `run_policy`'s own loop has
+no estimator.
+
+### 3. Threading works, and is no longer needed (`sim/estimator_thread.py`)
+
+`ThreadedEstimator` wraps `EstimatorRuntime`; `estimator_loop.py` is untouched, because it is what
+`test_sources_truth_bypasses_the_estimate` runs through at `atol=0`. Never drops a sample (plain
+`deque`, no `maxlen` — a `maxlen` deque discards the *oldest*, the worst possible choice for a
+sequential recursion); consumes **fixed `substeps` chunks** so XLA never retraces; scores against
+the truth **paired** with each chunk rather than the current `MjData`.
+
+Two corrections to the design:
+
+* **Default `max_backlog_ticks` is 2, not 5.** Staleness tracks the allowed backlog almost exactly
+  (age ≈ backlog + 1 ticks), and tilt error against the synchronous run degrades sharply past ~3:
+  `1 → +0.099°, 2 → +0.112°, 3 → +0.456°, 5 → +1.598°`. The planned default of 5 failed the
+  plan's own 0.3° acceptance gate by 5x.
+* **It buys almost nothing now.** 0.97x headless, 1.03x with a render per tick. The 1.90x
+  thread-overlap figure that motivated it was a micro-benchmark of JAX against `mj_step`; in the
+  real loop, once ORT stopped stealing cores, the sim thread has too little work left to overlap.
+  It stays opt-in, viewer-only, off by default.
+
+**A liveness bug that only mutation testing found.** Back-pressure originally waited while
+`self._error is None`. A worker that dies *without* recording an error (swallowed exception,
+library `sys.exit`) then leaves the producer blocked forever — and the test that should have caught
+it **hung instead of failing**, which is the failure mode that hides in CI. The wait is now gated
+on `self._alive()`, and `_reraise` also raises when the thread stopped silently. With the fix, the
+same mutant fails in 2 s instead of hanging.
+
+### 4. The GPU wins — the prediction was backwards
+
+`pyproject.toml` gained its first `[project.optional-dependencies]`: `gpu = ["jax[cuda13]"]`.
+Every reason to expect a **loss** is still true — batch size 1, no `vmap` anywhere in the estimator
+path, hundreds of tiny kernels, float64 at 1/64 rate on a consumer card, a blocking host
+round-trip every tick. Measured anyway, RTX 4070 SUPER, 250 ticks at vx=0.6, three interleaved
+repeats:
+
+| device | build | p50 | xRT | tilt tail-RMS | drift |
+|---|---|---|---|---|---|
+| cpu | 54 s | 13.59–13.84 ms | 1.45–1.47x | 0.856° | 0.353 m |
+| gpu | 71 s | **8.93–9.05 ms** | **2.21–2.24x** | 0.856° | 0.353 m |
+
+**1.5x faster with the error columns identical to three decimals** — a real win, not a
+speed/accuracy trade. Build+compile is ~17 s slower, paid once. The reasoning above was sound and
+the conclusion was still wrong; `experiments/bench_estimator_device.py` exists so the question is
+re-measured rather than re-argued.
+
+Backend selection is the `JAX_PLATFORMS` env var, deliberately **not** a `--device` flag: the
+backend must be chosen before `jax` is imported, and `run_estimator.py` imports the whole
+`invariant_estimation` chain (which runs `jax.config.update` at `__init__.py:15`) at module scope,
+before `argparse`. A flag would need an `sys.argv` scan above the imports — the same import-order
+landmine the file already carries once for `MUJOCO_GL`.
+
+The repo-root `conftest.py` pins the suite to `JAX_PLATFORMS=cpu` via `setdefault`, so installing
+the extra cannot silently move MJX kinematics onto the GPU and shift tolerances measured on CPU.
+Checked afterwards: `tests/sim` + `tests/pipeline` (61 tests) pass on CUDA as well, so the pin is
+precaution rather than a workaround, and `JAX_PLATFORMS=cuda uv run pytest` remains available.
+`uv lock` resolves all extras, so `uv.lock` carries a large `nvidia-*` block that a default
+`uv sync` never downloads.
+
+### Deliberate deviations from the plan
+
+* `max_backlog_ticks` default 5 → **2** (the planned default failed the planned accuracy gate).
+* `run_free_viewer` takes an optional pre-built loop, and `run_estimator.py` gained `--wasd`;
+  without it the planned ghost hook in that viewer would have been unreachable.
+* The threaded-vs-synchronous acceptance test runs **250 ticks, not 120**: `summarise` scores the
+  tail half, and at 120 ticks that window is still inside the gait transient, where the two
+  trajectories differ by more than the estimator does (a 120-tick version read 1.157 vs 0.738° and
+  failed on startup noise alone).
+* `--ghost` with `--headless`/`--video` is a hard error rather than a silent no-op, as is
+  `--realtime` with `--headless` — the latter because a threaded run is not reproducible and must
+  not be able to write an `.npz` or a video that looks authoritative.
+* The plan's note about re-recording `experiments/sim_runs/*.npz` after the ORT change was moot:
+  that directory has never existed in the repo (it was an ad-hoc scratch path). The stale
+  reference in `RUNNING.md` was removed instead.
