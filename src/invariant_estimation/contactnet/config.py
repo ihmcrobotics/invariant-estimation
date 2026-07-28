@@ -129,7 +129,7 @@ class ContactNetConfig:
     """
 
     # chained segments (see `dataset.ChainedBatcher`)
-    warm_in_s: float = 2.0
+    warm_in_s: float = 1.0
     """
     Seconds a freshly seeded chain runs before its segments are trained on.
 
@@ -138,20 +138,31 @@ class ContactNetConfig:
     its natural level the contact update has nothing to correct and the gradient
     w.r.t. `Sigma_C` is meaningless (that is the run-1 failure).
 
-    2.0 s from `experiments/measure_tstar.py`: with the process socket correct,
-    the contact update is only 0.92x of dead reckoning at 128 ms but 0.72x by
-    2 s and 0.16x by 4 s. Two seconds is where it is clearly earning its keep
-    without spending most of the episode warming up.
+    1.0 s, from the 30 s arm-C curve in `experiments/measure_tstar.py`: the
+    filter's body-frame velocity error saturates at ~8.5e-2 m/s and is already
+    there by 1 s (8.20e-2 at 1 s, 8.45e-2 at 2 s, 8.71e-2 at 4 s, 8.31e-2 at
+    29 s). Everything past ~1 s samples the same distribution, so a longer
+    warm-in is pure cost: one warm-in scan is **1118 ms**, and at the original
+    2.0 s / 20 s settings warm-ins were 310 ms of run 2's 598 ms per step -- 52%
+    of the run.
     """
 
-    episode_s: float = 20.0
+    episode_s: float = 43.0
     """
     Seconds a chain runs before being re-seeded from ground truth.
 
     Bounds how far the filter may drift. CoCo-InEKF (arXiv 2605.15122) uses
-    T = 100 s (dancing) / 6 s (ground motions) for the same purpose. 20 s sits
-    well past `warm_in_s` while still re-seeding a couple of times per rollout
-    (~46 s usable), so no single chain dominates.
+    T = 100 s (dancing) / 6 s (ground motions).
+
+    43 s is the **ceiling this dataset allows**, not a free choice: a 62 s
+    rollout minus the 16 s joint-KF warm-up leaves 45.5 s of legal segment
+    starts, so a chain can run at most ``45.5 - warm_in_s``. Setting 100 s here
+    would simply never fire -- the rollout-end re-seed would always trip first.
+    A true 100 s episode needs rollouts collected at ``--seconds 120``+.
+
+    Raising it costs nothing in signal (the error distribution is flat from 1 s
+    to 30 s, see `warm_in_s`) and buys wall time: re-seeds drop from 0.277 to
+    ~0.10 per step, and each one is a 1118 ms warm-in scan.
     """
 
     remat: bool = True

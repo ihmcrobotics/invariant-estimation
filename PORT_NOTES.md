@@ -2737,3 +2737,82 @@ survived: `test_cursor_starts_after_the_warm_in` derived the seed index *from*
 the cursor it was meant to verify — a circular assertion, the exact failure mode
 that file's docstring warns about. It now locates the warm-in slice's last
 `omega` row back in the source rollout instead.
+
+---
+
+## Run 2 works — and the gain-suppression gate misled me twice (2026-07-28)
+
+**`experiments/replay_eval.py`**, 2 rollouts x 2 seeds, 20 s each from a truth
+seed, identical inputs, differing only in `contact_meas_chol`:
+
+| metric | heuristic `σ₀²I` | run-2 `Σ_C` | ratio |
+|---|---|---|---|
+| body-frame velocity RMS | 0.0844 m/s | **0.0254** | 0.301 |
+| position RMS | 0.790 m | **0.245** | 0.310 |
+| **height RMS** | 0.780 m | **0.0918** | **0.118** |
+| **height final** | 1.347 m | **0.125** | **0.093** |
+| mean tilt | 0.689° | **0.353°** | 0.513 |
+
+**The learned `Σ_C` improves every axis measured**: 3.3x in velocity, 3.2x in
+position, 8.5x in height, 10.8x in terminal height, 2x in tilt. This is the
+first genuine ContactNet result in the project.
+
+Note the height number against the known "vertical drift at touchdowns" issue —
+the heuristic's 1.35 m of terminal height error over 20 s *is* that problem, and
+a trained `Σ_C` cuts it to 0.125 m with no reseed change at all.
+
+### The methodological lesson
+
+`check_sigma`'s gain table gave the wrong verdict **twice, in opposite
+directions**, on the same checkpoint:
+
+1. As `‖K‖_F` it said **1.6x, healthy**. The Frobenius norm is dominated by its
+   largest column, so a live x axis masked y at 178x and z at 3115x.
+2. Rewritten per-axis it said **DEGENERATE, z suppressed 3115x**. Also wrong —
+   the filter is 8.5x *better* in height with that suppression than without it.
+
+**A gain ratio cannot distinguish "switched off because the objective was
+degenerate" from "switched off because that residual direction is
+uninformative."** Run 1 was the first; run 2 is the second. The vertical contact
+residual during walking is dominated by sole compliance, ground penetration and
+terrain error — none of which is base velocity error — so down-weighting it
+removes a bias source rather than discarding information.
+
+Only running the filter separates the two cases. `check_sigma` now prints the
+gain table as a **diagnostic** and defers the verdict to `replay_eval`.
+
+### So is L2 "dead in the water"? No — it is incomplete in one measured way
+
+L2 gets the **mean** right: the numbers above. What it does not touch is the
+**covariance**. `nis_over_dof` finished run 2 at 7.5e-3, i.e. the filter is
+~130x underconfident, and that is exactly theory doc §7.1's stated limitation
+(L2 constrains the gain sequence and says nothing about the covariance) plus
+§7.2.1 Claim 1 (the quadratic term fixes shape, not scale).
+
+That split is the whole case for β-NLL, and it is now a measured split rather
+than an argued one:
+
+* **Consumers of the estimate** (the policy, which reads `v` and projected
+  gravity) get a 3.3x better signal today.
+* **Consumers of `P`** — NEES health monitoring, any MPC reasoning about
+  uncertainty, the G10 consistency gate — get a covariance that is wrong by two
+  orders of magnitude.
+
+### Caveats on the number
+
+* **All in-sample.** 12 rollouts collected, 12 trained on. This is "does it help
+  the filter", not a generalisation test.
+* The dataset narrowness entry still stands: ~1 100 contact events, one command
+  velocity, no friction randomisation.
+* 20 s horizons from a truth seed, not a closed-loop deployment.
+
+### Timing, after the `episode_s` / `warm_in_s` change
+
+`warm_in_s` 2.0 → 1.0 and `episode_s` 20 → 43 (the ceiling this dataset allows —
+45.5 s usable per rollout, so a true 100 s episode needs re-collection at
+`--seconds 120`+). Re-seeds 0.305 → 0.18/step, chain construction 48 s → 29 s,
+and **0.598 → ~0.36 s/step steady state, 1.66x**. 100k steps would be ~10 h on
+this box (an RTX 4070 SUPER, 12 GB — not a 4090).
+
+Batch size does **not** buy throughput here: B=32 450 ms, B=64 1333 ms (2.96x),
+B=128 2227 ms. Superlinear, so the GPU is not under-occupied at B=32.

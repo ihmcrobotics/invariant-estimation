@@ -71,8 +71,8 @@ def make_config(args) -> ContactNetConfig:
         total_steps=args.steps,
         remat=not args.no_remat,
         freeze_contact_chol=getattr(args, "freeze_contact_chol", False),
-        warm_in_s=getattr(args, "warm_in_s", 2.0),
-        episode_s=getattr(args, "episode_s", 20.0),
+        warm_in_s=getattr(args, "warm_in_s", 1.0),
+        episode_s=getattr(args, "episode_s", 43.0),
     )
 
 
@@ -382,8 +382,8 @@ def main():
     ap.add_argument("--no-chained", dest="chained", action="store_false", default=True)
     ap.add_argument("--freeze-contact-chol", action="store_true",
                     help="run-1 behaviour: pin the process socket at stance (10.2x worse)")
-    ap.add_argument("--warm-in-s", type=float, default=2.0)
-    ap.add_argument("--episode-s", type=float, default=20.0)
+    ap.add_argument("--warm-in-s", type=float, default=1.0)
+    ap.add_argument("--episode-s", type=float, default=43.0)
     ap.add_argument("--chunk", type=int, default=10_000)
     ap.add_argument("--fk-chunk", type=int, default=2_000)
     ap.add_argument("--batch-sizes", type=int, nargs="+", default=[8, 16, 32, 64])

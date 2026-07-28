@@ -125,14 +125,16 @@ def main() -> None:
     supp = float(np.max(g0 / g1))
     worst = "xyz"[int(np.argmax(g0 / g1))]
     print()
-    if supp > 10.0:
-        print(f"DEGENERATE — the {worst} axis is suppressed {supp:.0f}x. The "
-              f"network has switched that direction of the contact update off. "
-              f"An aggregate ||K|| would hide this whenever another axis stays "
-              f"live; judge on the WORST axis.")
-    else:
-        print(f"OK — every axis within {supp:.1f}x of initialization "
-              f"(worst: {worst}). The update is live in all three directions.")
+    print(f"Largest suppression: {supp:.0f}x on {worst}.")
+    print("This is a DIAGNOSTIC, not a verdict. A gain ratio cannot distinguish")
+    print("  (a) degenerate — the objective rewarded switching the update off")
+    print("      (run 1: 2339-36157x on all three axes), from")
+    print("  (b) correct    — that residual direction carries little velocity")
+    print("      information (the vertical residual during walking is dominated")
+    print("      by sole compliance and terrain error, not base velocity).")
+    print("Run `experiments/replay_eval.py` for the verdict. Measured on run 2,")
+    print("whose z axis is suppressed 3115x, the filter is 8.5x BETTER in")
+    print("height than the heuristic -- case (b).")
 
 
 if __name__ == "__main__":
