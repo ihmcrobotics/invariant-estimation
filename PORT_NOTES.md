@@ -2568,3 +2568,82 @@ that. Caveat: their NEES is on the core state (dof 9, band [2.7, 19]) and our
 not map one onto the other. But it weakens the premise that L2 must leave the
 filter miscalibrated, and combined with the run-1 root cause above it suggests
 **fixing the seeding before reaching for beta-NLL**.
+
+---
+
+## T* measured — and the frozen `contact_chol` is the primary cause (2026-07-28)
+
+`experiments/measure_tstar.py`. From a truth seed, run the InEKF forward over
+the same recorded inputs under three configurations, and record per-tick
+body-frame velocity error (`losses.l2_velocity`'s exact integrand):
+
+* **A** — training config: `contact_chol` frozen at `contact_chol_const` (stance),
+  contact update ON (`Sigma_C = sigma_0^2 I`).
+* **B** — training config, contact update OFF (`Sigma_C = 1e6 m^2`, gain ~0).
+* **C** — deployed config: `contact_chol` as recorded (`ContactTrust` Schmitt
+  trigger off `f_n/(0.5 m g)`, *not* ground truth), contact update ON.
+
+1 rollout x 4 seeds, 5 s each. RMS body-frame velocity error [m/s]:
+
+| horizon | A (train, on) | B (train, off) | C (deploy, on) | A/B | C/B |
+|---|---|---|---|---|---|
+| 10 ms | 4.39e-2 | 3.66e-3 | 9.51e-3 | 11.99 | 2.60 |
+| 50 ms | 1.90e-1 | 1.74e-2 | 2.43e-2 | 10.92 | 1.40 |
+| **128 ms (= L·dt)** | **3.69e-1** | **3.61e-2** | **3.32e-2** | **10.20** | **0.92** |
+| 250 ms | 5.46e-1 | 3.74e-2 | 5.63e-2 | 14.61 | 1.51 |
+| 500 ms | 5.81e-1 | 2.80e-2 | 7.85e-2 | 20.75 | 2.80 |
+| 1 s | 6.26e-1 | 3.53e-2 | 9.40e-2 | 17.74 | 2.66 |
+| 2 s | 6.29e-1 | 1.35e-1 | 9.70e-2 | 4.66 | 0.72 |
+| 4 s | 6.47e-1 | 5.33e-1 | 8.73e-2 | 1.22 | **0.16** |
+
+`T*` (A vs B) = **4.24 s**, 33x the segment horizon.
+
+### The contact update is not the problem — the training config is
+
+**C shows the contact update works.** In the deployed configuration it beats
+dead reckoning from ~2 s and is **6.1x better at 4 s**. The filter is fine.
+
+**A shows the training configuration breaks it.** Freezing `contact_chol` at the
+stance value pins *swing* feet as world-static, so the contact update fights a
+process model that is wrong for half the gait. The result is 10-20x **worse**
+than not using contacts at all, at every horizon out to 4 s.
+
+So run 1's `Sigma_C -> infinity` was not merely the consequence of a short
+horizon. It was **the correct response to a broken process model**: with swing
+feet pinned, the only way the network can stop the contact update from injecting
+0.4 m/s of velocity error is to switch it off globally. It did exactly that.
+
+This revises the diagnosis in "Run 1 learned to switch the contact update OFF".
+The force-teacher seeding is real but **secondary**. Ranked by measured effect:
+
+1. **Frozen `contact_chol`** — 10.2x penalty at the segment horizon. Primary.
+2. **Truth-seeded 128 ms horizon** — even with the process socket correct, C is
+   only 8% better than doing nothing at 128 ms (C/B = 0.92), rising to 6.1x at
+   4 s. The gradient signal for `Sigma_C` at 128 ms is marginal and probably
+   noise-dominated. Real, but it is a weak-signal problem, not a wrong-sign one.
+
+### This reopens a documented decision
+
+`dataset.py` docstring (b) freezes `contact_chol` deliberately: *"A training
+segment that kept it would hand the network a free ground-truth contact flag and
+void the experiment ... the swing/slip signal has to come out of ContactNet's
+measurement covariance, which is the only channel it owns."*
+
+The leak concern does not survive inspection. **The network never sees
+`contact_chol`.** Its inputs are the 24 feature channels (gyro, accel, q, tau,
+p_bc, v_bc); `contact_chol` enters the *filter's process model* only. Feeding
+the real value changes the filter ContactNet is differentiated through, not the
+information ContactNet receives. There is no path from `contact_chol` to the
+network's input.
+
+The freeze also fights theory-doc S3.2 / the `inEKF/filter.py` DECISION, which
+argues that contact condition belongs in the **process** noise and that the FK
+measurement is not wrong during swing. Freezing the process socket removes the
+correct lever and then asks the measurement socket to compensate — which is the
+thing that DECISION says not to do.
+
+Note the recorded signal is deployable: `sim/sensors.py` drives `contact_chol`
+from `ContactTrust` (the Schmitt-trigger port of
+`FootSwitchContactProbabilityProvider`), off normal force `f_n/(0.5 m g)`. It is
+a sensor-derived contact estimate, the same one the deployed filter uses — not
+the sim's binary contact truth.
