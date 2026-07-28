@@ -9,7 +9,7 @@ authors = [
 ]
 
 dependencies = [
-  "jax",
+  "jax[cuda12]==0.10.2",
   "jaxlie",
   "ipython",
   "pyyaml",
