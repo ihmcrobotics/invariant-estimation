@@ -225,3 +225,6 @@ typings/
 
 # Estimator-in-sim run histories (regenerate with `run_estimator.py --out ...`)
 experiments/sim_runs/*.npz
+
+# ContactNet training data (regenerate with `python -m invariant_estimation.sim.collect`)
+data/

@@ -488,6 +488,42 @@ params, opt_state, history = train(params, batch_loss, batches,
 the sim's swing/stance oracle (`sim/sensors.py` switches it 1e-4 ↔ 1e1 from a
 contact detector).
 
+### Collecting the training data (`sim/collect.py`)
+
+Terrain-randomised rollouts → one `.npz` per rollout under `data/` (gitignored):
+
+```bash
+uv run python -m invariant_estimation.sim.collect --seconds 60 --seeds 0 1 2   # 4 terrains x 3
+uv run python -m invariant_estimation.sim.collect --terrain waves --seeds 0 --seconds 60
+uv run python -m invariant_estimation.sim.collect --measure                    # warm-up + timings
+```
+
+```python
+from invariant_estimation.sim.collect import build_collector, collect_rollout, load_rollout
+c = build_collector()                 # ~30 s of MJX trace + XLA compile, ONCE — reuse it
+r = collect_rollout("hard_stepping", seed=3, seconds=60.0, collector=c)
+r.sensors      # FusedSensors      -> contactnet.features
+r.inputs       # InEKFInputs       -> contactnet.rollout.Segment.inputs (incl. joint.sigma_q)
+r.truth["v"], r.truth["R"]          # -> the L2 objective
+r.meta["warmup_ticks"]              # ticks to DISCARD at the head; nothing is dropped on save
+```
+
+The policy runs on ground truth (`run_policy.Loop`); the estimator runs **open loop** over the
+recorded stream afterwards, so the dataset does not depend on the filter ContactNet is about to
+change. Sensors are sampled every physics tick (1 kHz), not every control tick.
+
+| number | measured |
+|---|---|
+| cost | **3.2 wall-s per simulated second** on 20 CPU cores: `run_fused` 2.83, sensor read 0.19, `mj_step` + policy 0.12. So a 62 s rollout ≈ 3.5 min, and 12 rollouts ≈ 45 min |
+| size | 2.1 MB per 1000 ticks compressed (130 MB per 62 s rollout); `Σ_q`/`Σ_q̇` are 60% of it |
+| warm-up | **16 000 ticks (16 s)** — the gyro-bias drift plateau, worst of the four terrains (15.7 s). `Σ_q` itself plateaus in 3.2 s |
+| upright / on-field | asserted per rollout; a fall or an excursion past the 64 m hfield **raises**, and nothing is written |
+
+Two hazards the module docstring expands on: the saved `contact_chol` carries the sim's
+stance/swing truth (constant it during training), and `make_contact_channels` vmaps the MJX FK
+over the whole time axis — it needs ~38 GB on a 62 s rollout, so use
+`collect.contact_channels_chunked` for anything that runs the feature path over a full rollout.
+
 **Reading the logs — two traps, both measured (`PORT_NOTES.md`):**
 
 * Under `beta_nll` the **loss is not a progress metric**. It can rise while
