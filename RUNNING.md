@@ -777,8 +777,51 @@ directory:
 the cache, but `inputs`/`truth` come from the raw `.npz`. Copying only the cache
 is not enough.
 
+**Pulling out of WSL when your SSH endpoint is the Windows host.** The repo lives
+on the WSL filesystem but Windows OpenSSH drops you into Windows, not WSL. You do
+not need an sshd inside WSL — point rsync at the WSL binary with `--rsync-path`.
+Run this **from the target box** (verified working 2026-07-28):
+
 ```bash
-rsync -avh --progress data/ artifacts/ <linux-box>:~/invariant-estimation/
+WINHOST=lucas@<windows-tailscale-ip>
+SRC=/home/lucas/Documents/ihmc/invariant-estimation
+for d in data artifacts; do                      # BOTH -- see the trap below
+  rsync -avh --partial --progress --rsync-path="wsl -d Ubuntu rsync" \
+    "$WINHOST:$SRC/$d/" "./$d/"
+done
+```
+
+* **Name the distro.** `wsl -d Ubuntu`: this box also has a stopped `Ubuntu-22.04`,
+  and a bare `wsl` can land in the wrong one.
+* **Trap: pull `artifacts/` too.** It is easy to copy only `data/` and lose the
+  3.9 MB trained network — the one thing in the whole 1.8 GB that nothing
+  regenerates.
+* Skip `-z`; `.npz` is already compressed. `--partial` makes a dropped link
+  resume instead of restarting 1.8 GB.
+* If PowerShell is the default Windows shell and the quoting misbehaves, stream a
+  tar instead — no rsync needed on the Windows side:
+  ```bash
+  ssh "$WINHOST" "wsl -d Ubuntu -- tar -C $SRC -cf - data artifacts" | tar -xf -
+  ```
+
+**Pushing straight out of WSL over Tailscale usually fails**, even though the
+route works (TCP 22 to the peer is reachable). WSL2 in the default NAT mode is
+**not a tailnet node** — its traffic egresses through the Windows host's
+Tailscale and arrives with no client identity, so a peer running Tailscale SSH
+refuses it regardless of password. Install Tailscale inside WSL, or use key auth.
+WSL also starts with no `~/.ssh`; the Windows key at
+`/mnt/c/Users/Lucas/.ssh/id_ed25519` cannot be used in place because drvfs
+reports every file `0777` and ssh rejects a world-readable key — copy it to
+`~/.ssh` and `chmod 600`.
+
+**Verify the transfer.** Generate a manifest on the source and check it on the
+target; a truncated `.npz` fails much later and much more confusingly:
+
+```bash
+# source
+sha256sum artifacts/*.npz artifacts/*.json data/*.npz data/cache/*.npz > transfer-manifest.sha256
+# target
+sha256sum -c transfer-manifest.sha256
 ```
 
 **What changes on a native-Linux box:** `XLA_PYTHON_CLIENT_PREALLOCATE=false`
