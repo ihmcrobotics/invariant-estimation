@@ -2931,3 +2931,86 @@ step**, decomposing roughly into the documented ~0.18 s/step of re-seed warm-in
 plus ~0.15 s of batch construction and dispatch. This supersedes the 24%-GPU-util
 *inference* with a direct measurement, and it localises the only optimisation
 worth making: neither the GPU nor `B`, but the host path between steps.
+
+---
+
+## Run 3 is a reproducibility result, not a generalisation one (2026-07-28)
+
+Run 3 was trained from scratch on a second machine (WSL2 / RTX 4090 / 6 cores)
+with its own re-collected dataset. Reproduced locally, its `replay_eval` numbers
+match the 4090 box's to the digit.
+
+### What it establishes
+
+**1. The pipeline is deterministic and portable.** The 4090's rollouts and this
+machine's are the *same* simulation: identical seed, spawn pose, injected
+`true_gyro_bias`, `travelled_m` (23.572) and `tilt_max_deg` (2.504). Measured
+`P0` agrees to **1.3e-12**. The ~300-byte file-size differences are float
+rounding under compression, nothing more.
+
+**2. The learned function is stable across trainings.** Run 2 and run 3 are
+independent trainings under *different chain schedules* (`warm_in_s`/`episode_s`
+2.0/20 vs 1.0/43). Their `Sigma_C` on the same 600 ticks:
+
+| axis | run 2 median [m] | run 3 median [m] | per-tick correlation |
+|---|---|---|---|
+| x | 1.668e-3 | 1.729e-3 | **0.995** |
+| y | 4.634e-2 | 4.064e-2 | **0.948** |
+| z | 1.962e-1 | 2.135e-1 | **0.967** |
+
+Median relative difference of `Sigma_C` is 0.122. The network is learning a
+reproducible function of the features, not landing somewhere arbitrary in a flat
+valley — which was a live worry given L2 says nothing about absolute scale.
+
+And the filter outcome tracks:
+
+| metric (ratio vs heuristic) | run 2 | run 3 |
+|---|---|---|
+| velocity RMS | 0.301 | 0.304 |
+| position RMS | 0.310 | 0.301 |
+| height RMS | 0.118 | 0.098 |
+| height final | 0.093 | 0.073 |
+| tilt | 0.513 | 0.517 |
+
+### What it does NOT establish
+
+**`data/data/` is not a held-out set.** It is the same deterministic run
+re-executed, so run 3 tests *reproducibility*, not generalisation. Zero new
+evidence about unseen conditions.
+
+**The replay numbers are still in-sample**, on the same trajectories the network
+trained on. Run 3 being "better on both height metrics" is two samples of the
+same estimator differing by ~2% — the `Sigma_C` correlation above says these are
+the same solution, so that gap is noise and should not be read as an
+improvement.
+
+**Nothing here moves the dataset gap.** Still one command velocity, 4 terrains,
+3 seeds, no friction randomisation, ~1 100 independent contact events.
+
+So confidence in *reproducibility* is now high and confidence in *generalisation*
+is unchanged at zero evidence. That is the reason not to wire run 3 into the
+deployed filter yet.
+
+### Two findings from that run worth keeping
+
+**The 12 GB "larger B does not help" was card-specific.** On 24 GB, `measure-b`
+gives 16x the batch for 1.4x the step — so the superlinear scaling measured here
+(B=32 450 ms, B=64 1333 ms) was memory pressure, as that entry suspected.
+Re-measure per card. Note what it does and does not buy: lower gradient variance
+and better rollout decorrelation (B=512 is ~43 chains per rollout), but the
+segments still come from the same ~1 100 contact events.
+
+**The loop is host-bound, not GPU-bound.** A compiled `grad_fn` on a pre-built
+batch is 0.30 s/step at B=32 against the real loop's 0.632 s/step marginal — so
+**52% of wall time is host-side work outside the jitted step**. That is
+`ChainedBatcher`'s per-step Python: 32 `make_segment` gathers off 130 MB-backed
+arrays, the stack, and the host-to-device transfer. It explains why the 4090 box
+was *slower* per step (0.683) than this 4070 SUPER (0.598): 6 cores against 20.
+It also means larger `B` is close to free, since the host cost is per *step*.
+This is now the top performance item, ahead of anything GPU-side.
+
+### Housekeeping
+
+`data/data/` holds a 1.8 GB duplicate of the dataset from the rsync.
+`dataset.rollout_paths` globs non-recursively, so it is not silently picked up —
+but it is wasted disk and a trap for anyone pointing `--data` at it.

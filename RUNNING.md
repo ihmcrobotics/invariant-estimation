@@ -46,6 +46,21 @@ Three gotchas, all of which cost time once:
   regardless of use, so a running suite holds ~10 GB and blocks anything else on
   the device. The targeted subset that matters for training,
   `tests/inEKF tests/contactnet tests/pipeline`, runs on GPU in 5 min (312 tests).
+
+  **It also fails on GPU, and the failures read as real bugs.**
+  `tests/sim/test_collect.py` reports 3: `test_chunking_is_exact` asserting
+  `np.array_equal` false on two `(1500, 13, 13)` `sigma_q` arrays that print
+  identically, and two `JaxRuntimeError: INTERNAL: Autotuning failed ...
+  RESOURCE_EXHAUSTED: Out of memory while trying to allocate 182.25MiB`. **All 19
+  pass under `JAX_PLATFORMS=cpu`.** The chunked-vs-one-pass check is a
+  bit-exactness assertion and GPU autotuning picks its reduction order per
+  compilation, so that equality is not a GPU-portable property; the OOMs are the
+  75%-preallocation above colliding with anything else on the device. Since a
+  bare `uv run pytest` now selects CUDA, **always pin the suite to CPU**:
+
+  ```bash
+  JAX_PLATFORMS=cpu uv run pytest -q tests/     # 733 passed in 18:54 (2026-07-28)
+  ```
 * **Consumer NVIDIA runs FP64 at 1/64 of FP32.** A 4070 SUPER is ~0.5 TFLOPS
   FP64, comparable to this CPU, and I8 mandates float64 at the filter boundary.
   The GPU wins anyway because the workload is latency- and memory-bound rather
