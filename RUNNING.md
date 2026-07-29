@@ -442,7 +442,40 @@ attitude, gyro, velocity, position drift, joint state) over the whole run and ov
 | `--contact-fk measured\|pinned` | whether the InEKF contact FK uses the measured ankle angles (default) or pins them at `qpos0`, as the library default still does — worth ~2x on attitude error, see below |
 | `--stance-chol` / `--swing-chol` | the Σ_C factor for a trusted / airborne foot. The InEKF has **no contact mask**; contact condition rides entirely in Σ_C, so a swing foot needs a large factor or the filter keeps believing it is planted |
 | `--contact-meas-var` | flight's `1e-4` contact measurement-noise floor (port default 0) |
+| `--contactnet CKPT.npz` | attach a trained ContactNet as the contact-noise provider (off = the analytic filter). The run prints `ContactNet: ATTACHED ckpt=… norm=…` at startup so a log is never ambiguous about which arm it is |
+| `--contactnet-norm N.npz` | the normalization constants, which **must** be the ones the checkpoint was trained under: run 4 → `data/dr/norm_constants.npz`, run 2 → `data/norm_constants.npz`. A mismatch shifts the network's input distribution and **nothing raises** — the run just quietly measures something else |
 | `--video walk.mp4` | record the run offscreen to H.264 (implies `--headless`, `--video-fps` / `--video-size` tune it) |
+
+### ContactNet in the closed loop
+
+```bash
+uv run python run_estimator.py --policy baseline --headless --ticks 1500 --vx 0.6 \
+    --imu-noise --contact-fk measured \
+    --contactnet artifacts/contactnet_run4.npz --contactnet-norm data/dr/norm_constants.npz
+```
+
+The provider needs `span_ticks(cfg)` = **400** ticks of history (0.4 s at the 1 kHz filter rate,
+i.e. 20 control ticks) before it emits anything; until then it falls back to the analytic
+`sigma_0**2 I`. An attached run is therefore **bit-identical** to an unattached one for the first
+19 control ticks and diverges at tick 19 — that identity-then-divergence is the cheapest proof the
+network is actually reaching the filter rather than being silently dropped.
+
+**Measured, 30 s at vx = 0.6, `--imu-noise`, `--contact-fk measured`, 3 noise seeds
+(2026-07-29).** The headline is vertical drift, `est_z - true_z`, which the 3D `p_err` norm hides:
+
+| mean of 3 seeds | no ContactNet | run 4 (`data/dr`) | run 2 (`data/`) |
+|---|---|---|---|
+| final signed dz [m] | **−3.183** | **−0.399** | −0.769 |
+| dz RMS (last half) [m] | 2.432 | 0.303 | 0.583 |
+| sink rate, last 20 s [m/s] | −0.107 | −0.0135 | −0.026 |
+| tilt error, tail RMS [deg] | 1.201 | 0.252 | 0.658 |
+| base gyro, tail RMS [rad/s] | 0.0080 | 0.0056 | 0.0062 |
+| 3D position drift, final [m] | 3.260 | 0.511 | 2.220 |
+
+The robot itself walks fine in every arm (true base height stays 0.88–0.91 m, 19–20 m travelled) —
+the sinking is entirely in the estimate. **A parallel-runs gotcha:** `run_policy.cycloid_forearm_urdf`
+writes its hands-free URDF to a fixed `tempfile.gettempdir()` path, so N concurrent runs race on
+one file and some die with an XML `ParseError`. Give each background run its own `TMPDIR=…`.
 
 ### Recording a video
 
@@ -917,6 +950,49 @@ Two hazards the module docstring expands on: the saved `contact_chol` carries th
 stance/swing truth (constant it during training), and `make_contact_channels` vmaps the MJX FK
 over the whole time axis — it needs ~38 GB on a 62 s rollout, so use
 `collect.contact_channels_chunked` for anything that runs the feature path over a full rollout.
+
+#### Domain-randomised collection (`--dr`, `config/collect_dr.yaml`)
+
+The first 12-rollout dataset varied only terrain tilt and came out contact-wise near-identical
+(93–96 contact events, stance duty 0.630–0.642 across all twelve), and the learned `Σ_C` was then
+**79% explained by gait phase alone**. `--dr` randomises friction, adds pelvis pushes, and
+resamples the velocity/height command, so contact quality stops being a function of stride phase:
+
+```bash
+uv run python -m invariant_estimation.sim.collect --dr                    # config/collect_dr.yaml
+uv run python -m invariant_estimation.sim.collect --dr my.yaml --seconds 30 --dr-seed 7
+uv run python -m invariant_estimation.sim.collect --record-slip           # DR off, slip recorded
+```
+
+```python
+dr, run = collect.load_dr_config()                 # config/collect_dr.yaml -> (config, run kwargs)
+r = collect.collect_rollout("flat", seed=0, seconds=60, collector=c, dr=dr)
+r.truth["slip_sat"]    # (T, 2) friction-cone saturation |f_t|/(mu f_n), worst contact per foot
+r.truth["contact_fn"]  # (T, 2) N; 0 ⇒ no loaded contact, i.e. this sample says nothing about slip
+r.truth["push_force"]  # (T, 3) N applied to the pelvis
+r.truth["cmd"]         # (T, 5) the live [vx, vy, yaw, standing, base_height]
+r.meta["friction_mu"], r.meta["push_schedule"], r.meta["cmd_schedule"], r.meta["slip_fraction"]
+```
+
+* **`dr=None` is bit-for-bit the pre-DR collector** — verified: all 28 saved leaves identical to
+  `HEAD`'s module on the same rollout. The old `data/*.npz` stay reproducible, and every DR
+  rollout carries `meta["dr"]` (`null` on the old ones) so a loader can tell the generations apart.
+* **Slip is recorded, not inferred.** `mj_contactForce` per foot contact per physics tick; below
+  `normal_force_min_n = 5 N` the cone is meaningless and the sample is marked unloaded. It cannot
+  be recovered from a finished rollout, which is why it is here. `--record-slip` gets the DR-off
+  baseline (a read only — the trajectory stays bit-identical).
+* **The friction floor is terrain-dependent** and a fall costs the whole rollout, so the config
+  carries a `range_by_terrain` override. Measured, 8 s walks with pushes and command resampling:
+
+  | terrain | mu → slip fraction |
+  |---|---|
+  | flat | 1.0 → 2.9% · 0.70 → 3.9% · 0.40 → 8.5% · **0.20 → 26–44%** |
+  | waves | 0.20 → 34% |
+  | stepping_stones | 0.30 → 14% |
+  | hard_stepping | 0.60 → 11% · 0.45 → 19% · 0.30 → 19% · **0.20 → FELL** |
+
+* Cost: the `mj_contactForce` loop adds ~0.11 wall-s per simulated second (sensor read 0.21 →
+  0.32 s/sim-s), i.e. ~3% on top of a collection run that `run_fused` already dominates.
 
 **Reading the logs — two traps, both measured (`PORT_NOTES.md`):**
 

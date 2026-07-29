@@ -1,0 +1,96 @@
+# config/collect_dr.yaml -- domain randomisation for `sim/collect.py`.
+#
+# SEPARATE ON PURPOSE. This file changes the DATASET, not the filter, and the pre-DR rollouts must
+# stay reproducible from a checkout where it does not exist: `collect_rollout(dr=None)` never reads
+# it. Nothing here belongs in `alex_jointkf.yaml` / `alex_inekf.yaml` / `filter_cfg.yaml`.
+#
+# WHY. The first dataset (12 rollouts, `data/`) varied only terrain tilt and came out contact-wise
+# near-identical: 93-96 contact events and stance duty 0.630-0.642 across all twelve. The learned
+# Sigma_C was then 79% explained by GAIT PHASE alone (R^2 = 0.790 of log10 std_z against
+# time-since-touchdown; contact trust explained 0.02). With one gait, "contact quality" and "stride
+# phase" are the same variable, so a stride-phase clock is the most any network can learn from it.
+# Each block below breaks that identification a different way.
+#
+#     uv run python -m invariant_estimation.sim.collect --dr          # this file
+#     uv run python -m invariant_estimation.sim.collect --dr config/my_sweep.yaml --seconds 20
+#
+# `run:` supplies defaults for the CLI; anything typed on the command line wins.
+
+run:
+  terrains: [flat, waves, stepping_stones, hard_stepping]
+  seeds: [0, 1, 2]
+  seconds: 60.0
+  settle_s: 2.0
+  chunk_ticks: 10000
+  out_dir: data/dr          # relative to the repo root; keeps the pre-DR `data/*.npz` untouched
+
+dr:
+  # Base seed. Rollout `s` draws from default_rng(seed + 7919*s) -- a stream independent of the
+  # spawn-pose (0xC0FFEE + s) and IMU-noise (s) streams, so friction is not a function of terrain.
+  seed: 20260728
+
+  friction:
+    # Sliding friction written to `m.geom_friction[:, 0]` on EVERY geom (MuJoCo mixes a contact
+    # pair by max, so overriding one side alone does nothing).
+    #   sim default          mu = 1.0   (`run_policy.CONTACT`)
+    #   policy training DR   mu in [0.8, 1.4] -- below 0.8 is extrapolation, which is the point
+    #
+    # MEASURED in this collector (8 s walks, seed 0, pushes AND command resampling on), slip =
+    # fraction of loaded (tick, foot) samples at the friction cone:
+    #   flat            mu 1.0 -> 2.9%   0.70 -> 3.9%   0.40 -> 8.5%   0.20 -> 26-44%
+    #   waves           mu 0.20 -> 34%
+    #   stepping_stones mu 0.30 -> 14%
+    #   hard_stepping   mu 0.60 -> 11%   0.45 -> 19%    0.30 -> 19%    0.20 -> FELL at t=8.3 s
+    # So the floor is terrain-dependent, and a fall costs the whole rollout (`collect_all` skips
+    # it -- and skipping biases the dataset toward the easy seeds, which is exactly the failure
+    # this dataset exists to fix). `range` is the value that walked on all four; the override
+    # below buys the low-mu, high-slip points on the two terrains that tolerate them.
+    enabled: true
+    range: [0.30, 1.20]
+    range_by_terrain:
+      flat:  [0.20, 1.20]
+      waves: [0.20, 1.20]
+
+  push:
+    # Random shoves on the pelvis, `d.xfrc_applied[PELVIS_LINK, :3]`. Direction uniform on the
+    # horizontal circle. These land at instants drawn INDEPENDENTLY of stride phase, which is the
+    # only reason they are here.
+    # MEASURED envelope (`experiments/dr_envelope.py`, 20 s walks, 5 seeds, 90.5 kg robot):
+    #   flat            0-700 N all upright; 750 N -> 4/5; 900 N -> 2/5; 1200 N -> 0/5
+    #   with terrain    400 N -> 24/24 across flat/waves/hard_stepping; 600 N -> 4/5 on waves
+    # 400 N x 0.15 s / 90.5 kg is a 0.66 m/s delta-v. Capped at 400 because a fall costs the whole
+    # rollout AND biases the set toward easy seeds.
+    #
+    # Note what pushes are NOT for: as a slip source they are worthless (+0.18 pp over a no-push
+    # control). They are here for ATTITUDE EXCITATION at instants uncorrelated with stride phase
+    # (max tilt 8.1 vs 6.3 deg), which is the identification this dataset exists to break.
+    enabled: true
+    force_n: [50.0, 400.0]
+    duration_s: [0.10, 0.20]
+    interval_s: [1.0, 3.0]        # gap between the end of one push and the start of the next
+    vertical_scale: 0.0           # f_z = U(-1,1)*scale*|f|; 0 keeps pushes purely horizontal
+
+  command:
+    # `run_policy.Loop.cmd = [vx, vy, yaw_rate, standing, base_height]`, resampled on this interval.
+    # Every dataset so far used vx=0.4 with everything else fixed.
+    # Policy training ranges: vx (-0.9, 0.9), vy (-0.5, 0.5), yaw (-1.5, 1.5).
+    # MEASURED tracking deadband (`run_policy.WALK_MIN_*`): |vx|<0.30, |vy|<0.28, |yaw|<0.60 leave
+    # the robot standing whatever the command says. The ranges below deliberately STRADDLE it --
+    # standing-under-a-walk-command is real data, not a bug -- and `stand_prob` adds explicit
+    # stands on top.
+    enabled: true
+    resample_s: [2.0, 4.0]
+    vx: [-0.5, 0.8]
+    vy: [-0.35, 0.35]
+    yaw_rate: [-0.8, 0.8]
+    base_height: null             # null => the policy's own height_range (baseline: 0.83-0.93);
+                                  # an explicit [lo, hi] is CLIPPED to it
+    stand_prob: 0.15
+
+  slip:
+    # Friction-cone saturation |f_t| / (mu f_n) from `mj_contactForce`, per physics tick per foot,
+    # saved as `truth.slip_sat` / `truth.contact_fn`. Coulomb makes this the definition of sliding,
+    # not a proxy. It CANNOT be recovered from a finished rollout, which is why it is recorded at
+    # collection time rather than inferred later.
+    record: true
+    normal_force_min_n: 5.0       # below this a contact is grazing and its cone is meaningless

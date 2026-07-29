@@ -50,12 +50,11 @@ from invariant_estimation.sim import collect
 REPO = Path(__file__).resolve().parent.parent
 
 
-def run_arm(fused, prep, cfg, t0: int, ticks: int, chol) -> dict[str, float]:
+def run_arm(fused, prep, cfg, t0: int, ticks: int, chol, P0) -> dict[str, float]:
     """Filter from a truth seed at `t0` for `ticks`, under contact chol `chol`."""
     xs = jax.tree.map(lambda a: jnp.asarray(a[t0:t0 + ticks]), prep.inputs)
     d0 = jnp.asarray(np.einsum("ij,kj->ki", prep.R_true[t0], prep.y_fk[t0])
                      + prep.p_true[t0][None, :])
-    P0 = np.load(REPO / "artifacts/p0.npz")["P0"]
     state0 = inekf_mod.initialize(
         fused.ekf, rotation=jnp.asarray(prep.R_true[t0]),
         velocity=jnp.asarray(prep.v_true[t0]),
@@ -89,6 +88,15 @@ def run_arm(fused, prep, cfg, t0: int, ticks: int, chol) -> dict[str, float]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("checkpoint")
+    # Explicit, because a hardcoded `data/` would silently score a network
+    # trained on one dataset against a different one and look perfectly healthy.
+    ap.add_argument("--data", default=str(REPO / "data"))
+    ap.add_argument("--cache", default=None, help="default <data>/cache")
+    ap.add_argument("--norm", default=None, help="default <data>/norm_constants.npz")
+    # P0 is MEASURED per dataset. Friction randomisation changes what the filter
+    # covariance settles to, so scoring DR data against the original set's P0
+    # would seed every arm from the wrong prior.
+    ap.add_argument("--p0", default=str(REPO / "artifacts/p0.npz"))
     ap.add_argument("--ticks", type=int, default=20_000)
     ap.add_argument("--starts", type=int, default=3)
     ap.add_argument("--rollouts", type=int, default=2)
@@ -96,18 +104,22 @@ def main() -> None:
 
     cfg = ContactNetConfig(F=24, sigma_0=1.0e-4)
     fused = collect.build_collector(verbose=False).fused
-    norm = normalize.load(str(REPO / "data/norm_constants.npz"))
-    preps = dataset.prepare(dataset.rollout_paths(REPO / "data")[:args.rollouts],
-                            norm, cfg, verbose=False)
+    data = Path(args.data)
+    cache = Path(args.cache) if args.cache else data / "cache"
+    norm = normalize.load(str(Path(args.norm) if args.norm
+                              else data / "norm_constants.npz"))
+    preps = dataset.prepare(dataset.rollout_paths(data)[:args.rollouts],
+                            norm, cfg, cache_dir=cache, verbose=False)
     like = network.init(jax.random.PRNGKey(0), cfg.d_in, cfg.widths,
                         cfg.sigma_0, cfg.eps)
     params = train.load_params(args.checkpoint, like)
     fwd = jax.jit(jax.vmap(jax.vmap(
         lambda x: network.forward(params, x, cfg.eps))))
 
-    print(f"replay eval: {args.checkpoint}")
-    print(f"  {len(preps)} rollouts x {args.starts} seeds, "
-          f"{args.ticks * cfg.dt:.0f} s each, all in-sample\n")
+    P0 = np.load(args.p0)["P0"]
+    print(f"replay eval: {args.checkpoint}  (P0 from {args.p0})")
+    print(f"  data={data}  {len(preps)} rollouts x {args.starts} seeds, "
+          f"{args.ticks * cfg.dt:.0f} s each\n")
 
     rows = {"heuristic": [], "trained": []}
     for prep in preps:
@@ -122,8 +134,8 @@ def main() -> None:
             L_net = fwd(flat)
             L_heur = jnp.broadcast_to(
                 cfg.sigma_0 * jnp.eye(3, dtype=jnp.float64), L_net.shape)
-            rows["heuristic"].append(run_arm(fused, prep, cfg, t0, args.ticks, L_heur))
-            rows["trained"].append(run_arm(fused, prep, cfg, t0, args.ticks, L_net))
+            rows["heuristic"].append(run_arm(fused, prep, cfg, t0, args.ticks, L_heur, P0))
+            rows["trained"].append(run_arm(fused, prep, cfg, t0, args.ticks, L_net, P0))
             print(f"  {prep.name} t0={t0:6d}  "
                   f"vel {rows['heuristic'][-1]['vel_rms']:.4f} -> "
                   f"{rows['trained'][-1]['vel_rms']:.4f}   "

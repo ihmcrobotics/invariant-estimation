@@ -54,12 +54,13 @@ Three facts that bite, all measured (see `bias_plateau`, `WARMUP_TICKS` and `__m
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import inspect
 import json
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import NamedTuple, Sequence
 
@@ -70,6 +71,7 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 
+from ..config import load_config
 from ..pipeline import main_estimator as me
 from ..pipeline.main_estimator import FusedSensors
 from ..inEKF.filter import InEKFInputs, JointFilterOutput
@@ -80,6 +82,7 @@ __all__ = [
     "DATA_DIR", "Rollout", "Collector", "build_collector", "terrain_field", "spawn_pose",
     "collect_rollout", "collect_all", "save_rollout", "load_rollout",
     "bias_plateau", "channel_report",
+    "DR_CONFIG_PATH", "DomainRandomization", "load_dr_config", "slip_fraction",
 ]
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -137,6 +140,224 @@ def spawn_pose(seed: int, *, radius: float = SPAWN_RADIUS) -> tuple[float, float
     r = np.random.default_rng(0xC0FFEE + int(seed))
     x, y = r.uniform(-radius, radius, 2)
     return float(x), float(y), float(r.uniform(-np.pi, np.pi))
+
+
+# ---------------------------------------------------------------------------
+# Domain randomisation (opt-in; `dr=None` reproduces every pre-existing rollout)
+# ---------------------------------------------------------------------------
+
+DR_CONFIG_PATH = REPO_ROOT / "config" / "collect_dr.yaml"
+
+
+@dataclass(frozen=True)
+class DomainRandomization:
+    """Per-rollout randomisation knobs. Built from `config/collect_dr.yaml`, never from a default.
+
+    Why this exists: the first 12-rollout dataset varied only terrain tilt, and came out
+    contact-wise near-identical (93-96 contact events, stance duty 0.630-0.642 across all 12).
+    A diagnostic then showed 79% of the learned contact covariance was explained by **gait phase
+    alone** — with one gait, "contact quality" and "stride phase" are the same variable, so a
+    stride-phase clock is the most a network can learn from it. The three knobs here each break
+    that identification in a different way:
+
+    * `friction` moves *where the contact sits in its cone* without moving the gait clock,
+    * `push` perturbs the robot at instants drawn independently of stride phase,
+    * `command` changes the gait clock itself (speed, heading, stance/walk, ride height).
+
+    Every field defaults to the disabled/neutral value, so a partially-filled YAML randomises only
+    what it names. `DomainRandomization()` with no arguments is a no-op except that it still
+    records slip.
+    """
+
+    seed: int = 20260728
+    """Base seed. Rollout `s` uses `default_rng(seed + 7919 * s)` — a stream independent of the
+    spawn-pose and IMU-noise streams, so friction/pushes/commands are not tied to the terrain."""
+
+    friction: bool = False
+    friction_range: tuple[float, float] = (0.3, 1.2)
+    friction_range_by_terrain: dict = dataclasses.field(default_factory=dict)
+    """Sliding friction written to `m.geom_friction[:, 0]` (all geoms; MuJoCo mixes the two geoms
+    of a contact by max, so setting every geom sets the contact). The policy's own training DR was
+    [0.8, 1.4], so anything below 0.8 is extrapolation — which is the point, and it is where the
+    slip is: measured over 8 s walks with pushes and command changes on, slip fraction goes
+    2.9% at mu=1.0 -> 8.5% at 0.40 -> 26% at 0.20 on flat.
+
+    **The floor is terrain-dependent and a fall costs a whole rollout**, so `friction_range` is the
+    conservative range that walked on all four terrains and `friction_range_by_terrain` overrides
+    it per terrain. Measured (8 s, seed 0, pushes + command resampling on):
+    `hard_stepping` walks at 0.30/0.45/0.60 and FALLS at 0.20; `stepping_stones` walks at 0.30;
+    `flat` and `waves` walk at 0.20 (43-44% and 34% slip)."""
+
+    push: bool = False
+    push_force_n: tuple[float, float] = (20.0, 100.0)
+    push_duration_s: tuple[float, float] = (0.10, 0.20)
+    push_interval_s: tuple[float, float] = (1.0, 3.0)
+    push_vertical_scale: float = 0.0
+    """Random shoves on the pelvis via `d.xfrc_applied[base_bid, :3]`, horizontal direction uniform
+    on the circle (`push_vertical_scale` adds a `U(-s, s)*|f|` z-component). Applied for
+    `push_duration_s` and separated by `push_interval_s`, i.e. at instants uncorrelated with the
+    stride — that decorrelation is the whole reason for the channel."""
+
+    command: bool = False
+    command_resample_s: tuple[float, float] = (2.0, 4.0)
+    vx_range: tuple[float, float] = (-0.5, 0.8)
+    vy_range: tuple[float, float] = (-0.35, 0.35)
+    yaw_rate_range: tuple[float, float] = (-0.8, 0.8)
+    base_height_range: tuple[float, float] | None = None
+    stand_prob: float = 0.15
+    """`run_policy.Loop.cmd = [vx, vy, yaw_rate, standing, base_height]`, resampled every
+    `command_resample_s`. `base_height_range=None` means the policy's own `height_range`; an
+    explicit range is CLIPPED to it (outside the band the policy never saw the command).
+    Note the measured tracking deadband (`run_policy.WALK_MIN_*`): |vx|<0.30, |vy|<0.28,
+    |yaw|<0.60 leave the robot standing whatever the command says — the ranges are deliberately
+    wide enough to straddle it rather than snapped past it."""
+
+    slip: bool = True
+    slip_normal_force_min_n: float = 5.0
+    """Friction-cone saturation recording (§ `_RecordingLoop._read_slip`). On by default under DR
+    because it cannot be recovered afterwards; independently available via `record_slip=True`."""
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "DomainRandomization":
+        """Build from the nested YAML shape. Unknown keys RAISE — a typo must not silently disable
+        a whole randomisation channel and leave a dataset that looks collected."""
+        d = dict(d or {})
+        pair = lambda v: None if v is None else (float(v[0]), float(v[1]))    # noqa: E731
+        out: dict = {}
+        if "seed" in d:
+            out["seed"] = int(d.pop("seed"))
+        groups = {
+            "friction": {"enabled": "friction", "range": "friction_range",
+                         "range_by_terrain": "friction_range_by_terrain"},
+            "push": {"enabled": "push", "force_n": "push_force_n",
+                     "duration_s": "push_duration_s", "interval_s": "push_interval_s",
+                     "vertical_scale": "push_vertical_scale"},
+            "command": {"enabled": "command", "resample_s": "command_resample_s",
+                        "vx": "vx_range", "vy": "vy_range", "yaw_rate": "yaw_rate_range",
+                        "base_height": "base_height_range", "stand_prob": "stand_prob"},
+            "slip": {"record": "slip", "normal_force_min_n": "slip_normal_force_min_n"},
+        }
+        for g, keys in groups.items():
+            sub = dict(d.pop(g, {}) or {})
+            for k, v in sub.items():
+                if k not in keys:
+                    raise KeyError(f"collect_dr: unknown key '{g}.{k}'; have {sorted(keys)}")
+                fld = keys[k]
+                if fld == "friction_range_by_terrain":
+                    bad = [t for t in (v or {}) if t not in tr.TERRAINS]
+                    if bad:
+                        raise KeyError(f"collect_dr: friction.range_by_terrain names unknown "
+                                       f"terrain(s) {bad}; have {list(tr.TERRAINS)}")
+                    out[fld] = {str(t): pair(r) for t, r in (v or {}).items()}
+                elif fld in ("friction", "push", "command", "slip"):
+                    out[fld] = bool(v)
+                elif fld in ("push_vertical_scale", "stand_prob", "slip_normal_force_min_n"):
+                    out[fld] = float(v)
+                else:
+                    out[fld] = pair(v)
+        if d:
+            raise KeyError(f"collect_dr: unknown section(s) {sorted(d)}; "
+                           f"have {sorted(groups)} + 'seed'")
+        return cls(**out)
+
+    def to_meta(self) -> dict:
+        """JSON-safe dict for `Rollout.meta['dr']` (tuples -> lists)."""
+        j = lambda v: list(v) if isinstance(v, tuple) else v                  # noqa: E731
+        return {k: ({t: j(r) for t, r in v.items()} if isinstance(v, dict) else j(v))
+                for k, v in asdict(self).items()}
+
+    def friction_for(self, terrain: str) -> tuple[float, float]:
+        """The sampling range for `terrain` — the per-terrain override if it has one."""
+        return tuple(self.friction_range_by_terrain.get(terrain, self.friction_range))
+
+    def rng(self, seed: int) -> np.random.Generator:
+        return np.random.default_rng(int(self.seed) + 7919 * int(seed))
+
+    def max_speed(self, vx: float) -> float:
+        """Fastest horizontal command this config can issue — for the on-field pre-flight."""
+        if not self.command:
+            return abs(vx)
+        return float(np.hypot(max(abs(v) for v in self.vx_range),
+                              max(abs(v) for v in self.vy_range)))
+
+
+def load_dr_config(path: Path | str | None = None) -> tuple[DomainRandomization, dict]:
+    """Read `config/collect_dr.yaml` -> `(DomainRandomization, run_settings)`.
+
+    Deliberately a SEPARATE file from `filter_cfg.yaml` / `alex_*.yaml`: this one changes the
+    dataset, not the filter, and the pre-DR rollouts must stay reproducible from a repo where this
+    file does not exist at all. Reuses `config.load_config` only for its YAML-1.1 exponent trap
+    (`1.0e9` parses as a *string*), which bites here exactly as it does in the filter configs.
+    """
+    cfg = load_config(Path(path) if path is not None else DR_CONFIG_PATH)
+    return DomainRandomization.from_dict(cfg.get("dr", {})), dict(cfg.get("run", {}) or {})
+
+
+def _push_schedule(dr: DomainRandomization, rng: np.random.Generator,
+                   t0: float, t1: float) -> list[list[float]]:
+    """`[[t_start, t_end, fx, fy, fz], ...]` over the WALK window `[t0, t1)`, in seconds."""
+    if not dr.push:
+        return []
+    events: list[list[float]] = []
+    t = t0 + float(rng.uniform(*dr.push_interval_s))
+    while t < t1:
+        dur = float(rng.uniform(*dr.push_duration_s))
+        mag = float(rng.uniform(*dr.push_force_n))
+        th = float(rng.uniform(-np.pi, np.pi))
+        fz = mag * float(rng.uniform(-1.0, 1.0)) * float(dr.push_vertical_scale)
+        events.append([t, min(t + dur, t1), mag * np.cos(th), mag * np.sin(th), fz])
+        t += dur + float(rng.uniform(*dr.push_interval_s))
+    return events
+
+
+def _push_trace(events: Sequence[Sequence[float]], T: int, dt: float) -> np.ndarray:
+    """Rasterise a push schedule onto the physics grid: `(T, 3)` N, index = physics tick.
+
+    Rasterising up front (rather than testing the schedule inside the loop) makes the applied
+    force a recorded array, so what the robot actually felt is in the `.npz` and not only
+    reconstructible from the schedule and a reader's assumptions about rounding.
+    """
+    f = np.zeros((T, 3), dtype=np.float64)
+    for t0, t1, fx, fy, fz in events:
+        lo, hi = int(round(t0 / dt)), int(round(t1 / dt))
+        f[max(0, lo):max(0, min(T, hi))] = (fx, fy, fz)
+    return f
+
+
+def _command_schedule(dr: DomainRandomization, rng: np.random.Generator, *,
+                      walk_tick: int, total_ticks: int, control_dt: float,
+                      height_range: tuple[float, float]) -> dict[int, list[float]]:
+    """`{control_tick: [vx, vy, yaw, standing, height]}`, first entry exactly at `walk_tick`."""
+    lo, hi = height_range
+    if dr.base_height_range is not None:
+        lo = max(lo, dr.base_height_range[0])
+        hi = min(hi, dr.base_height_range[1])
+        if lo > hi:
+            raise ValueError(f"base_height {dr.base_height_range} does not intersect the policy's "
+                             f"height_range {height_range}")
+    out: dict[int, list[float]] = {}
+    k = int(walk_tick)
+    while k < total_ticks:
+        h = float(rng.uniform(lo, hi))
+        if float(rng.random()) < dr.stand_prob:
+            out[k] = [0.0, 0.0, 0.0, 1.0, h]
+        else:
+            out[k] = [float(rng.uniform(*dr.vx_range)), float(rng.uniform(*dr.vy_range)),
+                      float(rng.uniform(*dr.yaw_rate_range)), 0.0, h]
+        k += max(1, int(round(float(rng.uniform(*dr.command_resample_s)) / control_dt)))
+    return out
+
+
+def slip_fraction(slip_sat: np.ndarray, contact_fn: np.ndarray, *,
+                  threshold: float = 0.99) -> float:
+    """Fraction of LOADED (tick, foot) samples whose contact is at its friction cone.
+
+    Comparable with `experiments/friction_feasibility.probe`'s `slip_frac`: `contact_fn > 0`
+    already encodes "at least one contact carried >= `slip_normal_force_min_n`".
+    """
+    loaded = np.asarray(contact_fn) > 0.0
+    n = int(loaded.sum())
+    return float((np.asarray(slip_sat)[loaded] >= threshold).sum() / n) if n else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -212,13 +433,63 @@ class _RecordingLoop(rp.Loop):
     from `MjData`, i.e. ground truth: this loop does not close the estimator into the gait.
     """
 
-    def __init__(self, m, policy, maps, reader: SimSensorReader):
+    def __init__(self, m, policy, maps, reader: SimSensorReader, *,
+                 push: np.ndarray | None = None, slip_fn_min: float | None = None,
+                 record_cmd: bool = False):
         super().__init__(m, policy, maps)
         self.reader = reader
         self.sensors: list = []
         self.truth: list = []
         self.sim_s = 0.0        # wall time in mj_step + policy
         self.read_s = 0.0       # wall time in sensor extraction (collector overhead)
+
+        # -- opt-in extras. Each one is `None`/False by default and every use of it is guarded, so
+        # -- with all three off this class steps EXACTLY the sim it stepped before they existed.
+        self.push = push                    # (T, 3) N on the pelvis, indexed by physics tick
+        self.slip_fn_min = slip_fn_min      # None = do not compute friction-cone saturation
+        self.record_cmd = bool(record_cmd)
+        self.tick = 0
+        self.slip_sat: list = []
+        self.contact_fn: list = []
+        self.cmd_log: list = []
+        self._frc = np.zeros(6)
+        self._foot_slot = {}
+        for slot, name in enumerate(rp.FOOT_GEOMS):
+            gid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, name)
+            if gid < 0:
+                raise KeyError(f"foot geom {name!r} is not in the compiled model")
+            self._foot_slot[gid] = slot
+        self.n_feet = len(rp.FOOT_GEOMS)
+
+    def _read_slip(self) -> tuple[np.ndarray, np.ndarray]:
+        """Per foot: worst friction-cone saturation `|f_t| / (mu f_n)`, and total normal force.
+
+        Coulomb makes this the DEFINITION of sliding rather than a proxy — a contact strictly
+        inside its cone cannot slide — which is why it is read from `mj_contactForce` here, at
+        collection time, and not differentiated out of FK later. `mu` comes from
+        `contact.friction[0]`, i.e. the resolved pair value MuJoCo actually enforced, not from the
+        friction this rollout *sampled*: with `condim=4` and per-geom overrides those can differ.
+
+        A foot with no contact carrying at least `slip_fn_min` reports `(0, 0)` — swing, and
+        `contact_fn == 0` is the flag that says "this sample is not evidence about slip".
+        """
+        sat = np.zeros(self.n_feet)
+        fn_tot = np.zeros(self.n_feet)
+        d = self.d
+        for i in range(d.ncon):
+            c = d.contact[i]
+            slot = self._foot_slot.get(int(c.geom1), self._foot_slot.get(int(c.geom2), -1))
+            if slot < 0:
+                continue
+            mujoco.mj_contactForce(self.m, d, i, self._frc)
+            fn = abs(float(self._frc[0]))
+            if fn < self.slip_fn_min:               # grazing contact: no usable cone
+                continue
+            mu = float(c.friction[0])
+            s = float(np.hypot(self._frc[1], self._frc[2])) / max(1e-9, mu * fn)
+            sat[slot] = max(sat[slot], s)
+            fn_tot[slot] += fn
+        return sat, fn_tot
 
     def control_tick(self):
         t0 = time.perf_counter()
@@ -229,6 +500,10 @@ class _RecordingLoop(rp.Loop):
         self.d.ctrl[self.maps["ALL_AID"]] = self.maps["ALL_HOME"]
         self.d.ctrl[self.maps["AID"]] = self.maps["HOME"] + self.scale * self.last_action
         for _ in range(rp.DECIMATION):
+            if self.push is not None:
+                # Written EVERY tick, so the zero rows of the trace also do the clearing; a push
+                # that is set once and never cleared runs for the rest of the rollout.
+                self.d.xfrc_applied[self.reader.base_bid, :3] = self.push[self.tick]
             mujoco.mj_step(self.m, self.d)
             t1 = time.perf_counter()
             self.sim_s += t1 - t0
@@ -237,6 +512,13 @@ class _RecordingLoop(rp.Loop):
             # Schmitt/dwell trajectory that the joint KF's stance anchors ride on.
             self.sensors.append(self.reader.read(self.d))
             self.truth.append(self.reader.truth(self.d))
+            if self.slip_fn_min is not None:
+                s, f = self._read_slip()
+                self.slip_sat.append(s)
+                self.contact_fn.append(f)
+            if self.record_cmd:
+                self.cmd_log.append(self.cmd.copy())
+            self.tick += 1
             t0 = time.perf_counter()
             self.read_s += t0 - t1
         self._ramp_t += rp.DECIMATION * rp.DT
@@ -271,6 +553,8 @@ def collect_rollout(
     field_margin: float = FIELD_MARGIN,
     max_tilt_deg: float = MAX_TILT_DEG,
     warmup_ticks: int | None = None,
+    dr: DomainRandomization | None = None,
+    record_slip: bool = False,
     out_dir: Path | str | None = DATA_DIR,
     verbose: bool = True,
 ) -> Rollout:
@@ -283,20 +567,53 @@ def collect_rollout(
 
     `warmup_ticks` (metadata only, nothing is dropped) defaults to the measured joint-KF bias
     plateau; pass an explicit value to override.
+
+    `dr` (default `None`) turns on domain randomisation — friction, pelvis pushes, and a resampled
+    velocity/height command, plus the slip instrumentation. **With `dr=None` this function is
+    bit-for-bit what it was before domain randomisation existed**: no `geom_friction` write, no
+    `xfrc_applied` write, no extra `mj_contactForce` call, the same constant `vx` command and the
+    same set of saved fields. That is load-bearing — the pre-DR 12-rollout dataset has to stay
+    reproducible. `record_slip=True` adds ONLY the friction-cone arrays (a read, never a write, so
+    the trajectory is still unchanged), which is how a DR-off slip baseline is measured.
+
+    Extra saved fields, each present only when its switch is on:
+
+    ==================  ==========  ====================================================
+    key                 shape       when
+    ==================  ==========  ====================================================
+    truth.slip_sat      (T, 2)      `record_slip` or `dr.slip` — worst cone saturation/foot
+    truth.contact_fn    (T, 2)      idem — summed normal force/foot; 0 ⇒ no loaded contact
+    truth.push_force    (T, 3)      `dr is not None` — N applied to the pelvis
+    truth.cmd           (T, 5)      `dr is not None` — the live `[vx,vy,yaw,stand,height]`
+    ==================  ==========  ====================================================
     """
     c = collector or build_collector(verbose=verbose)
     n_ticks = int(round(seconds / CONTROL_DT))
     settle_ticks = int(round(settle_s / CONTROL_DT))
     total_ticks = settle_ticks + n_ticks
     T = total_ticks * rp.DECIMATION
+    want_slip = bool(record_slip or (dr is not None and dr.slip))
 
     # -- pre-flight: can this rollout even fit on the field? ------------------
-    reach = spawn_radius + abs(vx) * seconds + field_margin
-    if reach > tr.EXTENT / 2:
-        raise ValueError(
-            f"a {seconds:.0f}s rollout at vx={vx} from a +-{spawn_radius}m spawn reaches "
-            f"{reach:.1f}m, past the {tr.EXTENT / 2:.0f}m half-extent of the heightfield; "
-            "shorten the rollout or shrink the spawn box")
+    # The straight-line bound is exact for a FIXED forward command and hopelessly
+    # pessimistic once the yaw command is resampled: the path becomes a random
+    # walk, and measured combined-DR travel is 6.4 m net in 20 s against the
+    # 17.5 m this bound would charge. Applying it to a randomised rollout would
+    # cap `seconds` at ~31 s, and with a fixed 16 s joint-KF warm-up per rollout
+    # that throws away more usable trajectory than it protects.
+    #
+    # So randomised rollouts are policed by `_off_field` at runtime instead --
+    # strictly stronger, since it observes where the robot actually went rather
+    # than bounding where it could have. The static bound still guards the
+    # fixed-command path, where it is tight and free.
+    safe_radius = tr.EXTENT / 2 - field_margin
+    if dr is None:
+        reach = spawn_radius + abs(vx) * seconds + field_margin
+        if reach > tr.EXTENT / 2:
+            raise ValueError(
+                f"a {seconds:.0f}s rollout at vx={vx} from a +-{spawn_radius}m spawn reaches "
+                f"{reach:.1f}m, past the {tr.EXTENT / 2:.0f}m half-extent of the heightfield; "
+                "shorten the rollout or shrink the spawn box")
 
     # -- model ---------------------------------------------------------------
     field = terrain_field(terrain_name, seed)
@@ -308,10 +625,33 @@ def collect_rollout(
     if not np.allclose(got, field, atol=1e-6):
         raise RuntimeError("hfield_data does not match the rasterised field")
 
+    # -- domain randomisation: sample it all BEFORE the run, record it, then run -----------------
+    # Sampling up front (rather than drawing inside the loop) is what makes a DR rollout replayable
+    # from its own metadata: `meta["friction_mu"]`, `meta["push_schedule"]` and
+    # `meta["cmd_schedule"]` are the complete description of what was done to the robot.
+    rng = None if dr is None else dr.rng(seed)
+    mu = None
+    push_trace = cmd_events = None
+    push_events: list = []
+    if dr is not None:
+        if dr.friction:
+            mu = float(rng.uniform(*dr.friction_for(terrain_name)))
+            # Every geom, not just the floor: MuJoCo mixes a contact pair's sliding friction by
+            # `max` unless a priority is set, so overriding one side alone does nothing.
+            m.geom_friction[:, 0] = mu
+        push_events = _push_schedule(dr, rng, settle_s, settle_s + seconds)
+        push_trace = _push_trace(push_events, T, rp.DT)
+        cmd_events = _command_schedule(
+            dr, rng, walk_tick=settle_ticks, total_ticks=total_ticks, control_dt=CONTROL_DT,
+            height_range=tuple(c.policy["height_range"]))
+
     reader = SimSensorReader(m, c.fused, foot_geoms=rp.FOOT_GEOMS, dt=c.dt,
                              noise=IMUNoise(seed=int(seed)) if imu_noise else None,
                              stance_chol=stance_chol, swing_chol=swing_chol)
-    loop = _RecordingLoop(m, c.policy, rp.make_maps(m, c.policy), reader)
+    loop = _RecordingLoop(m, c.policy, rp.make_maps(m, c.policy), reader,
+                          push=push_trace, record_cmd=dr is not None,
+                          slip_fn_min=(float(dr.slip_normal_force_min_n) if dr is not None
+                                       else 5.0) if want_slip else None)
 
     # -- spawn ---------------------------------------------------------------
     x0, y0, yaw = spawn_pose(seed, radius=spawn_radius)
@@ -335,18 +675,44 @@ def collect_rollout(
     if verbose:
         print(f"  {terrain_name}/seed{seed}: relief={floor.relief * 100:.1f}cm  "
               f"spawn=({x0:+.1f},{y0:+.1f})m yaw={np.degrees(yaw):+.0f}deg  "
-              f"{settle_s:.0f}s settle + {seconds:.0f}s walk -> T={T} ticks")
+              f"{settle_s:.0f}s settle + {seconds:.0f}s walk -> T={T} ticks"
+              + ("" if dr is None else
+                 f"\n    DR: mu={'-' if mu is None else f'{mu:.2f}'}  "
+                 f"{len(push_events)} pushes  {len(cmd_events)} commands"))
     for k in range(total_ticks):
         if k >= settle_ticks:
-            loop.cmd[0:3] = (vx, 0.0, 0.0)
-            loop.cmd[3] = 0.0
+            if cmd_events is None:
+                loop.cmd[0:3] = (vx, 0.0, 0.0)
+                loop.cmd[3] = 0.0
+            elif k in cmd_events:
+                ev = cmd_events[k]
+                loop.cmd[0:3] = ev[0:3]
+                loop.cmd[3] = ev[3]
+                # `cmd[4]` is overwritten every tick by the height ramp, so the height command has
+                # to go through `set_height_target` — writing `cmd[4]` directly is a no-op.
+                loop.set_height_target(ev[4])
         loop.control_tick()
         if not np.all(np.isfinite(loop.d.qpos)):
             raise RuntimeError(f"{terrain_name}/seed{seed}: non-finite qpos at control tick {k}")
+        # Off-field is the one failure that stays perfectly finite: past the edge
+        # MuJoCo clamps the hfield and the robot walks onto an infinite extrusion
+        # of the boundary row, so every downstream check still passes on data that
+        # is physically meaningless. Fail loudly instead of recording it.
+        if float(np.hypot(*loop.d.qpos[0:2])) > safe_radius:
+            raise RuntimeError(
+                f"{terrain_name}/seed{seed}: left the heightfield at control tick {k} "
+                f"({np.hypot(*loop.d.qpos[0:2]):.1f} m from centre, safe radius "
+                f"{safe_radius:.1f} m)")
 
     sensors = _stack(loop.sensors)
     truth = _stack(loop.truth)
     assert len(loop.sensors) == T, f"recorded {len(loop.sensors)} ticks, expected {T}"
+    if want_slip:
+        truth["slip_sat"] = np.asarray(loop.slip_sat, dtype=np.float64)
+        truth["contact_fn"] = np.asarray(loop.contact_fn, dtype=np.float64)
+    if dr is not None:
+        truth["push_force"] = np.asarray(push_trace, dtype=np.float64)
+        truth["cmd"] = np.asarray(loop.cmd_log, dtype=np.float64)
 
     # -- did this rollout produce data at all? --------------------------------
     tilt = _check_rollout(truth, max_tilt_deg=max_tilt_deg,
@@ -391,12 +757,29 @@ def collect_rollout(
         "wall_read_s": loop.read_s,
         "wall_fused_s": fused_s,
         "wall_fused_chunks_s": chunk_wall,
+        # What was randomised, in full. `dr: null` on every pre-DR rollout, so a loader can tell
+        # the two dataset generations apart without guessing from which keys exist.
+        "dr": None if dr is None else dr.to_meta(),
+        "friction_mu": mu,
+        "push_schedule": push_events,               # [[t0, t1, fx, fy, fz], ...] seconds / N
+        "cmd_schedule": ([] if cmd_events is None else
+                         [[k * CONTROL_DT] + list(v) for k, v in sorted(cmd_events.items())]),
+        "slip_normal_force_min_n": (float(loop.slip_fn_min) if want_slip else None),
     }
+    if want_slip:
+        meta["slip_fraction"] = slip_fraction(truth["slip_sat"], truth["contact_fn"])
+        loaded = truth["contact_fn"] > 0.0
+        sat = truth["slip_sat"][loaded] if loaded.any() else np.zeros(1)
+        meta["slip_sat_p50"] = float(np.percentile(sat, 50))
+        meta["slip_sat_p99"] = float(np.percentile(sat, 99))
     if verbose:
         sim_s = seconds + settle_s
         print(f"    travelled={travelled:.1f}m  tilt_max={tilt.max():.1f}deg  "
-              f"wall: sim={loop.sim_s:.1f}s read={loop.read_s:.1f}s fused={fused_s:.1f}s "
-              f"({(loop.sim_s + loop.read_s + fused_s) / sim_s:.2f} s/sim-s)")
+              + (f"slip={100 * meta['slip_fraction']:.1f}% "
+                 f"(cone p50={meta['slip_sat_p50']:.2f} p99={meta['slip_sat_p99']:.2f})  "
+                 if want_slip else "")
+              + f"wall: sim={loop.sim_s:.1f}s read={loop.read_s:.1f}s fused={fused_s:.1f}s "
+                f"({(loop.sim_s + loop.read_s + fused_s) / sim_s:.2f} s/sim-s)")
 
     roll = Rollout(sensors=sensors, inputs=inputs, truth=truth, aux=aux, meta=meta)
     _assert_float64(roll)
@@ -818,15 +1201,47 @@ if __name__ == "__main__":
     ap.add_argument("--chunk", type=int, default=10_000)
     ap.add_argument("--out", default=str(DATA_DIR))
     ap.add_argument("--no-noise", action="store_true", help="clean sensors (no bias to converge)")
+    ap.add_argument("--dr", nargs="?", const=str(DR_CONFIG_PATH), default=None,
+                    metavar="YAML", help="domain-randomised collection; bare --dr uses "
+                                         f"{DR_CONFIG_PATH.relative_to(REPO_ROOT)}")
+    ap.add_argument("--record-slip", action="store_true",
+                    help="friction-cone instrumentation WITHOUT randomisation (the DR-off "
+                         "baseline; a read only, so the trajectory is unchanged)")
+    ap.add_argument("--dr-seed", type=int, default=None, help="override the DR config's seed")
     ap.add_argument("--measure", action="store_true",
                     help="(A) bias warm-up + (B) throughput, one long rollout per terrain")
     ap.add_argument("--seed", type=int, default=0, help="--measure only")
     ap.add_argument("--save", action="store_true", help="--measure only: also write the .npz")
     args = ap.parse_args()
 
+    dr = None
+    if args.dr is not None:
+        dr, run = load_dr_config(args.dr)
+        if args.dr_seed is not None:
+            dr = dataclasses.replace(dr, seed=int(args.dr_seed))
+        # The config's `run:` section supplies defaults; anything given on the command line wins.
+        given = set(sys.argv[1:])
+        if "--terrain" not in given and run.get("terrains"):
+            args.terrain = list(run["terrains"])
+        if "--seeds" not in given and run.get("seeds"):
+            args.seeds = [int(s) for s in run["seeds"]]
+        if "--seconds" not in given and run.get("seconds") is not None:
+            args.seconds = float(run["seconds"])
+        if "--chunk" not in given and run.get("chunk_ticks") is not None:
+            args.chunk = int(run["chunk_ticks"])
+        if "--out" not in given and run.get("out_dir"):
+            args.out = str(Path(run["out_dir"]) if Path(run["out_dir"]).is_absolute()
+                           else REPO_ROOT / run["out_dir"])
+        settle = float(run.get("settle_s", SETTLE_S))
+        print(f"domain randomisation from {args.dr}:\n  {dr}\n  -> {args.out}")
+
     if args.measure:
         _measure(args)
+    elif dr is not None:
+        collect_all(args.terrain, args.seeds, args.seconds, out_dir=args.out,
+                    collector=build_collector(chunk_ticks=args.chunk),
+                    vx=args.vx, imu_noise=not args.no_noise, dr=dr, settle_s=settle)
     else:
         collect_all(args.terrain, args.seeds, args.seconds, out_dir=args.out,
                     collector=build_collector(chunk_ticks=args.chunk),
-                    vx=args.vx, imu_noise=not args.no_noise)
+                    vx=args.vx, imu_noise=not args.no_noise, record_slip=args.record_slip)

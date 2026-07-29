@@ -11,6 +11,9 @@ is the arrangement on the real robot.
     uv run python run_estimator.py --policy baseline --headless --source truth   # A/B: estimator
                                                                                  # runs but does
                                                                                  # not drive
+    uv run python run_estimator.py --policy baseline --headless --ticks 1500 --vx 0.6 \
+        --contactnet artifacts/contactnet_run4.npz \
+        --contactnet-norm data/dr/norm_constants.npz     # learned contact noise in the loop
 Every run scores the estimate against the sim's own state (attitude, tilt-as-seen-by-the-policy,
 gyro, velocity, position drift, joint state) and can dump the full history to `.npz`.
 
@@ -132,6 +135,12 @@ class EstimatedLoop(rp.Loop):
             "omega_norm": np.linalg.norm(t["omega"]),
             "v_err": np.linalg.norm(est.v - t["v"]),
             "p_err": np.linalg.norm(est.p - t["p"]),
+            # Signed VERTICAL error, kept separately from the 3D norm. The failure this run
+            # exists to detect -- the estimate sinking into the ground -- is a one-sided z
+            # error, and `p_err` (a norm, dominated by the forward-travel scale error) cannot
+            # show it. `dz_abs` is what the RMS/max columns score.
+            "dz": float(est.p[2] - t["p"][2]),
+            "dz_abs": float(abs(est.p[2] - t["p"][2])),
             "q_err": float(np.abs(est.q - t["q"]).max()),
             "qd_err": float(np.abs(est.q_dot - t["q_dot"]).max()),
             "bias_norm": float(np.linalg.norm(est.bias)),
@@ -150,15 +159,15 @@ class EstimatedLoop(rp.Loop):
         h = self.history[-1]
         return (f"est: tilt_err={h['tilt_deg']:5.2f}deg att={h['att_deg']:5.2f}deg "
                 f"|dw|={h['omega_err']:.3f} (|w|={h['omega_norm']:.2f}) "
-                f"|dv|={h['v_err']:.3f} |dp|={h['p_err']:.3f} feet={h['trusted']:.0f} "
-                f"NIS={h['nis']:.1f}")
+                f"|dv|={h['v_err']:.3f} |dp|={h['p_err']:.3f} dz={h['dz']:+.3f} "
+                f"feet={h['trusted']:.0f} NIS={h['nis']:.1f}")
 
 
 def summarise(history, tail_frac=0.5):
     """Error summary over the whole run and over its last `tail_frac` (post-transient)."""
     if not history:
         return {}
-    keys = ("att_deg", "tilt_deg", "omega_err", "v_err", "p_err", "q_err", "qd_err")
+    keys = ("att_deg", "tilt_deg", "omega_err", "v_err", "p_err", "dz_abs", "q_err", "qd_err")
     a = {k: np.array([h[k] for h in history]) for k in keys}
     n0 = int(len(history) * (1.0 - tail_frac))
     out = {}
@@ -167,6 +176,14 @@ def summarise(history, tail_frac=0.5):
         out[f"{k}_max"] = float(a[k].max())
         out[f"{k}_tail_rms"] = float(np.sqrt((a[k][n0:] ** 2).mean()))
     out["final_p_err"] = float(history[-1]["p_err"])
+    # Signed, so a report cannot hide which way it went: negative = the estimate believes it
+    # is BELOW where it really is, i.e. sinking into the ground.
+    dz = np.array([h["dz"] for h in history])
+    out["final_dz"] = float(dz[-1])
+    out["mean_dz"] = float(dz.mean())
+    out["tail_mean_dz"] = float(dz[n0:].mean())
+    out["min_dz"] = float(dz.min())
+    out["max_dz"] = float(dz.max())
     out["duration_s"] = float(history[-1]["t"])
     return out
 
@@ -184,10 +201,15 @@ def print_summary(history):
                            ("omega_err", "base gyro error", "rad/s"),
                            ("v_err", "base velocity error", "m/s"),
                            ("p_err", "base position error", "m"),
+                           ("dz_abs", "VERTICAL |dz| error", "m"),
                            ("q_err", "joint pos error", "rad"),
                            ("qd_err", "joint vel error", "rad/s")):
         print(f"    {label + ' [' + unit + ']':22s} {s[k + '_rms']:10.4f} {s[k + '_max']:10.4f} "
               f"{s[k + '_tail_rms']:16.4f}")
+    print(f"    signed dz (est_z - true_z) [m]: final={s['final_dz']:+.4f} "
+          f"mean={s['mean_dz']:+.4f} tail_mean={s['tail_mean_dz']:+.4f} "
+          f"range=[{s['min_dz']:+.4f}, {s['max_dz']:+.4f}]   "
+          f"(negative = estimate sinking into the ground)")
     return s
 
 
@@ -195,10 +217,53 @@ def print_summary(history):
 # Wiring
 # ---------------------------------------------------------------------------
 
+def attach_contactnet(fused, reader, ckpt, norm_path, *, verbose=True):
+    """Attach a trained ContactNet to `fused`, returning the new estimator.
+
+    The two paths are printed together on purpose: a checkpoint is only meaningful next to the
+    normalization constants it was TRAINED under. Load a run-4 checkpoint against
+    `data/norm_constants.npz` (the pre-DR constants) and the network sees a shifted input
+    distribution -- nothing raises, and every number the run produces is worthless. The log line
+    is the record of which pair was actually used.
+    """
+    import jax
+
+    from invariant_estimation.contactnet import network, normalize, train
+    from invariant_estimation.contactnet.config import ContactNetConfig
+    from invariant_estimation.contactnet.features import build_subchain_indices
+
+    # The trained config (artifacts/contactnet_run{2,4}.history.json): F=24, sigma_0=1e-4, and
+    # the ContactNetConfig defaults for everything else (H=50, window_span_s=0.392, dt=1e-3,
+    # widths=(256,256)). dt matches `run_policy.DT`, which is what turns the window SPAN into
+    # ticks -- a mismatch there is a silently different network input.
+    cfg = ContactNetConfig(F=24, sigma_0=1.0e-4)
+    like = network.init(jax.random.PRNGKey(0), cfg.d_in, cfg.widths, cfg.sigma_0, cfg.eps)
+    params = train.load_params(ckpt, like)
+    consts = normalize.load(norm_path)
+    # `reader.unfiltered_names` is the same resolution `sim.collect._unfiltered_names` does
+    # (`_dof_joint_names(mj_model, build.dof_anchor_unfiltered)`) -- one source of truth, never
+    # a hand-written ankle list.
+    sub = build_subchain_indices(fused.build.joint_names, reader.unfiltered_names)
+    fused = me.with_contactnet(fused, params, cfg, consts, sub)
+    if verbose:
+        print(f"ContactNet: ATTACHED  ckpt={ckpt}  norm={norm_path} "
+              f"({consts.n_ticks} ticks, source={consts.source!r})")
+        print(f"            cfg F={cfg.F} H={cfg.H} span={cfg.window_span_s}s "
+              f"stride={cfg.stride} dt={cfg.dt} widths={cfg.widths} sigma_0={cfg.sigma_0}; "
+              f"warm-up {online_span(cfg)} ticks of analytic sigma_0^2 I before it acts")
+    return fused
+
+
+def online_span(cfg):
+    from invariant_estimation.contactnet import online as cn_online
+    return cn_online.span_ticks(cfg)
+
+
 def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
                         noise=None, est_dt=None, contact_meas_var=0.0,
                         stance_chol=1.0e-4, swing_chol=1.0e1,
-                        contact_fk_unfiltered=True, est_every=1, verbose=True):
+                        contact_fk_unfiltered=True, est_every=1, verbose=True,
+                        contactnet=None, contactnet_norm=None):
     t0 = time.time()
     policy = rp.load_policy(policy_name)
     m = rp.build_sim_model(policy, with_visuals=with_visuals, with_imu_sensors=True)
@@ -220,6 +285,12 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
         print(f"           policy reads {list(sources)} from the estimate; "
               f"noise={'on' if noise else 'off'}; contact FK uses "
               f"{'MEASURED' if fused.n_aux else 'qpos0-pinned'} off-path joints")
+    # After the estimator is built (the seam takes its kinematics and base IMU from `fused`) and
+    # before the loop -- `EstimatedLoop` builds the runtime, which closes over the fused step.
+    if contactnet:
+        fused = attach_contactnet(fused, reader, contactnet, contactnet_norm, verbose=verbose)
+    elif verbose:
+        print("ContactNet: not attached (analytic contact noise)")
     loop = EstimatedLoop(m, policy, maps, fused=fused, reader=reader, sources=sources,
                          est_every=est_every)
     loop.rt.warmup(loop.batch)      # pay the ~11 s XLA compile here, not on the first tick
@@ -322,6 +393,15 @@ if __name__ == "__main__":
                     help="physics steps per estimator step: 1 = the 200 Hz physics rate "
                          "(faithful), 4 = one step per control tick (50 Hz), which makes the "
                          "viewer run at roughly real time")
+    ap.add_argument("--contactnet", default=None, metavar="CKPT.npz",
+                    help="attach a trained ContactNet (e.g. artifacts/contactnet_run4.npz); "
+                         "off by default, which is the analytic contact noise")
+    ap.add_argument("--contactnet-norm", default="data/dr/norm_constants.npz",
+                    metavar="NORM.npz",
+                    help="normalization constants -- MUST be the ones the checkpoint was "
+                         "trained under (run 4 -> data/dr/norm_constants.npz; "
+                         "run 2 -> data/norm_constants.npz). A mismatch shifts the network's "
+                         "input distribution and nothing raises")
     ap.add_argument("--out", default=None, help="write the per-tick history to this .npz")
     ap.add_argument("--video", default=None, metavar="PATH.mp4",
                     help="record the run offscreen to an H.264 file (implies --headless; needs "
@@ -346,7 +426,8 @@ if __name__ == "__main__":
         noise=IMUNoise(seed=args.noise_seed) if args.imu_noise else None,
         contact_meas_var=args.contact_meas_var,
         stance_chol=args.stance_chol, swing_chol=args.swing_chol,
-        contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every)
+        contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every,
+        contactnet=args.contactnet, contactnet_norm=args.contactnet_norm)
     if headless:
         run_headless(loop, args.ticks, cmd=(args.vx, args.vy, args.yaw), out=args.out,
                      video=args.video, video_fps=args.video_fps, video_size=video_size)

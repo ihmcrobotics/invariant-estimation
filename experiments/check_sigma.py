@@ -68,6 +68,8 @@ def gain_columns(P0: np.ndarray, sigma_c: np.ndarray,
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("checkpoint")
+    # Explicit: evaluating a network against the norm constants of a *different*
+    # dataset shifts its input distribution and reports nonsense confidently.
     ap.add_argument("--cache", default=str(REPO / "data/cache"))
     ap.add_argument("--norm", default=str(REPO / "data/norm_constants.npz"))
     ap.add_argument("--p0", default=str(REPO / "artifacts/p0.npz"))

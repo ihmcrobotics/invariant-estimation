@@ -3152,3 +3152,147 @@ collection: **collect a small friction-randomised batch and re-run the
 phase-R² diagnostic.** R² dropping well below 0.79 is the evidence the
 intervention worked; R² staying near 0.79 is the evidence that motion diversity
 (dancing / mimic motions), not friction, is the necessary change.
+
+---
+
+## ContactNet closed the loop: z drift cut 8x in sim (2026-07-29)
+
+The first closed-loop evidence in this project. Everything before this was
+open-loop replay, where the estimate never affects the motion.
+
+`run_estimator.py` gains `--contactnet CKPT` / `--contactnet-norm NORM`.
+`estimator_loop.py` needed **no change** — it tree-maps over whatever
+`init_fused_carry` returns, so `with_contactnet`'s 3-tuple carry flows through.
+
+**Checkpoint/norm pairing is load-bearing:** run 4 <-> `data/dr/norm_constants.npz`,
+run 2 <-> `data/norm_constants.npz`. A mismatch shifts the input distribution and
+fails silently.
+
+30 s, vx=0.6, `--imu-noise`, `--contact-fk measured`, 3 noise seeds. Headline is
+signed vertical drift `est_z - true_z` (negative = estimate sinking into ground):
+
+| mean of 3 seeds | no ContactNet | run 4 | run 2 |
+|---|---|---|---|
+| **final dz [m]** | **−3.183** | **−0.399** | −0.769 |
+| dz RMS, last half | 2.432 | 0.303 | 0.583 |
+| sink rate, last 20 s [m/s] | −0.107 | −0.0135 | −0.026 |
+| tilt error, tail RMS [deg] | 1.201 | 0.252 | 0.658 |
+| 3D drift, final [m] | 3.260 | 0.511 | 2.220 |
+| velocity err, tail RMS [m/s] | 0.1327 | 0.0243 | 0.0437 |
+
+No metric regresses. The robot itself walks fine in every arm (true height
+0.88-0.91 m) — **the sinking is entirely in the estimate.**
+
+**The wiring is proved live, not assumed.** Matched runs differing only in
+`--contactnet` are **bit-identical through control tick 18** (max|diff| = 0.000e+00
+on every leaf) and first diverge at tick 19 — exactly the 400-filter-tick
+ring-buffer warm-up over 20 substeps. Identity-then-divergence at the predicted
+boundary is the cheapest proof the network is not being silently dropped, and it
+should be re-run after any change to the seam.
+
+### The z drift has a specced fix that is deliberately absent
+
+`inEKF/ekf.py` carries a TODO for `reseedContact` — the touchdown re-anchor
+(`P_dd = P_pp + R N Rᵀ`, `P_θd = P_θp`, fire-once latch). CLAUDE.md §2/§3 require
+it, G5 lists `InvariantEKFReseedTest`, and `tests/inEKF/test_invariant_ekf.py:271`
+**asserts its absence**. The stated reason: *"Lucas measured no meaningful
+difference on the real robot (2026-07-21)."*
+
+That rejection may not transfer. The sim failure is **−3.18 m in 30 s**, far
+larger than anything a hardware run would have shown, so "no meaningful
+difference" was measured against a much smaller drift than the one ContactNet is
+fixing here. ContactNet leaves ~1.4 cm/s of residual sink (~−0.8 m at 60 s); if
+that residual matters, re-testing the reseed **in sim** is the open lever.
+
+Note CoCo-InEKF has no reseed either — their Eq. (5) models a zero-mean contact
+*velocity* in the process model, doing the same job continuously. Our port has
+that socket too (`contact_chol`), unfrozen as of run 2.
+
+## Structural safety: the network cannot make the filter over-trust contacts
+
+Over 22 080 samples across all 12 DR rollouts: **zero non-finite, zero
+non-positive**; SPD by construction from `L Lᵀ` plus softplus. `Sigma_C` does dip
+below `sigma_0` (min 9.8e-6 m, on 3.6% of x samples), which looks like an
+over-trust risk and is not one:
+
+* `S = H P Hᵀ + N + Sigma_C` with **N = J Sigma_q Jᵀ = 1.26e-5 m²**. A `Sigma_C`
+  of 1e-5 m contributes 1e-10 m² — five orders below N, hence invisible.
+* The shipped analytic filter passes `contact_meas_chol = 0`, so "below sigma_0"
+  is *closer* to shipped behaviour, not more aggressive than it.
+
+**The encoder term floors the gain.** The network can only ever make the filter
+more cautious, never less. That is a structural guarantee rather than a
+statistical one, and it is the single most important property for live use.
+
+## Acceptance criterion for deploying Sigma_C live
+
+1. **Closed-loop A/B on unseen conditions** — tilt error and position drift no
+   worse than the heuristic over >=30 s, on terrain and friction not in training.
+   Gate 1 is now *partly* satisfied: passed on flat, 3 noise seeds. Not yet on
+   `waves` / `stepping_stones`, and not at an untrained friction.
+2. **No per-window regression** — the *worst* window must not be worse than the
+   heuristic's worst. Mean ratios hide tail events; not yet measured.
+3. **Structural check** — the floor result above. Passes; belongs in the test
+   suite rather than a one-off script.
+4. **NIS/dof in the chi² band** — only if anything downstream consumes `P` (NEES
+   monitoring, an MPC reasoning about uncertainty, the G10 gate). Run 4 fails by
+   ~100x (`nis_over_dof` 9.5e-3). This is beta-NLL's job, not more data's. The
+   policy reads only the mean, so it does not block a policy-only deployment.
+
+## Run 2 transfers out of sample — the first such number in the project
+
+Run 2 was trained only on the original single-gait set and had never seen
+randomised friction, disturbances or commands. Evaluated on the DR data it still
+beats the analytic heuristic: **velocity 25%, position 50%, height 62%**. Every
+previous ContactNet number in this project — including the 3.3x/8.5x quoted since
+run 2 — was in-sample. ContactNet transfers; it just transfers less well than a
+network trained on the conditions.
+
+### Head-to-head, same rollouts / same P0 / each net with its own norm
+
+The per-dataset `replay_eval` rows are NOT comparable across runs: DR rollouts
+random-walk ~3.8 m while the originals march ~23.6 m, which moves the heuristic
+denominator before any network is involved.
+
+| metric | heuristic | run 2 | run 4 | run 4 vs run 2 |
+|---|---|---|---|---|
+| velocity RMS | 0.07369 | 0.05526 | **0.04046** | 27% better |
+| position RMS | 0.37037 | 0.18425 | **0.06093** | 67% better |
+| height RMS | 0.36367 | 0.13875 | **0.04930** | 64% better |
+| height final | 0.61858 | 0.26306 | **0.09098** | 65% better |
+| mean tilt | 0.56588 | 0.44297 | **0.35386** | 20% better |
+
+### Suppression across runs — percentile form, never a median
+
+| run | axis | @p10 | @p50 | @p90 | % ticks trusted (<2x) |
+|---|---|---|---|---|---|
+| run 2 | x | 1.0 | 1.2 | 15793 | 52.3% |
+| run 3 | x | 1.0 | 1.3 | 15928 | 52.5% |
+| **run 4** | x | 1.0 | **1.0** | **5.9** | **83.9%** |
+| run 2 | y | 9.9 | 174.0 | 4251 | 2.5% |
+| run 4 | y | 5.7 | 128.4 | 2589 | 3.4% |
+| run 2 | z | 30.8 | 3105 | 34582 | 0.8% |
+| run 4 | z | 183.6 | 2153 | 12277 | 1.1% |
+
+The **medians barely move** (y 174->128, z 3105->2153, both inside the
+run-2-vs-run-3 spread, and those two learned the same function at 0.97
+correlation). The change is in the tail: runs 2/3 shut the forward axis
+completely off at 10%+ of ticks (~16 000x); run 4's worst case is **5.9x** and it
+keeps x live 83.9% of the time against 52.3%. That is the phase clock breaking —
+a sharp phase-locked on/off switch replaced by continuous modulation.
+
+## Two tooling defects found while doing the above
+
+* **`alpha_sweep --B 8` is unsafe on any dataset containing standing.** It FAILED
+  on the DR set — the documented hard stop — and is a false negative: at B=32 and
+  B=64 the DR set lands on the same interior optimum the original set does. The
+  DR set has **29.2% of ticks below 0.2 m/s** (against 3.7% originally), almost
+  all of it the 17.3%-duty standing command, and those slow segments individually
+  prefer `Sigma_C -> 0`. At B=8 two or three of them flip the batch argmin to the
+  boundary. **Default `--B` must match the training batch size.**
+* **`run_policy.cycloid_forearm_urdf` writes its hands-free URDF to a fixed
+  `tempfile.gettempdir()` path.** N concurrent sim processes race on that one file
+  and some read it mid-write, dying with `xml.etree.ElementTree.ParseError`. It
+  cost 4 of 9 runs once and 1 of 3 sweeps earlier the same night. Workaround: a
+  per-run `TMPDIR`. **Not fixed** — it is a real latent bug for anyone running the
+  sim in parallel.
