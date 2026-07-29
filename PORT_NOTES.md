@@ -3014,3 +3014,57 @@ This is now the top performance item, ahead of anything GPU-side.
 `data/data/` holds a 1.8 GB duplicate of the dataset from the rsync.
 `dataset.rollout_paths` globs non-recursively, so it is not silently picked up —
 but it is wasted disk and a trap for anyone pointing `--data` at it.
+
+---
+
+## What the training set actually contains, measured and rendered (2026-07-28)
+
+`experiments/render_rollout.py` re-simulates a saved rollout with a camera on it
+(videos in `artifacts/video/`), and `experiments/dataset_stats.py` counts what is
+in it. The renderer re-simulates rather than replays — the `.npz` stores
+`truth.R/v/p` and sensors but no `qpos` — which is sound because
+`collect._RecordingLoop` builds its observation from `MjData`, so the estimator
+is not in the control loop and physics + policy + spawn reproduce the trajectory.
+**Checked, not assumed:** on `flat_seed000` the re-simulation lands within
+**0.4 mm** of the recorded base position after the full 60 s walk.
+
+### The four terrains are contact-wise indistinguishable
+
+| rollout | events | duty | relief [m] | travel [m] | tilt_max [deg] |
+|---|---|---|---|---|---|
+| flat/s0-2 | 94, 94, 94 | 0.639 | 0.000 | 23.57-23.66 | 2.30-2.51 |
+| stepping_stones/s0-2 | 93, 94, 95 | 0.632-0.635 | 0.030 | 23.70-23.86 | 3.33-3.60 |
+| hard_stepping/s0-2 | 94, 95, 96 | 0.630-0.634 | 0.070 | 23.49-23.76 | 3.63-5.24 |
+| waves/s0-2 | 94, 95, 96 | 0.637-0.642 | 0.100 | 23.37-23.89 | 2.66-3.49 |
+
+Across all 12: contact events **93-96**, stance duty **0.630-0.642**, distance
+**23.37-23.89 m**. `tilt_max` (2.30-5.24 deg) is the *only* column the terrain
+moves. Terrain randomisation is changing the ground under the robot and almost
+nothing about the contact process the network sees.
+
+**Totals: 1 134 contact events over 552 s** — confirming the ~1 100 estimate the
+dataset-narrowness entry reasoned from. ~47 steps per foot per rollout, ~1 s
+stride, ~27% double support.
+
+### Slip cannot be recovered from the saved rollouts
+
+The reconstruction `W v_C = v_B + R(omega x p_bc) + R v_bc` is exactly zero for a
+planted foot. It is not zero: in deep mid-stance (trust > 0.95, eroded 60 ms per
+edge) it reads **0.29 m/s p50 against a 0.406 m/s base speed**, and an
+independent finite difference of the world contact point agrees to three digits,
+so it is not an algebra error.
+
+It is also not 0.29 m/s of sliding. `p_bc` is FK to the **sole site**, not the
+contact patch, so a foot rolling heel-to-toe carries that site through the world
+without sliding at all — a few tens of cm over a 0.64 s stance is 0.2-0.3 m/s by
+itself. Differentiating a noisy FK at 1 kHz adds more. **Nothing in the recorded
+signals separates roll from slip:** the rollouts store no contact-patch position
+and no contact forces.
+
+So the slip measurement this file has been asking for since the narrowness entry
+**must go into the collector** — per-contact tangential sole velocity while
+loaded, taken where MuJoCo still knows the contact geometry — and cannot be
+recovered afterwards. Note the first attempt at it reported the *body-frame*
+`v_bc` (p50 0.466 m/s) as slip; that is just the base walking at 0.4 m/s, since
+`v_bc` is a body-frame derivative and a planted foot reads ~ the base speed by
+construction.
