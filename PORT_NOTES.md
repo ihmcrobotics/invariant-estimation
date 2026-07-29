@@ -3068,3 +3068,87 @@ recovered afterwards. Note the first attempt at it reported the *body-frame*
 `v_bc` (p50 0.466 m/s) as slip; that is just the base walking at 0.4 m/s, since
 `v_bc` is a body-frame derivative and a planted foot reads ~ the base speed by
 construction.
+
+---
+
+## The learned gate is a stride-phase clock — and friction randomisation is feasible (2026-07-28)
+
+### Correction: runs 2/3 do not "switch off y and z"
+
+That reading was a **median artifact**. Evaluating the learned `Sigma_C` densely
+and taking the velocity-row gain at percentiles *of the learned distribution*:
+
+| pct of learned std | std_x | std_y | std_z | supp_x | supp_y | supp_z |
+|---|---|---|---|---|---|---|
+| 1 | 1.0e-4 | 1.0e-3 | 4.5e-3 | 1.0x | 1.1x | **2.6x** |
+| 10 | 1.3e-4 | 1.1e-2 | 1.9e-2 | 1.0x | 9.9x | 30.8x |
+| 50 | 1.8e-3 | 4.7e-2 | 2.0e-1 | 1.2x | 174x | 3105x |
+| 75 | 2.7e-1 | 1.1e-1 | 4.6e-1 | **5715x** | 1015x | 16552x |
+| 99 | 7.5e-1 | 3.4e-1 | 8.6e-1 | 44654x | 9063x | 58015x |
+
+The network **gates in time, not by axis**. At ~10% of ticks it trusts `z` to
+within 2 cm; at ~22% it turns `z` off entirely; and at the 75th percentile it
+turns **x** off too. Every axis is trusted sometimes and rejected sometimes.
+That is why `replay_eval` improves every metric — the network is choosing *when*
+to believe the feet, not *which axis*.
+
+### What the gate is keyed on: gait phase, not contact condition
+
+On `flat_seed000`, regressing `log10 std_z` on time-since-last-touchdown:
+
+* **R² = 0.790** from **gait phase alone**
+* R² = 0.020 from the `ContactTrust` signal
+* correlation with trust: −0.143
+
+So ~79% of the learned covariance is a **stride-phase clock**. With one gait,
+"contact quality" and "stride phase" are the same variable and the network cannot
+tell them apart — a clock is the most it can learn, and more of the same gait
+teaches it nothing new. Runs 2 and 3 correlating at 0.97 is consistent: both
+learned the same clock.
+
+This reframes the dataset problem. It is not primarily terrain (measured
+indistinguishable across our four) and not "no information in z" (`std_z` spans
+192x p99/p1 and is genuinely trusted 10% of the time). It is that **the only
+thing that varies is phase**.
+
+### Friction randomisation: feasible, with a wide window
+
+`experiments/friction_feasibility.py` sweeps floor friction and measures slip
+from the **friction cone** — `|f_t| >= 0.99 mu f_n` via `mj_contactForce`, which
+is Coulomb's law rather than a proxy, and is the collector-side instrumentation
+the narrowness entry asked for. 15 s walks, flat/seed0:
+
+| mu | walks | travel [m] | tilt_max | contacts | slip % | cone p50 |
+|---|---|---|---|---|---|---|
+| 1.40 | yes | 5.74 | 2.46 | 14173 | 0.62 | 0.098 |
+| **1.00 (ours)** | yes | 5.75 | 2.50 | 13767 | **1.23** | 0.130 |
+| 0.80 | yes | 5.76 | 2.49 | 13050 | 1.51 | 0.153 |
+| 0.60 | yes | 5.76 | 2.48 | 11602 | 2.51 | 0.180 |
+| 0.45 | yes | 5.76 | 2.44 | 10405 | 3.00 | 0.237 |
+| 0.35 | yes | 5.73 | 2.35 | 9375 | 4.84 | 0.298 |
+| 0.25 | yes | 5.82 | 2.45 | 8594 | 9.38 | 0.402 |
+| 0.15 | yes | 5.56 | 2.12 | 7310 | **30.15** | 0.658 |
+
+**The policy walks at every friction tested, down to mu = 0.15** — travel
+5.56-5.82 m and tilt_max 2.12-2.50 deg throughout — despite its own DR range
+being only [0.8, 1.4] (`alexander-mujoco/.../randomize.py`). Slip rises
+monotonically and is 24x more frequent at mu = 0.25 than at our current 1.0.
+
+Two corrections to earlier assumptions:
+
+* **The sim is not slip-free today.** At mu = 1.0 the cone saturates on 1.23% of
+  loaded contact-ticks. The narrowness entry's "possibly no slip at all" was too
+  strong; the problem is that slip is *rare and probably phase-locked* (push-off),
+  not that it is absent.
+* Contact count *falls* with mu (14173 -> 7310), so lower friction shortens or
+  lightens contacts as well as sliding them.
+
+### The gate that decides whether any of this worked
+
+Per-*rollout* friction randomisation varies the slip **rate between** rollouts,
+but within a rollout slip may stay phase-locked — in which case the clock
+survives and nothing is gained. That is measurable before committing to a large
+collection: **collect a small friction-randomised batch and re-run the
+phase-R² diagnostic.** R² dropping well below 0.79 is the evidence the
+intervention worked; R² staying near 0.79 is the evidence that motion diversity
+(dancing / mimic motions), not friction, is the necessary change.
