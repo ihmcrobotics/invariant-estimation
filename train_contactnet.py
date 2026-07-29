@@ -286,6 +286,7 @@ def run_train(args):
     P0 = (np.load(args.p0)["P0"] if args.p0 and Path(args.p0).exists()
           else dataset.measure_p0(c.fused, preps[0], cfg, ticks=args.p0_ticks))
     if args.p0:
+        Path(args.p0).parent.mkdir(parents=True, exist_ok=True)
         np.savez(args.p0, P0=P0)
 
     key = jax.random.PRNGKey(args.seed)

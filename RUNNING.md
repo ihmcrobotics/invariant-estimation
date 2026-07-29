@@ -620,6 +620,19 @@ uv run python -m experiments.check_sigma  artifacts/<run>.npz  # after
 uv run python -m experiments.replay_eval  artifacts/<run>.npz  # after — the verdict
 ```
 
+> **`alpha_sweep` needs `artifacts/p0.npz`, which only `train` creates.** On a
+> fresh clone the gate dies with `FileNotFoundError` before it can gate anything:
+> it `np.load`s P0 with no fallback, while `train_contactnet.py:286-289` is the
+> only code path that measures-and-caches it. Mint P0 first with a throwaway
+> 2-step run, which uses train's own code path so the value is identical:
+> ```bash
+> mkdir -p artifacts
+> uv run python train_contactnet.py train --steps 2 --warmup-steps 1 \
+>     --p0 artifacts/p0.npz --out artifacts/_p0_probe.npz && rm artifacts/_p0_probe.*
+> ```
+> `--steps 1` does **not** work: `warmup_steps` clamps to `total_steps` and then
+> trips its own `warmup_steps < total_steps` guard.
+
 **`alpha_sweep`** scales `Σ_C` by a global factor and requires an interior
 `argmin`. It is theory-doc §7.2.1 Claim 1 aimed at the objective actually in use,
 runs in ~30 s, and needs no training. Run-1's config **FAILS** it (monotone to
@@ -667,6 +680,115 @@ Over half of run 2's wall time was re-seed warm-in scans (1118 ms each at
 (2.96×), B=128 2227 ms. Scaling is superlinear, so the GPU is not
 under-occupied at B=32 and buying throughput with batch size does not work here.
 Re-measure on a bigger card before assuming otherwise.
+
+### The second machine: WSL2 / RTX 4090 / 6 cores (measured 2026-07-28)
+
+A full from-scratch pipeline reproduced run 2's `replay_eval` numbers on a
+*different* box. Everything above was measured on the 4070 SUPER / 20-core /
+native-Linux machine; this one differs in ways that matter, and not in the
+direction you would guess.
+
+| stage | 4070 SUPER, 20c, native | 4090, 6c, WSL2 |
+|---|---|---|
+| `collect` | 3.2 s/sim-s | **2.63 s/sim-s** (faster) |
+| `cache` | ~2 min/rollout | **4.4 min/rollout** (slower) |
+| `train` B=32 | 0.36 s/step | **0.632 s/step** marginal (0.68 total) |
+
+**The GPU is not the bottleneck — the host is.** During training the 4090 sits at
+**24% utilisation, 73 W of 337 W, P-state P2**, with sustained ~112 MiB/s inbound
+host→device traffic. Three consequences:
+
+* **A bigger GPU buys at most ~1.3×.** Util is the fraction of wall time a kernel
+  is running, so 24% busy ⇒ deleting *all* GPU time is a `1/0.76` speedup. The
+  workload is a `lax.scan` of L=128 **sequentially dependent** filter steps on
+  15×15 float64 matrices — many tiny serial kernels, not big GEMMs. Batch size
+  widens each kernel but cannot remove the 128 round trips, which is the same
+  thing the superlinear `B` scaling above is telling you.
+* **`collect` inverts the core count.** It is ~88% `run_fused`, so the GPU absorbs
+  it and 6 cores are fine. `cache` and `train` are host-bound and lose badly.
+* **Cores scale sublinearly.** 20c → 6c costs only 1.76× on `train`, not 3.3×,
+  because part of the host path (Python/JAX dispatch, NumPy segment gathering) is
+  single-threaded. Expect ~2×, not more, from a 24-core box. WSL2 vs native is
+  confounded with core count in every number here and was not profiled.
+
+**On a 24 GB card `B` is nearly free — the 12 GB result does not transfer.**
+`measure-b` on the 4090 (GPU, L=128, ahead-of-time compile):
+
+| B | remat | peak [MB] | compile [s] | step [s] |
+|---:|---|---:|---:|---:|
+| 8 | off | 2866 | 25.7 | 0.25 |
+| 16 | off | 2943 | 26.0 | 0.28 |
+| 32 | off | 3052 | 26.1 | 0.30 |
+| 64 | off | 3206 | 25.7 | 0.30 |
+| 128 | off | 3605 | 25.7 | **0.35** |
+
+**16× the batch for 1.4× the step.** On the 4070 the same sweep was superlinear
+(B=32 450 ms → B=64 1333 ms, 2.96×), so "larger `B` does not help" is a 12 GB
+statement, not a general one — the instruction above to re-measure on a bigger
+card was right. Two caveats before raising it: it buys sample *throughput*, not
+sample *diversity* (at 12 rollouts, B=128 is ~10.7 segments per rollout, so the
+extra draws increasingly replay trajectories already in the batch — the same
+argument that makes more iterations the wrong purchase), and `remat` is still a
+net loss (+0.02–0.09 s/step, +250–300 MB compile).
+
+**The host overhead is measured, not inferred.** `measure_one` times a single
+compiled `grad_fn` on a **pre-built** batch (`train_contactnet.py:226-228`) — no
+chained batcher, no re-seed warm-in, no segment gathering. That step is
+**0.30 s** at B=32/no-remat, against the real training loop's **0.632 s/step**.
+So **~0.33 s/step, 52% of wall time, is host-side work outside the jitted step**,
+decomposing roughly into the documented ~0.18 s/step of re-seed warm-in plus
+~0.15 s of batch construction and dispatch. That, not the GPU and not `B`, is the
+only thing worth optimising.
+
+**WSL2 gotcha — the startup `CUDA_ERROR_OUT_OF_MEMORY` spam is benign.** XLA tries
+to preallocate 75% of VRAM as *one contiguous block* (17.99 GiB) and fails, then
+walks down ~10% at a time. Nothing is lost: `bytes_limit` stays at 17.99 GiB and
+the allocator grows on demand. Measured on this box with 19 GB free:
+
+| probe | result |
+|---|---|
+| single 8 GiB block | **fails** |
+| 8 × 1 GiB blocks | **succeeds** |
+| largest single block (bisected) | **~3.6 GiB** |
+
+So it is a **contiguity limit, not a capacity limit** — an artifact of the
+paravirtualised WDDM (`dxgkrnl`) path, not the card. It only bites if one tensor
+exceeds ~3.6 GiB; B=32 peaks near 242 MB. Set
+`XLA_PYTHON_CLIENT_PREALLOCATE=false` to silence the spam and make the
+grow-on-demand behaviour explicit. Note `nvidia-smi` free-VRAM is *not* the
+health check here (see the NVML soname note) — these numbers came from actual
+allocation attempts.
+
+### Moving a ContactNet run to another machine
+
+**`data/` and `artifacts/` are both gitignored** (`.gitignore:230,233`), so a
+`git pull` on the other box gets you the code and none of the run. Decide per
+directory:
+
+| path | size | copy or regenerate |
+|---|---|---|
+| `data/*.npz` (12 rollouts) | 1.5 GB | **copy** to reproduce a run exactly; regenerating is ~35–40 min but MJX/XLA are not bit-identical across hardware |
+| `data/cache/*_feat.npz` | 276 MB | **copy** — cheap, and saves the 25–53 min `cache` stage |
+| `data/norm_constants.npz` | 4 KB | copy (or regenerate in seconds) |
+| `artifacts/contactnet_run3.npz` | 3 MB | **copy** — this is the deliverable and nothing else reproduces it |
+| `artifacts/p0.npz` | 2 KB | either; it now regenerates automatically |
+
+`prepare` needs **both** the raw rollout and its `_feat.npz`: features come from
+the cache, but `inputs`/`truth` come from the raw `.npz`. Copying only the cache
+is not enough.
+
+```bash
+rsync -avh --progress data/ artifacts/ <linux-box>:~/invariant-estimation/
+```
+
+**What changes on a native-Linux box:** `XLA_PYTHON_CLIENT_PREALLOCATE=false`
+becomes unnecessary (harmless to keep — it costs a little allocation overhead and
+buys quieter logs), and neither the 3.6 GiB contiguity ceiling nor the NVML
+soname shadowing applies. Expect roughly `collect` ~40 min, `cache` ~25 min,
+`train` 10k ≈ 1 h on the 20-core box.
+
+**What does not change:** the pipeline is host-bound everywhere, so do not expect
+a bigger GPU or a larger `B` to help — see the util argument above.
 
 **More iterations is probably the wrong purchase.** 100k steps × B=32 = 3.2M
 segment draws over ~1 100 independent contact events in the current dataset —

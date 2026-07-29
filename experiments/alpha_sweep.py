@@ -81,7 +81,9 @@ def main() -> None:
     ap.add_argument("--data", default=str(REPO / "data"))
     ap.add_argument("--cache", default=str(REPO / "data/cache"))
     ap.add_argument("--norm", default=str(REPO / "data/norm_constants.npz"))
-    ap.add_argument("--p0", default=str(REPO / "artifacts/p0.npz"))
+    ap.add_argument("--p0", default=str(REPO / "artifacts/p0.npz"),
+                    help="npz to load P0 from; measured and cached here if absent")
+    ap.add_argument("--p0-ticks", type=int, default=3_000)
     ap.add_argument("--rollouts", type=int, default=4)
     ap.add_argument("--B", type=int, default=8)
     ap.add_argument("--decades", type=float, default=4.0,
@@ -105,7 +107,16 @@ def main() -> None:
     norm = normalize.load(args.norm)
     preps = dataset.prepare(dataset.rollout_paths(args.data)[:args.rollouts],
                             norm, cfg, cache_dir=args.cache, verbose=False)
-    P0 = np.load(args.p0)["P0"]
+    # P0 is *measured*, not configured. `train` is the only other code path that
+    # mints it, so on a fresh clone this gate used to die with FileNotFoundError
+    # before it could gate anything -- fall back to measuring it the same way.
+    if args.p0 and Path(args.p0).exists():
+        P0 = np.load(args.p0)["P0"]
+    else:
+        P0 = dataset.measure_p0(fused, preps[0], cfg, ticks=args.p0_ticks)
+        if args.p0:
+            Path(args.p0).parent.mkdir(parents=True, exist_ok=True)
+            np.savez(args.p0, P0=P0)
     params = network.init(jax.random.PRNGKey(args.seed), cfg.d_in, cfg.widths,
                           cfg.sigma_0, cfg.eps)
     batch_loss = jax.jit(make_batch_loss(fused.ekf, fused.kinematics, cfg.eps,

@@ -2816,3 +2816,118 @@ this box (an RTX 4070 SUPER, 12 GB — not a 4090).
 
 Batch size does **not** buy throughput here: B=32 450 ms, B=64 1333 ms (2.96x),
 B=128 2227 ms. Superlinear, so the GPU is not under-occupied at B=32.
+
+## Run 3 — a clean-machine reproduction, and what the second box taught (2026-07-28)
+
+A full from-scratch pipeline (collect → cache → norm → gate → train → gates) on a
+**second machine**: WSL2, RTX 4090, **6 cores**, 19 GB RAM. Everything above was
+measured on the 4070 SUPER / 20-core / native-Linux box. Run 3 used the current
+defaults with no ablation flags: `--steps 10000 --objective l2_velocity --B 32
+--no-remat`, chaining on, process socket passing through, `warm_in_s=1.0`,
+`episode_s=43.0`.
+
+### It reproduces run 2
+
+`replay_eval`, 20 s horizons, all in-sample:
+
+| metric | heuristic | run 3 | ratio | run 2 |
+|---|---|---|---|---|
+| body-frame velocity RMS | 0.0843 m/s | 0.0257 | **0.304** | 0.301 |
+| position RMS | 0.789 m | 0.237 | **0.301** | 0.310 |
+| height RMS | 0.779 m | 0.0767 | **0.098** | 0.118 |
+| height final | 1.346 m | 0.0983 | **0.073** | 0.093 |
+| mean tilt | 0.688° | 0.356° | **0.517** | 0.513 |
+
+Better on both height metrics, matching elsewhere. `alpha_sweep` PASSED before
+training (interior argmin at α=3.16e+01, Σ_C ≈ 3.2 mm). `check_sigma` showed the
+run-2 signature — per-axis differentiation (x 1.2×, y 135.6×, z 3552.5×), not
+run 1's uniform 2339–36157× on all three. `NIS/dof` finished at 7.3e-3 against
+run 2's 7.5e-3, expected under L2.
+
+**Two independent checks that the data pipeline is right, not just the outcome:**
+measured P0 matched the documented `diag(R)=[6.9e-5, 6.9e-5, 1.0]`,
+`diag(v)=7.6e-4`, `diag(p)=0.34` to three figures, and `prepare` found **exactly
+545 772** legal segment starts — the documented count, from a freshly collected
+dataset with different terrain seeds.
+
+### The gate could never have run on a clean machine
+
+`alpha_sweep` died with `FileNotFoundError` on `artifacts/p0.npz`. P0 is
+*measured*, not configured, and `train_contactnet.py` was the **only** code path
+that minted it; `alpha_sweep` merely `np.load`ed it. Every previous run had an
+`artifacts/` left over from an earlier training run, so the documented order
+("gate before training") had never actually been executed against an empty tree.
+`--steps 1` is not a workaround either: `warmup_steps` clamps to `total_steps`
+and then trips its own `warmup_steps < total_steps` guard, so a throwaway P0 run
+must be `--steps 2 --warmup-steps 1`. Fixed: `alpha_sweep` now falls back to
+`dataset.measure_p0` and caches, and both scripts `mkdir` the artifacts dir.
+
+### The bottleneck is the host, not the GPU — and not the batch size
+
+The 4090 trains at **0.632 s/step marginal** against the 4070 SUPER's 0.36 at
+identical settings. A *better* GPU running 1.76× slower is the whole finding:
+during training the card sits at **24% utilisation, 73 W of 337 W, P-state P2**,
+with sustained ~112 MiB/s host→device traffic.
+
+* **Any GPU upgrade is capped at ~1.3×.** Util is the fraction of wall time a
+  kernel is running; 24% busy means deleting *all* GPU time is `1/0.76`. The
+  workload is a `lax.scan` of L=128 **sequentially dependent** filter steps on
+  15×15 float64 matrices — many tiny serial kernels, not big GEMMs. This is the
+  same fact the superlinear `B` scaling reports from the other direction: batch
+  size widens each kernel but cannot remove the 128 round trips.
+* **Cores scale sublinearly.** 20c → 6c costs 1.76× on `train`, not 3.3×, so part
+  of the host path (Python/JAX dispatch, NumPy segment gathering) is
+  single-threaded. Expect ~2× from a 24-core box, not more.
+* **`collect` inverts it.** It is ~88% `run_fused`, so the GPU absorbs it: 2.63
+  s/sim-s here vs 3.2 on the 20-core box. `cache` is host-bound and loses badly
+  (4.4 min/rollout vs ~2).
+* WSL2 vs native Linux is confounded with core count in every number here and was
+  **not** profiled. Both point the same way; the split between them is unknown.
+
+### WSL2: the startup CUDA OOM spam is benign
+
+XLA preallocates 75% of VRAM as *one contiguous block* (17.99 GiB), fails, and
+walks down ~10% at a time. Nothing is lost — `bytes_limit` stays 17.99 GiB and
+the allocator grows on demand. With 19 GB free: a single 8 GiB block **fails**,
+8 × 1 GiB **succeeds**, largest single block bisects to **~3.6 GiB**. It is a
+**contiguity limit, not a capacity limit**, from the paravirtualised WDDM
+(`dxgkrnl`) path. Only bites if one tensor exceeds ~3.6 GiB; B=32 peaks near
+242 MB. `XLA_PYTHON_CLIENT_PREALLOCATE=false` silences it. Note `nvidia-smi`'s
+free-VRAM is not a valid health check on this box — these came from actual
+allocation attempts.
+
+### `measure-b` on a 24 GB card overturns the batch-size guidance
+
+Re-measured on the 4090, GPU, L=128, AOT compile (the earlier 12 GB sweep asked
+for exactly this):
+
+| B | remat | peak [MB] | compile [s] | step [s] |
+|---:|---|---:|---:|---:|
+| 8 | off | 2866 | 25.7 | 0.25 |
+| 32 | off | 3052 | 26.1 | 0.30 |
+| 64 | off | 3206 | 25.7 | 0.30 |
+| 128 | off | 3605 | 25.7 | **0.35** |
+
+**16× the batch for 1.4× the step.** On the 4070 the same sweep was superlinear
+(B=32 450 ms → B=64 1333 ms, 2.96×). So "larger `B` does not help" is a **12 GB**
+statement, not a general one — at B=32 the 4070 was already saturated and the
+4090 is not. `remat` remains a net loss on both (+0.02–0.09 s/step here).
+
+Raising `B` still buys sample **throughput**, not sample **diversity**: at 12
+rollouts, B=128 is ~10.7 segments per rollout, so the extra draws increasingly
+replay trajectories already in the batch. The "more iterations is the wrong
+purchase" argument applies unchanged — friction randomisation and a wider
+`vx`/yaw sweep are still the better spend.
+
+### The host overhead is now measured, not inferred
+
+`measure_one` times a single compiled `grad_fn` on a **pre-built** batch
+(`train_contactnet.py:226-228`): no `ChainedBatcher`, no re-seed warm-in, no
+segment gathering. At B=32/no-remat that step is **0.30 s**, against the real
+training loop's **0.632 s/step marginal**.
+
+So **~0.33 s/step — 52% of wall time — is host-side work outside the jitted
+step**, decomposing roughly into the documented ~0.18 s/step of re-seed warm-in
+plus ~0.15 s of batch construction and dispatch. This supersedes the 24%-GPU-util
+*inference* with a direct measurement, and it localises the only optimisation
+worth making: neither the GPU nor `B`, but the host path between steps.
