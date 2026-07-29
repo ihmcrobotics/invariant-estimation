@@ -3296,3 +3296,76 @@ a sharp phase-locked on/off switch replaced by continuous modulation.
   cost 4 of 9 runs once and 1 of 3 sweeps earlier the same night. Workaround: a
   per-run `TMPDIR`. **Not fixed** — it is a real latent bug for anyone running the
   sim in parallel.
+
+---
+
+## Run 4 converged, and the residual z drift is a BIAS (2026-07-29)
+
+Two measurements that together rule out the two obvious next steps.
+
+### The loss converged — more steps buy nothing
+
+| steps | mean loss | | steps | mean loss |
+|---|---|---|---|---|
+| 0-999 | 1.5922e-03 | | 5000-5999 | 1.2866e-03 |
+| 1000-1999 | 1.3793e-03 | | 6000-6999 | 1.2718e-03 |
+| 2000-2999 | 1.3067e-03 | | 7000-7999 | 1.2054e-03 |
+| 3000-3999 | 1.3637e-03 | | 8000-8999 | 1.1973e-03 |
+| 4000-4999 | 1.2699e-03 | | 9000-9999 | 1.2374e-03 |
+
+Last 2000 vs previous 2000: **ratio 0.983** — 1.7% over 2000 steps, i.e. flat
+from ~step 3000. `nis_over_dof` is likewise static (9.05e-3 -> 9.52e-3).
+**A longer run is not the lever.** More *friction conditions* still might be;
+more *steps* on this data are not.
+
+### The sink is systematic, not accumulated noise
+
+Fitting the closed-loop vertical drift against a line and against sqrt(t),
+t > 2 s, seed 0:
+
+| arm | slope | linear-fit resid | sqrt-fit resid | verdict |
+|---|---|---|---|---|
+| no ContactNet | −0.1079 m/s | **0.0076** | 0.1255 | **bias** |
+| run 4 | −0.0135 m/s | **0.0023** | 0.0161 | **bias** |
+
+`dz/t` is constant to three significant figures in both arms (run 4: −0.0122,
+−0.0131, −0.0130 at 5/10/20 s). The linear fit beats the random-walk fit by 16x
+and 7x respectively.
+
+### Why this matters more than any hyperparameter
+
+**A covariance cannot remove a bias.** `Sigma_C` sets *how much* the filter
+listens to the contact measurement; it says nothing about that measurement being
+*offset*. ContactNet cut the accumulation rate 8x by listening less — it did not
+and structurally cannot drive it to zero, because `l2_velocity` contains no term
+that could. No amount of additional data or training changes this.
+
+It also rules out the two obvious next moves:
+
+* **Harder disturbances / falls** add motion diversity but still only move a
+  covariance. Worse, a fall creates contacts at knees, torso and hands while the
+  filter has **N = 2 slots, both soles** — CoCo-InEKF runs that scenario with
+  N = 10 body-wide points. The data would contain contact events the filter
+  cannot represent.
+* **Longer training** is converged (above) and could not fix a bias regardless.
+
+### Three candidate sources, and the diagnostic that separates them
+
+1. **The FK contact point is the sole SITE, not the contact patch.** Already
+   observed independently: the reconstructed contact point moves **0.29 m/s in
+   deep mid-stance** against a 0.406 m/s base speed, which is foot roll carrying
+   the site through the world (see "What the training set actually contains").
+   If that site also sits systematically above or below the true patch, the
+   filter infers a wrong base height on every stance, in the same direction,
+   every step — exactly a constant-rate sink.
+2. **Ground penetration** in MuJoCo's soft contact: the foot settles into the
+   floor, so the world-static anchor sits below nominal.
+3. **No re-anchoring** — the deferred `reseedContact` would not remove the bias
+   but would bound its accumulation.
+
+**The diagnostic:** on a recorded rollout, compare the FK sole-site height at
+mid-stance against the terrain height under that foot. A persistent offset
+separates a **model bug** (fix the contact point — cheap, and it would also have
+been quietly corrupting every `p_bc` feature ContactNet trained on) from a
+**filter gap** (needs the reseed, previously rejected on hardware against a far
+smaller drift). Run this before spending another GPU hour.
