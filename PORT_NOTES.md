@@ -3516,9 +3516,114 @@ control. `data/dr`, 3 rollouts × 2 truth seeds × 20 s, `P0 = p0_dr.npz`:
 
 Arm B at 0 ticks is bit-identical to A, which is the harness's own self-check.
 The response is **monotone in the shift and 19x at 100 ticks**, with `height_rms`
-down 12x and tilt down 1.8x, while the stance *value* does nothing at all. The
-sink is controlled by **when** the anchor is released, not by how tightly it is
-held.
+down 12x and tilt down 1.8x.
+
+### Arm C as specified was a floor artifact — corrected
+
+`branch_out.md` §1's arm C sweeps the stance value `1e-4 → 1e-3 → 1e-2` and the
+table above shows it flat. That "flat" is **not** a statement about tightness:
+`contact.apply_floor` adds `contact_floor = 1e-4` to the digested covariance, so
+
+| chol | `Σ = chol²` | digested | floor's share |
+|---|---|---|---|
+| 1e−4 | 1.0e−8 | 1.000e−4 | **100%** |
+| 1e−3 | 1.0e−6 | 1.010e−4 | 99% |
+| 1e−2 | 1.0e−4 | 2.000e−4 | 50% |
+| 1e−1 | 1.0e−2 | 1.010e−2 | 1% |
+| 1e0 | 1.0e0 | 1.000e0 | 0% |
+
+The whole specified sweep lives inside the floor's saturation region — it moved
+`Σ_C` from 1.000e−4 to 2.000e−4, a factor of two. Flatness was guaranteed.
+
+Swept where the value actually varies (same 3×2×20 s protocol):
+
+| stance chol | slope(e_pz) | vel_rms | height_rms | tilt [deg] |
+|---|---|---|---|---|
+| A (1e−4) | −0.03750 | 0.0771 | 0.3980 | 0.590 |
+| 1e−2 | −0.03767 | 0.0718 | 0.3973 | 0.452 |
+| 1e−1 | −0.03435 | 0.1057 | 0.3268 | 0.326 |
+| 1e0 | **+0.00642** | **0.4539** | 0.1551 | 0.557 |
+
+So tightness **is** a lever above the floor — and a **harmful** one. At stance
+1e0 the sink flips sign, but `vel_rms` degrades **5.9x**: uniformly loosening the
+anchor in stance removes the sink by removing the contact update's velocity
+information altogether. Compare arm B at −100 ticks, which reaches a comparable
+sink (−0.0020) while *improving* `vel_rms` to 0.0416, better than baseline.
+
+**Two distinct levers, one good and one bad**, both in the process socket:
+
+* **Release timing** (arm B) improves the sink *and* velocity. This is the one to
+  learn.
+* **Uniform magnitude** (arm C) trades velocity for sink. This is the one run 1
+  found when it drove `Σ_C → ∞`.
+
+That is a useful property of the objective rather than a hazard: `l2_velocity`
+scores exactly the quantity arm C degrades, so the loss rewards the timing lever
+and penalises the magnitude one. A `Σ_C → ∞` collapse should be self-limiting on
+this socket in a way it was not on the measurement socket.
+
+### The floor costs the network four decades
+
+At the heuristic's stance value the floor supplies **100%** of the digested
+covariance, so a network emitting anything below chol ≈ 1e-2 has **no effect on
+the filter and therefore no gradient**. The usable output range is chol ∈
+[1e-2, 1e1] — three decades, not the nominal seven. Two consequences:
+
+* `ContactNetConfig.sigma_0 = 1e-4` initialises the network *inside the dead
+  zone*. That is worse than the run-1 configuration, which at least had an
+  effect; see `TODO.md` item 1.
+* A network cannot express a stance tighter than the floor no matter what it
+  emits.
+
+### The floor is load-bearing — swept, not assumed (`--arms F`)
+
+Same 3×2×20 s protocol, heuristic `contact_chol`, only `InEKFParams.contact_floor`
+varying:
+
+| `contact_floor` | slope(e_pz) | vel_rms | height_rms | tilt [deg] |
+|---|---|---|---|---|
+| 1e−4 (shipped) | −0.03750 | 0.0771 | 0.3980 | 0.590 |
+| 1e−5 | −0.03388 | 0.2072 | 0.3616 | 2.745 |
+| 1e−6 | −0.02103 | **0.6536** | 0.2419 | **10.403** |
+
+Lowering it buys a marginally smaller sink and costs **8.5x in velocity and 17.6x
+in attitude**. This reproduces the 2026-07-21 closed-loop finding (−15 m of drift,
+18° of tilt, a fall) from a truth seed in 20 s, so that entry's conclusion — the
+slack "absorbs contact/FK inconsistency; it is load-bearing" — is confirmed rather
+than inferred. **Keep 1e-4.** The cost is that the learned `Σ_C` has three usable
+decades instead of seven; that is the right trade.
+
+### Where a run actually starts (`--arms I`)
+
+`network.init` zeroes the output head, so iteration 0 emits a **constant**
+`sigma_0 · I` for every foot at every gait phase — stance and swing alike. Arm C
+only moves the stance value, so it does not answer this:
+
+| init constant | slope(e_pz) | vel_rms | height_rms | tilt [deg] |
+|---|---|---|---|---|
+| A heuristic | −0.03750 | 0.0771 | 0.3980 | 0.590 |
+| 1e−1 | **+0.00008** | 0.5136 | 0.0596 | 1.259 |
+| 1e0 | +0.01162 | 0.5418 | 0.1825 | 0.688 |
+
+A uniform constant is the arm-C trade in its extreme form: the sink and the height
+error essentially vanish, and velocity accuracy degrades 6.7x. The filter is
+degraded but **stable** — no fall, tilt ~1.3° — which is what makes it a usable
+starting point.
+
+`sigma_0 = 1e-1` was chosen for run 5 on that basis. Three properties, all of
+which the old 1e-4 lacked:
+
+* **It is inside the floor's live range** (1% floor contribution), so the
+  network's output actually reaches the filter and therefore has a gradient. At
+  1e-4 the floor supplies 100% and the output is inert.
+* **The gradient is available where it starts.** `d softplus/dx = σ(x)`, which at
+  the tight end equals the emitted value — so learning is starved *at* 1e-4 and
+  healthy at 1e-1.
+* **The loss starts high on the quantity it scores** (vel_rms 0.51 against the
+  heuristic's 0.077), and the descent direction is "tighten in stance to recover
+  the contact update's velocity information". A `Σ_C → ∞` collapse is where the
+  run *begins*, and L2 penalises it — the run-1 escape route is closed by
+  construction on this socket.
 
 ### Arm D falsifies the strong form of the claim
 

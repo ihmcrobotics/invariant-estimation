@@ -21,6 +21,10 @@ differs in exactly one field of `InEKFInputs`:
     B   the same, but loosened ``N`` ticks BEFORE liftoff          is it timing?
     C   the same, with the stance value swept up                   is it tightness?
     D   run 4's network on ``contact_meas_chol``                   control
+    F   the heuristic, with ``contact_floor`` swept                 what does the
+                                                                   floor buy?
+    I   a CONSTANT chol at every phase                             where does a
+                                                                   run start?
 
 Arm B is deliberately **non-causal** — liftoff is known offline, so the swing
 value is dilated backwards in time.  It is a mechanism test, not a deployable
@@ -80,6 +84,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import dataclasses
 from pathlib import Path
 
 import jax
@@ -258,20 +263,55 @@ def trace_report(res: dict, s_heur: np.ndarray, dt: float, window: int = 50) -> 
 # Arms
 # ---------------------------------------------------------------------------
 
-def build_arms(spec: str, s_heur: np.ndarray, shifts, stances) -> list[tuple]:
-    """``[(label, socket, chol), ...]`` for the requested arm letters."""
+def with_floor(fused, floor: float):
+    r"""``fused`` with `InEKFParams.contact_floor` replaced — arm F's only change.
+
+    The floor is **not** an input, it is filter configuration: `contact.digest`
+    applies ``Σ ← Σ + floor·I`` before ``Σ_C`` reaches ``Q_d``.  So unlike every
+    other arm here, arm F patches the estimator rather than the per-tick chol.
+    `run_arm` rebuilds its own `make_step` from `fused.ekf`, so replacing the
+    params is sufficient and nothing stale survives.
+    """
+    return dataclasses.replace(
+        fused, ekf=fused.ekf._replace(
+            params=fused.ekf.params._replace(contact_floor=floor)))
+
+
+def build_arms(spec: str, s_heur: np.ndarray, shifts, stances, floors) -> list[tuple]:
+    """``[(label, socket, chol, floor), ...]`` for the requested arm letters.
+
+    ``floor=None`` means "leave the estimator alone"; only arm F sets it.
+    """
     want = {c.strip().upper() for c in spec.split(",") if c.strip()}
     arms = []
     if "A" in want:
-        arms.append(("A  heuristic", "process", as_chol(s_heur)))
+        arms.append(("A  heuristic", "process", as_chol(s_heur), None))
     if "B" in want:
         for n in shifts:
             arms.append((f"B  loosen -{n:>3d} ticks", "process",
-                         as_chol(loosen_early(s_heur, n))))
+                         as_chol(loosen_early(s_heur, n)), None))
     if "C" in want:
         for v in stances:
             arms.append((f"C  stance {v:.0e}", "process",
-                         as_chol(retighten(s_heur, v))))
+                         as_chol(retighten(s_heur, v)), None))
+    if "I" in want:
+        # What the RUN ACTUALLY STARTS FROM. `network.init` zeroes the output
+        # head, so iteration 0 emits a constant `sigma_0 * I` for every foot at
+        # every gait phase -- stance and swing alike. Arm C only moves the stance
+        # value, so it does not answer this; and "the constant is between the two
+        # heuristic values" is not an argument, it is a guess.
+        for v in stances:
+            arms.append((f"I  init const {v:.0e}", "process",
+                         as_chol(np.full_like(s_heur, v)), None))
+    if "F" in want:
+        # `contact_floor` saturates everything below chol ~1e-2: at the
+        # heuristic's stance value (chol 1e-4 => Sigma 1e-8) the floor supplies
+        # 100% of the digested covariance, so the network's output there has no
+        # effect on the filter and therefore no gradient. This arm asks what the
+        # floor is actually buying, since it costs the learned Sigma_C the bottom
+        # four decades of its range.
+        for f in floors:
+            arms.append((f"F  floor {f:.0e}", "process", as_chol(s_heur), f))
     return arms
 
 
@@ -290,6 +330,8 @@ def main() -> None:
     ap.add_argument("--arms", default="A,B,C,D")
     ap.add_argument("--shifts", default="0,10,25,50,100")
     ap.add_argument("--stances", default="1e-4,1e-3,1e-2")
+    ap.add_argument("--floors", default="1e-4,1e-5,1e-6",
+                    help="arm F: InEKFParams.contact_floor sweep")
     ap.add_argument("--ticks", type=int, default=20_000)
     ap.add_argument("--starts", type=int, default=2)
     ap.add_argument("--rollouts", type=int, default=3)
@@ -300,6 +342,7 @@ def main() -> None:
 
     shifts = [int(x) for x in args.shifts.split(",")]
     stances = [float(x) for x in args.stances.split(",")]
+    floors = [float(x) for x in args.floors.split(",")]
     want_d = "D" in {c.strip().upper() for c in args.arms.split(",")}
 
     cfg = ContactNetConfig(F=24, sigma_0=1.0e-4)
@@ -335,14 +378,15 @@ def main() -> None:
             t0 = int(t0)
             sl = slice(t0, t0 + args.ticks)
             s_heur = chol_scale(np.asarray(prep.inputs.contact_chol[sl]))
-            arms = build_arms(args.arms, s_heur, shifts, stances)
+            arms = build_arms(args.arms, s_heur, shifts, stances, floors)
             if want_d:
                 flat = w[sl].reshape(args.ticks, w.shape[1], -1)
-                arms.append(("D  run4 on N", "meas", fwd(flat)))
+                arms.append(("D  run4 on N", "meas", fwd(flat), None))
 
-            for label, socket, chol in arms:
+            for label, socket, chol, floor in arms:
                 first = label not in rows
-                res = run_arm(fused, prep, cfg, t0, args.ticks, chol, P0,
+                res = run_arm(with_floor(fused, floor) if floor is not None else fused,
+                              prep, cfg, t0, args.ticks, chol, P0,
                               socket=socket,
                               want_traces=args.traces and label.startswith("A"))
                 rows.setdefault(label, []).append(res)
