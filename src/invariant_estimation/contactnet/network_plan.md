@@ -21,6 +21,24 @@ Everything else below is a committed value. Do not treat `D_in ≈ 600` as final
 
 ## 1. Scope and interface boundary
 
+> **SUPERSEDED, 2026-07-29 — the socket moved.** Everything below places `Σ_C` in
+> the contact update's *measurement* noise `N̄`. It now enters the **process**
+> noise instead: `InEKFInputs.contact_chol` → `contact.digest` → the contact
+> blocks of `Q_d`. `contact_meas_chol` is zeros everywhere, which is the shipped
+> analytic filter.
+>
+> Nothing else in this plan changes — the features, the window geometry, the
+> Cholesky parameterisation, the export path and the Java transliteration are all
+> untouched, because the network's *output type* is identical. What changes is
+> which field the caller writes it into, and three consequences: `sigma_0`'s
+> justification (§0) does not transfer, `eps` is no longer the conditioning lever
+> (that is `contact_floor`, and it is now safety-critical), and the network must
+> not be initialised at a constant.
+>
+> The argument, the ablation and the traps are in `PORT_NOTES.md`, "ContactNet
+> moves to the process socket"; the dispatch document is `branch_out.md`.
+
+
 The network is **one replaceable noise block**. It does not touch filter state, propagation, or the measurement Jacobian.
 
 ```

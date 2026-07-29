@@ -236,7 +236,26 @@ def attach_contactnet(fused, reader, ckpt, norm_path, *, verbose=True):
     # the ContactNetConfig defaults for everything else (H=50, window_span_s=0.392, dt=1e-3,
     # widths=(256,256)). dt matches `run_policy.DT`, which is what turns the window SPAN into
     # ticks -- a mismatch there is a silently different network input.
+    #
+    # THE SOCKET MOVED (2026-07-29). `with_contactnet` now writes the network's
+    # output into `contact_chol`, the stance-anchor PROCESS noise, not into
+    # `contact_meas_chol`. Runs 1-4 were trained against the measurement socket,
+    # where ~1e-4 is a sensible FK measurement std; the same number on the process
+    # socket is the stance value, i.e. every anchor -- swing feet included --
+    # asserted world-static. That is `freeze_contact_chol`, measured 10.2x worse
+    # than not using contacts at all, and in the closed loop it is a fall.
+    #
+    # So this warns rather than silently running the demo into the ground. It does
+    # not refuse: replaying an old checkpoint on the new socket deliberately is a
+    # legitimate experiment, and `experiments/replay_eval.py --socket meas` is the
+    # way to score one on the socket it was trained for.
     cfg = ContactNetConfig(F=24, sigma_0=1.0e-4)
+    if "run1" in ckpt or "run2" in ckpt or "run3" in ckpt or "run4" in ckpt:
+        print(f"WARNING: {ckpt} looks like a run-1..4 checkpoint, which was trained "
+              f"on the MEASUREMENT socket. It is being attached to the PROCESS "
+              f"socket, where its output range means something different -- expect "
+              f"pinned anchors and a fall. See PORT_NOTES.md, 'ContactNet moves to "
+              f"the process socket'.")
     like = network.init(jax.random.PRNGKey(0), cfg.d_in, cfg.widths, cfg.sigma_0, cfg.eps)
     params = train.load_params(ckpt, like)
     consts = normalize.load(norm_path)
@@ -250,7 +269,7 @@ def attach_contactnet(fused, reader, ckpt, norm_path, *, verbose=True):
               f"({consts.n_ticks} ticks, source={consts.source!r})")
         print(f"            cfg F={cfg.F} H={cfg.H} span={cfg.window_span_s}s "
               f"stride={cfg.stride} dt={cfg.dt} widths={cfg.widths} sigma_0={cfg.sigma_0}; "
-              f"warm-up {online_span(cfg)} ticks of analytic sigma_0^2 I before it acts")
+              f"warm-up {online_span(cfg)} ticks of the analytic heuristic before it acts")
     return fused
 
 

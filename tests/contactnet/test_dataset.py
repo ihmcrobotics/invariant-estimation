@@ -15,6 +15,7 @@ itself is the failure mode this suite is most exposed to.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from types import SimpleNamespace
 
@@ -480,18 +481,24 @@ def test_measure_p0_converges_below_the_diffuse_prior(preps):
     assert np.diag(P)[9:].max() < 1.0
 
 
-def test_measure_p0_uses_the_constant_contact_chol(preps, monkeypatch):
-    """The burn-in must run under training conventions, not the sim's ground truth.
+def test_measure_p0_burns_in_on_the_recorded_contact_chol(preps, monkeypatch):
+    r"""The burn-in must run under whatever conventions a training segment runs
+    under — and since 2026-07-29 that means the **recorded** ``contact_chol``.
 
-    Kills a burn-in that forgot the `contact_chol` overwrite: the sim's swing
-    value (1e1 ⇒ Σ = 100·I) inflates the contact process noise by six orders of
-    magnitude against the frozen stance value, which the converged ``P`` sees.
+    The network now drives the process socket, so a `P0` measured with
+    ``contact_chol`` frozen at the stance constant would seed every segment from
+    the covariance of a filter that believed its swing feet were world-static.
+    The default must therefore *not* call `_constant_contact_chol`, and setting
+    ``freeze_contact_chol`` must bring it back — that flag is the only remaining
+    route to the run-1 configuration.
+
+    The freeze genuinely changes the answer (the sim's swing value 1e1 ⇒
+    ``Σ = 100·I`` inflates the contact process noise by six orders against the
+    stance constant), which is what makes this a discriminator rather than a
+    coincidence.
     """
     fused = SimpleNamespace(ekf=ekf_mod.create(N_C, dt=1.0e-3),
                             kinematics=_fixture_kinematics())
-    cfg = _cfg()
-    P_const = dataset.measure_p0(fused, preps[0], cfg, ticks=400, verbose=False)
-
     seen = {}
     real = dataset._constant_contact_chol
 
@@ -500,18 +507,17 @@ def test_measure_p0_uses_the_constant_contact_chol(preps, monkeypatch):
         return real(cfg_, L, N)
 
     monkeypatch.setattr(dataset, "_constant_contact_chol", spy)
-    P_spy = dataset.measure_p0(fused, preps[0], cfg, ticks=400, verbose=False)
-    assert seen.get("called"), "measure_p0 did not freeze contact_chol"
-    assert np.array_equal(P_spy, P_const)          # the spy is a pass-through
 
-    # And the frozen value genuinely changes the answer: re-run with the sim's
-    # raw (switching) contact_chol.  The converged P is dominated by the
-    # measurement, so the shift is small (~1e-4 relative here) — but it is eight
-    # orders above float64 noise, which is what makes this a discriminator and
-    # not a coincidence.
-    monkeypatch.setattr(dataset, "_constant_contact_chol",
-                        lambda cfg_, L, N: np.asarray(
-                            preps[0].inputs.contact_chol[preps[0].t_lo:preps[0].t_lo + L]))
-    P_sim = dataset.measure_p0(fused, preps[0], cfg, ticks=400, verbose=False)
-    rel = np.abs(P_sim - P_const).max() / np.abs(P_const).max()
+    P_rec = dataset.measure_p0(fused, preps[0], _cfg(), ticks=400, verbose=False)
+    assert not seen.get("called"), (
+        "measure_p0 froze contact_chol — that is the run-1 burn-in and it no "
+        "longer matches what a training segment runs under")
+
+    cfg_frozen = dataclasses.replace(_cfg(), freeze_contact_chol=True)
+    P_frozen = dataset.measure_p0(fused, preps[0], cfg_frozen, ticks=400, verbose=False)
+    assert seen.get("called"), "freeze_contact_chol=True did not freeze contact_chol"
+
+    # The converged P is dominated by the measurement, so the shift is small
+    # (~1e-4 relative here) — but eight orders above float64 noise.
+    rel = np.abs(P_frozen - P_rec).max() / np.abs(P_rec).max()
     assert rel > 1e-8, f"freezing contact_chol changed nothing (rel {rel:.2e})"

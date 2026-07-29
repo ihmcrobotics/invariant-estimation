@@ -369,15 +369,16 @@ class FusedEstimator:
     aux_qd_var: float             # their velocity variance (config `sigma_qd_unfiltered`)
 
     contactnet: "ContactNetSeam | None" = None
-    """The learned contact measurement noise, or `None` for the analytic filter.
+    """The learned stance-anchor process noise, or `None` for the analytic filter.
 
     `None` is the default and reproduces the pre-ContactNet filter bit-for-bit —
-    `contact_meas_chol` stays zero and the fused carry stays the 2-tuple
+    `contact_chol` stays on `sim.sensors`' Schmitt-switched heuristic, the unused
+    `contact_meas_chol` stays zero, and the fused carry stays the 2-tuple
     `(jkf_carry, inekf_carry)` every existing caller and test expects.
 
     When set, the carry gains a third slot holding the provider's ring buffer and
-    `contact_meas_chol` comes from `contactnet.step`.  Attach one with
-    `with_contactnet`.
+    `contact_chol` comes from `contactnet.step` instead of from the heuristic.
+    Attach one with `with_contactnet`.
     """
 
     @property
@@ -604,9 +605,12 @@ class ContactNetSeam(NamedTuple):
     """A trained ContactNet, reduced to what `fused_step` needs.
 
     `step` is `contactnet.online.make_provider`'s return value:
-    ``(state, sensors) -> (state, contact_meas_chol)``, fixed-shape and
-    branch-free so the fused graph stays constant (I7).  `init` builds the
-    ring-buffer carry.
+    ``(state, sensors) -> (state, contact_chol)``, fixed-shape and branch-free so
+    the fused graph stays constant (I7).  `init` builds the ring-buffer carry.
+
+    What it emits is the **stance-anchor process noise** ``Σ_C``, replacing
+    `sensors.contact_chol`'s heuristic — not the FK measurement noise it drove
+    until 2026-07-29.  See `_boundary` for why the socket moved.
     """
     step: Callable
     init: Callable
@@ -718,8 +722,8 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
         # filter mean states).  Running it here rather than inside `_boundary`
         # keeps that visible.
         if contactnet is not None:
-            cn_state, meas_chol = contactnet.step(cn_state, sensors)
-            inekf_inputs = inekf_inputs._replace(contact_meas_chol=meas_chol)
+            cn_state, sigma_c_chol = contactnet.step(cn_state, sensors)
+            inekf_inputs = inekf_inputs._replace(contact_chol=sigma_c_chol)
 
         # -- (d/e) InEKF step --------------------------------------------------
         inekf_carry, inekf_out = inekf_step(inekf_carry, inekf_inputs)
@@ -780,11 +784,19 @@ def _boundary(
     joint = inf.JointFilterOutput(
         q=q_hat, q_dot=qd_hat, sigma_q=sigma_q_eff, sigma_q_dot=sigma_qd,
     )
-    # ContactNet seam: the learned FK measurement noise Σ_C (network_plan.md §1).
-    # Zeros until the network is trained, which reproduces the pre-ContactNet
-    # filter bit-for-bit — `N` is then the encoder term J Σ_q Jᵀ alone.  This is
-    # the single line ContactNet replaces; see inEKF/filter.py, "Two contact
-    # covariance sockets", for why this is *not* `sensors.contact_chol`.
+    # The FK measurement socket is **unused**: `N` is the encoder term J Σ_q Jᵀ
+    # alone, which is the shipped analytic filter exactly.
+    #
+    # ContactNet drove this field until 2026-07-29 and no longer does. For one
+    # contact `H = [0 0 I −I]`, so `K = P Hᵀ (H P Hᵀ + N)⁻¹` and `N` appears only
+    # inside the inverted factor: it scales the correction and reweights residual
+    # axes, but cannot change how a residual is apportioned between the base and
+    # the anchor. That apportionment is pure prior, hence pure PROCESS noise —
+    # and the residual drift the network was being trained to remove is an
+    # integrated velocity bias, which lives on exactly that apportionment.
+    # `fused_step` therefore writes the network's output into `contact_chol`.
+    # Measured (`experiments/process_socket_ablation.py`): a process-side change
+    # alone moves the sink by 5x and through zero; the measurement socket cannot.
     contact_meas_chol = jnp.zeros_like(sensors.contact_chol)
 
     return inf.InEKFInputs(

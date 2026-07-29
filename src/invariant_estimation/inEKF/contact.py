@@ -77,6 +77,34 @@ def apply_floor(Sigma: Array, floor: float) -> Array:
     ``≥ 0``).  Branch-free and smooth — unlike an eigenvalue clamp — which keeps
     the BPTT gradient finite even at a singular ``Σ``.
 
+    **This floor is safety-critical since 2026-07-29.**  While ``L`` came from
+    the heuristic it was a conditioning nicety: the supplier never emitted
+    anything near singular.  ContactNet now supplies it, and the floor is the
+    only thing between a mis-prediction and a *pinned swing foot* — an anchor
+    asserted world-static while the foot is in flight, which is the run-1 failure
+    mode (measured 10.2x worse in body-frame velocity than not using contacts at
+    all).  Do not lower it to "let the network express confident stance": at
+    1e-6 the closed-loop filter was measured at −15 m of drift and 18° of tilt,
+    and the robot falls.
+
+    **Two floors act on one quantity — reconcile them, do not stack them.**  The
+    network's own ``eps`` (`ContactNetConfig.eps`, 1e-6) floors ``diag(L)``, so
+    ``L Lᵀ`` already has eigenvalues ``≥ eps²`` before this adds ``floor``.  They
+    are not redundant and not interchangeable:
+
+    * ``eps`` is a *factor* floor, applies before the outer product, and exists
+      to keep ``softplus`` output strictly positive so the Cholesky
+      parameterisation stays valid and differentiable.  It contributes
+      ``eps² = 1e-12`` of variance, which is negligible here.
+    * ``floor`` is a *variance* floor applied to the reconstructed ``Σ`` and is
+      the actual physical bound on how world-static any anchor may be asserted
+      to be.  It is the number to change if that bound is wrong.
+
+    The effective floor is therefore ``floor`` alone at any sane setting, and
+    `PORT_NOTES.md` §"ContactNet seam" was corrected on the same date: it had
+    ``eps`` as the measurement-socket lever and ``floor`` as the process one,
+    which stopped being true when the network moved to the process socket.
+
     Parameters
     ----------
     Sigma : Array, shape (N, 3, 3)

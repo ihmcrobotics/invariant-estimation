@@ -1551,6 +1551,14 @@ Neither reaches the policy — base position and velocity are not in the 98-term
 
 ## ContactNet seam — two contact covariance sockets (2026-07-27)
 
+> **SUPERSEDED IN PART, 2026-07-29.** ContactNet now drives `contact_chol`, the
+> **process** socket, not `contact_meas_chol`. The table below is still the
+> correct description of the two sockets; the sentence "`eps` is the right lever
+> for the *measurement* socket, `contact_floor` for the *process* one" is no
+> longer a division of labour, because both now act on the same object. See
+> "ContactNet moves to the process socket" below for the argument, the
+> measurement, and the reconciliation of the two floors.
+
 `network_plan.md` §1 specifies ContactNet as supplying `Σ_C` into the contact
 update's measurement noise, `N̄ = R̂(J_C Σ_q J_Cᵀ + Σ_C)R̂ᵀ`. That term **did not
 exist in the port**: `correct.measurement_noise(Np)` block-diagonalised the
@@ -3369,3 +3377,243 @@ separates a **model bug** (fix the contact point — cheap, and it would also ha
 been quietly corrupting every `p_bc` feature ContactNet trained on) from a
 **filter gap** (needs the reseed, previously rejected on hardware against a far
 smaller drift). Run this before spending another GPU hour.
+
+---
+
+## The diagnostic ran: it is not the contact point, it is a velocity bias (2026-07-29)
+
+`experiments/z_bias_diag.py`, read-only over the 12 DR + 3 control rollouts. No
+filter run, no JAX — every number is already in the `.npz`.
+
+### Candidate 1/2 (contact point, ground penetration) are RULED OUT
+
+Reconstructing the world sole position from the **true** base pose and the cached
+FK, `sole_w = p_true + R_true · y_fk`, a planted foot must be world-static.
+
+| quantity | result |
+|---|---|
+| vertical drift within deep stance, pooled over 24 foot-rollouts | **+0.00213 ± 0.00034 m/s** |
+| sole height above `z = 0`, flat terrain, 6 foot-rollouts | **+0.0055 m**, never below +0.0005 |
+
+The drift is **positive** — the FK sole point rises ~2 mm/s during stance, the
+opposite sign from the sink. The site sits a constant 5.5 mm above the ground and
+**never penetrates**. Neither a wrong contact point nor MuJoCo soft-contact
+settling is producing a per-step downward ramp.
+
+**Methodology warning — the naive version of this measurement gives the wrong
+answer with the wrong sign.** A tick-wise `np.gradient` over a stance mask returns
+**−0.0096 m/s**, which looks like a confirmation of candidate 1. It is an
+artifact: at each end of a stance block the centred difference straddles the
+swing transition, and those few samples carry ~100x the interior magnitude.
+Eroding 50 ticks per block and taking a *secant* across the interior flips the
+sign. Per-**phase** statistics are also mandatory — 1 kHz samples inside one
+stance are nearly perfectly correlated, so a per-tick standard error understates
+by ~25x and would have made the artifact look significant.
+
+### The sink is an integrated velocity bias
+
+| relation | across 15 rollouts |
+|---|---|
+| `mean(est_v_z − v_z)` vs `slope(est_p_z − p_z)` | **r = +0.958**, mean ratio **1.068** |
+
+The position error is the time-integral of a persistent negative velocity error,
+to within 7%. The control set is the cleanest case: three seeds of steady walking
+give `e_vz` = −0.0624 / −0.0629 / −0.0626 and a ratio of **1.059 on all three**.
+A perfectly periodic gait produces a perfectly repeatable velocity bias.
+
+So the question is not "what pushes the base down" but **"why does `v̂_z` sit
+low"** — and `v` is observed by *nothing* in this filter (no `H` has a `ξ_v`
+block), so it moves only by propagation or by `P_vp` coupling out of the contact
+update.
+
+### It is not the propagation
+
+Measuring the world-z specific-force error the filter actually integrates,
+`(R̂ a)_z − (R a)_z`:
+
+* DR set: **−0.0018 to −0.0033 m/s²**, consistently negative;
+* control set: **+0.0004 m/s²**, *positive* — while sinking the **worst**
+  (−0.063 m/s, 2-3x the DR arms).
+
+The sign flips with no corresponding flip in the sink, and `corr(a_err_z, e_vz)`
+is **−0.726** — the wrong sign for a causal story. The propagation is exonerated.
+
+Second-order tilt rectification was checked explicitly because it is a genuine
+bias mechanism (`Δv̇_z = −½ g |δ|²` is negative for *any* tilt-error direction,
+so a zero-mean attitude error rectifies into a downward push). It is the right
+order of magnitude (−0.0006 to −0.0049 m/s²) but `corr(|δ|², a_err_z) = +0.278`.
+Contributory, not causal. Worth remembering on hardware, where tilt error is
+larger.
+
+### What that leaves
+
+By elimination, the velocity bias enters through the **contact correction**. The
+`v`-row of `P Hᵀ` is `P_vp − P_vd`, which is a pure prior quantity: the
+measurement noise `N` cannot change it, only scale the whole correction. That is
+the same conclusion the apportionment argument reaches for `p`, and it lands on
+the same lever — **the process socket** (`contact_chol`), which is not what
+ContactNet is currently wired to.
+
+Note this also re-reads the run-4 result. ContactNet cut the sink 8x by driving
+`N_z → ∞` (median z suppression 2153x, "Suppression across runs" above). Under
+the analysis here that works by shrinking the *whole* correction, including the
+`v_z` pull — i.e. it bought the improvement by partially disconnecting the
+contact update, which is exactly what `inEKF/filter.py`'s DECISION block argues
+against. The gain is real; the mechanism is not the one the design intended.
+
+### Not yet separated
+
+* **No accelerometer-bias state exists anywhere in this port.** The joint KF
+  carries `b_omega` only (`jointKF/state.py:12`); I1 keeps the InEKF pure
+  `SE_{N+2}(3)`. CoCo-InEKF has both Eq. (6) and Eq. (7). `sim/sensors.py`
+  injects no accel bias, so this is invisible in sim — it is a **hardware**
+  exposure, and on hardware it would produce exactly this signature.
+* The per-tick contact innovation is not recorded in the rollouts, so the
+  `P_vp − P_vd` claim is inferred by elimination rather than measured directly.
+  Logging `contact_innovation` in the collector would close that gap.
+
+---
+## ContactNet moves to the process socket (2026-07-29)
+
+Runs 1–4 trained ContactNet into `contact_meas_chol`, the FK **measurement**
+noise. It now drives `contact_chol`, the stance-anchor **process** noise;
+`contact_meas_chol` returns to zeros, which is the shipped analytic filter
+exactly. `network_plan.md` §1 and the "two contact covariance sockets" note above
+are superseded on this point. Deferred work is in `TODO.md`.
+
+### The structural argument
+
+For one contact `H = [0 0 I −I]` over `(R, v, p, d)`, so `K = P Hᵀ (H P Hᵀ + N)⁻¹`
+and `N` appears **only inside the inverted factor**. It scales the correction and
+reweights residual axes; it cannot change how a residual is *apportioned* between
+the base and the anchor. That apportionment is pure prior, hence pure process
+noise. The residual sink is an integrated velocity bias (`r = +0.958`, ratio
+1.068 over 15 rollouts — see "the diagnostic ran" above), so it lives on exactly
+that split. CoCo-InEKF Eq. (5) puts the learned covariance in the same place (the
+network is called inside Prediction, Alg. 1 line 1).
+
+The argument bounds what `N` can do to the *split*. It does **not** say `N` is
+powerless against the sink — see the arm-D result below.
+
+### The ablation that gated it — `experiments/process_socket_ablation.py`
+
+Recorded rollouts, no network, no training; every arm replays the same rollout
+from the same truth seed and differs in one field. Arm B loosens the anchor `N`
+ticks **before** liftoff (non-causal, a mechanism test, not a deployable filter),
+arm C sweeps the stance value up, arm D is run 4 on the measurement socket as a
+control. `data/dr`, 3 rollouts × 2 truth seeds × 20 s, `P0 = p0_dr.npz`:
+
+| arm | slope(e_pz) [m/s] | vel_rms | height_rms | tilt [deg] |
+|---|---|---|---|---|
+| A heuristic | −0.03750 | 0.0771 | 0.3980 | 0.590 |
+| B −0 ticks | −0.03750 | 0.0771 | 0.3980 | 0.590 |
+| B −10 | −0.03110 | 0.0680 | 0.3303 | 0.534 |
+| B −25 | −0.02290 | 0.0571 | 0.2440 | 0.463 |
+| B −50 | −0.01253 | 0.0461 | 0.1358 | 0.381 |
+| B −100 | **−0.00200** | 0.0416 | 0.0338 | 0.323 |
+| C stance 1e−4 → 1e−2 | −0.03750 → −0.03767 | | | flat |
+| D run 4 on `N` | −0.00490 | 0.0390 | 0.0548 | 0.337 |
+
+Arm B at 0 ticks is bit-identical to A, which is the harness's own self-check.
+The response is **monotone in the shift and 19x at 100 ticks**, with `height_rms`
+down 12x and tilt down 1.8x, while the stance *value* does nothing at all. The
+sink is controlled by **when** the anchor is released, not by how tightly it is
+held.
+
+### Arm D falsifies the strong form of the claim
+
+`branch_out.md` §0 concludes "ContactNet has been holding the one knob that
+provably cannot reach it". Arm D — run 4, unchanged, on the measurement socket —
+is **7.7x better than baseline** (−0.00490 against −0.03750). So the measurement
+socket is not powerless on this metric.
+
+The structural argument still holds as far as it goes: `N` cannot change the
+base/anchor *split*. What it can do is scale every correction, and the sink is an
+*accumulated* quantity — shrinking each dose shrinks the integral even with the
+split untouched. The defensible claim is the weaker one: **the process socket is
+the more direct lever, not the only one.** Practically, a process-socket retrain
+has to beat −0.0049, not run 4's −0.0135.
+
+### The mechanism is late stance, not early swing
+
+`branch_out.md` §1 argues the sink is a rectified liftoff dose because `P_dd` is
+"at its tightest exactly then, after a whole stance of being told it was
+world-static". Measured on the **prior** covariance (`replay_eval.run_arm(
+want_traces=True)`, reconstructed by replaying `propagate` — the posterior is the
+wrong object, since `Σ_C` enters through `Q_d` and the update immediately shrinks
+most of it back), over 234 liftoffs:
+
+|  | `P_pp` | `P_pd` | `P_dd` | base share `f` | vel. gain `g_v` [1/s] |
+|---|---|---|---|---|---|
+| late stance | 3.368e−1 | 3.368e−1 | 3.368e−1 | 7.85e−1 | **2.673** |
+| early swing | 3.369e−1 | 3.369e−1 | 4.369e−1 | 8.1e−7 | 2.78e−6 |
+| late swing | 3.370e−1 | 3.370e−1 | 4.370e−1 | 9.0e−7 | 3.01e−6 |
+
+1. **The asymmetry is stance-vs-swing, not early-vs-late swing** — and it is
+   ~**10⁶** in `g_v`, not the modest effect §1 imagines. The Schmitt trigger
+   releases *at* liftoff, so the anchor is already at its swing value on the first
+   tick of swing (`P_dd` picks up `Σ_C Δt = 0.1` the moment it releases).
+   Comparing two swing windows finds nothing, which is exactly what the first
+   version of this diagnostic reported.
+2. **The dose is injected in the last ~100 ms of stance**, while the foot is
+   unloading and beginning to move but the trigger still says "planted": the
+   contact residual reaches base velocity at `g_v ≈ 2.7 /s` there. That is why
+   arm B works and improves monotonically out to 100 ticks, and why arm C does
+   nothing — the stance *value* barely moves `g_v`, since in stance `P_dd` is not
+   what limits the coupling.
+3. **Base position is unobservable**, so `P_pp`, `P_pd` and `P_dd` agree to four
+   digits and the naive `P_pp/(P_pp+P_dd)` reads exactly 0.5 forever. The
+   informative row is `v`, which §0's argument names and §1's does not.
+
+Consequence for the retrain: what the network has to learn is a **slightly early
+release** — a leading indicator of unloading. The torque channels carry that. But
+100 ticks is 100 ms, and `experiments/phase_lock.py` already showed this dataset
+lets a net learn a stride-phase *clock* instead of a load signal; whether it
+learns unloading or merely phase is the thing to check.
+
+### Consequences of the move that are not optional
+
+* **The warm-up fallback inverts.** `online.make_provider` emitted **zeros**
+  before its ring buffer filled, because zeros in the measurement socket reproduce
+  the shipped filter. Zeros in the process socket are `Σ_C = 0`: every anchor,
+  swing feet included, asserted perfectly world-static — run 1's failure mode
+  applied to every contact for ~400 ticks. It now falls back to
+  `sensors.contact_chol`, the heuristic the caller already holds.
+  `test_warmup_fallback_is_the_heuristic_not_zeros` is the regression.
+* **Two floors now act on one quantity.** `contact_floor` (1e-4, a variance floor
+  on the reconstructed `Σ`) and the network's `eps` (1e-6, a factor floor on
+  `diag(L)`, contributing `eps² = 1e-12`). Not redundant and not interchangeable:
+  `eps` keeps the softplus output strictly positive so the Cholesky
+  parameterisation stays valid and differentiable; `contact_floor` is the physical
+  bound on how world-static an anchor may be asserted to be. The effective floor
+  is `contact_floor` alone at any sane setting. It is now **safety-critical** — the
+  only thing between a mis-prediction and a pinned swing foot — and lowering it to
+  1e-6 was already measured at −15 m of drift, 18° of tilt, and a fall. This
+  corrects the note above, which had `eps` as the measurement-socket lever and
+  `contact_floor` as the process one; both now act on the process socket.
+* **`measure_p0` and `make_warm_in` change conventions.** Both burned in / warmed
+  in at a *constant* `Σ_C`, described as "exactly the conventions a training
+  segment runs under". False after the move: they now use the recorded heuristic,
+  and `freeze_contact_chol` is the only remaining route to the old behaviour.
+  `make_warm_in`'s `sigma_0` argument is optional and defaults to pass-through —
+  the process socket has no "reproduces the shipped filter" constant to hold.
+  **`artifacts/p0_dr.npz` is stale**; see `TODO.md` item 2.
+
+### One correction found on the way
+
+`filter.contact_velocity_noise` paired `J̇_C` with `Σ_q̇`. The world velocity of
+contact `i` is `v + R(ω × h_i + J_{C_i} q̇)`, so the sensitivity of a measured
+contact velocity to `q̇` is `J_{C_i}`, the *position* Jacobian. Two independent
+checks: `J̇ Σ_q̇ J̇ᵀ` has units m²/s⁴ (not a velocity covariance), and
+`pipeline/main_estimator`'s MJX kinematics returns `J_dot = 0`, so the old pairing
+would have been identically zero on the deployment path while looking wired. The
+function still has **zero call sites** — see `TODO.md` item 3 for why.
+
+### An unrelated pre-existing test bug, fixed here
+
+`test_step_does_not_recompile_across_contact_conditions` asserted
+`step._cache_size() == 1`. It passes in isolation and fails with `0 == 1` under a
+full-directory run: JAX's jit cache is a process-wide LRU, so an unrelated suite
+evicts the entry and the assertion reads a *miss* as a recompile. Now compares the
+lowered HLO across contact conditions, which says the thing under test directly
+and cannot be evicted. (It was failing on `main` too — verified by stashing.)

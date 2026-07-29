@@ -345,17 +345,30 @@ def test_step_does_not_recompile_across_contact_conditions():
 
     This is the port's analogue of the Java allocation tests — *no recompilation
     IS no per-tick allocation*. G9 reuses it on the fused estimator.
+
+    Asserted as **one lowered HLO across every contact condition**, not as
+    ``step._cache_size() == 1``. The cache-size form passed in isolation and
+    failed with ``0 == 1`` under a full-directory run: JAX's jit cache is an LRU
+    shared process-wide, so an unrelated test suite evicts this entry and the
+    assertion reads a *miss* as a recompile. The property under test is that
+    every contact condition produces the same executable, and comparing the
+    lowered text says that directly and cannot be evicted.
     """
     rng = np.random.default_rng(9)
     ekf, state, kinematics = _setup(rng)
     step = jax.jit(make_step(ekf, kinematics))
 
     carry = init_carry(state)
+    lowered = set()
     for scale in (1e-6, 1.0, 1e3, 1e-2):
         chol = jnp.stack([jnp.eye(3) * scale, jnp.eye(3) * 1e-4])
-        carry, _ = step(carry, _inputs(np.random.default_rng(9), chol))
+        inputs = _inputs(np.random.default_rng(9), chol)
+        lowered.add(step.lower(carry, inputs).as_text())
+        carry, _ = step(carry, inputs)
 
-    assert step._cache_size() == 1
+    assert len(lowered) == 1, (
+        f"{len(lowered)} distinct lowerings across contact conditions — a "
+        f"data-dependent branch or shape has entered the step (I7)")
 
 
 def test_closed_gate_leaves_state_unchanged_by_the_gravity_update():

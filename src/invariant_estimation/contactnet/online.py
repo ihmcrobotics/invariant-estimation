@@ -153,33 +153,39 @@ def make_online_features(subchain, base_imu: int, kinematics, cfg: ContactNetCon
 
 def make_provider(subchain, base_imu: int, kinematics, cfg: ContactNetConfig,
                   constants: norm_mod.NormConstants, params: ContactNetParams):
-    r"""Factory → ``step(state, sensors) -> (state, contact_meas_chol)``.
+    r"""Factory → ``step(state, sensors) -> (state, contact_chol)``.
 
     The deployment seam: one tick of sensors in, the ``(N_c, 3, 3)`` Cholesky
-    factor `InEKFInputs.contact_meas_chol` wants out.
+    factor `InEKFInputs.contact_chol` wants out — the **stance-anchor process
+    noise**, which is what reaches the contact blocks of ``Q_d``.
 
-    Before the buffer is full this returns **zeros**, which is exactly what
-    `pipeline.main_estimator._boundary` passes in the analytic filter and what
-    `dataset.measure_p0` ran under.  So the warm-up reproduces the
-    pre-ContactNet filter bit-for-bit rather than approximating it -- a property
-    worth having, because the warm-up is the one window where the network's
-    output would be built on padded history it never saw.
+    Before the buffer is full this falls back to ``sensors.contact_chol``, the
+    Schmitt-switched heuristic the caller already holds.
 
-    ``sigma_0 * I`` would be the other defensible choice (the network's own
-    initialization, hence continuous with what it emits once ready), but the
-    discontinuity either way is ~1e-8 m^2 against ``N = J Sigma_q J^T`` =
-    1.26e-5, three orders below, so bit-exactness with the shipped filter wins.
+    **The fallback inverted when the socket moved (2026-07-29) and the old value
+    is now dangerous.**  Until then this emitted zeros, because zeros in the
+    *measurement* socket reproduce the shipped filter exactly.  Zeros in the
+    *process* socket mean ``Σ_C = 0``: every anchor, including a foot in flight,
+    asserted perfectly world-static.  That is the run-1 failure mode
+    (`ContactNetConfig.freeze_contact_chol`, measured 10.2x worse in body-frame
+    velocity than not using contacts at all) applied to every contact for the
+    first ~400 ticks.
+
+    Deferring to the heuristic keeps the warm-up on the **shipped filter's**
+    behaviour, which is the same argument the old zero fallback made, evaluated
+    on the new socket.  It is no longer bit-identical to an unattached filter
+    only in the sense that it *is* one: during warm-up the filter is byte-for-byte
+    the analytic filter, and it stops being one on the first ready tick.
 
     The fallback is a `jnp.where`, not a branch, so the graph stays constant (I7).
     """
     feats = make_online_features(subchain, base_imu, kinematics, cfg, constants)
     n_c = jnp.asarray(subchain).shape[0]
-    fallback = jnp.zeros((n_c, 3, 3), dtype=jnp.float64)
 
     def step(state: OnlineState, sensors):
         state, win, ready = feats(state, sensors)
         L = jax.vmap(forward, in_axes=(None, 0, None))(
             params, win.reshape(n_c, -1), cfg.eps)          # (N_c, 3, 3)
-        return state, jnp.where(ready, L, fallback)
+        return state, jnp.where(ready, L, sensors.contact_chol)
 
     return step

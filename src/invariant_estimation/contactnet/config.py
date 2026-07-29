@@ -25,17 +25,29 @@ class ContactNetConfig:
 
     sigma_0: float
     """
-    Initial per axis contact STD [m].
+    Initial per axis contact STD, the constant `network.init` makes the head emit.
 
-    NOT read from the Java filter, as the port has no contact *measurement* noise
-    (`N = J Sigma_q J^T` only), so the shipped constant for this socket is zero,
-    which `softplus(.) + eps > 0` cannot represent. Pick it small enough such that
-    `Sigma_C << J Sigma_q J^T` instead. Meausred on the test fixture, that term is
-    1.26e-5 m^2 (3.5e-3 m std), so 1e-4 sits three orders of magnitude below the limit.
+    **1e-4 is a MEASUREMENT-socket number and does not transfer.** Its
+    justification was: the port has no contact measurement noise (`N = J Sigma_q
+    J^T` only), so the shipped constant for that socket is zero, which
+    `softplus(.) + eps > 0` cannot represent; pick it small enough that `Sigma_C
+    << J Sigma_q J^T` instead. Measured on the test fixture that term is 1.26e-5
+    m^2 (3.5e-3 m std), so 1e-4 sat three orders below.
 
-    NOTE: this needs to be re-measured on the real-model, so this becomes more accurate,
-    as described in PORT_NOTES.md
+    Since 2026-07-29 the network drives the PROCESS socket, where that argument
+    does not exist. The heuristic's range there is 1e-4 (stance) to 1e1 (swing)
+    **as Cholesky factors**, i.e. variance 1e-8 to 1e2. `network.init` zeroes the
+    head, so iteration 0 emits a CONSTANT `sigma_0 * I` at every gait phase -- and
+    at the stance end that is `freeze_contact_chol`, measured 10.2x worse in
+    body-frame velocity than not using contacts at all, which is the run-1
+    configuration.
+
+    **Choose the initialization deliberately before the next run** -- see TODO.md,
+    "Initialization on the process socket". Nothing here enforces it.
+
+    NOTE: still worth re-measuring on the real model, as described in PORT_NOTES.md
     """
+
     # architecture
     H: int = 50 # history SAMPLES per evaluation (not span -- see `window_span_s`)
 

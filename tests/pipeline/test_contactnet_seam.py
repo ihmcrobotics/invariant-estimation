@@ -1,20 +1,25 @@
 r"""`with_contactnet` — the deployment seam into the fused estimator.
 
-`pipeline/main_estimator.py` carried a documented but dead socket for two
-months: ``contact_meas_chol = jnp.zeros_like(...)``, with a comment naming it
-"the single line ContactNet replaces".  This is that replacement, and these are
-the properties that make attaching a network safe rather than merely possible.
+The network drives `InEKFInputs.contact_chol`, the **stance-anchor process
+noise** — since 2026-07-29; it drove `contact_meas_chol` through run 4.  These
+are the properties that make attaching a network safe rather than merely
+possible.
 
 The three that matter:
 
 1. **Detaching is exact.** With no ContactNet the carry is still the 2-tuple and
    the trajectory is bit-identical to the pre-ContactNet filter.  Everything
    already gated on G9 depends on that.
-2. **The warm-up is exact too.** The provider emits zeros until its ring buffer
-   holds a full window, and zeros is what `_boundary` passes analytically — so an
-   attached filter reproduces the unattached one for the first `span` ticks and
-   then diverges.  That gives a sharp, checkable switchover instead of a smeared
-   transient.
+2. **The warm-up is exact too.** The provider emits the caller's own heuristic
+   `sensors.contact_chol` until its ring buffer holds a full window, and that is
+   what `_boundary` passes analytically — so an attached filter reproduces the
+   unattached one for the first `span` ticks and then diverges.  That gives a
+   sharp, checkable switchover instead of a smeared transient.
+
+   The fallback **inverted** when the socket moved, and the old one is now a trap
+   rather than a nicety: zeros in the process socket assert every anchor,
+   including a foot in flight, perfectly world-static.
+   `test_warmup_fallback_is_the_heuristic_not_zeros` is the regression.
 3. **`Sigma_C` actually reaches the filter.** A seam that silently dropped the
    network's output would pass 1 and 2 and be useless.
 """
@@ -97,7 +102,11 @@ def test_no_contactnet_leaves_the_carry_and_trajectory_untouched(fused, sensors_
     carry = me.init_fused_carry(fused, q0=jnp.zeros(fused.n_joints))
     assert len(carry) == 2, "analytic carry must stay a 2-tuple"
     _, out = me.run_fused(fused, carry, sensors_seq)
+    # The measurement socket is unused and stays zero...
     assert bool(jnp.all(out.inekf_inputs.contact_meas_chol == 0.0))
+    # ...and the process socket carries the heuristic through untouched.
+    assert np.array_equal(np.asarray(out.inekf_inputs.contact_chol),
+                          np.asarray(sensors_seq.contact_chol))
 
 
 def test_attached_carry_gains_a_third_slot(fused):
@@ -115,7 +124,7 @@ def test_warmup_is_bit_identical_then_diverges(fused, sensors_seq):
     r"""Attached == unattached for `span` ticks, then not.
 
     Both halves matter.  Identity during warm-up says the fallback really is the
-    analytic zero rather than something close to it; divergence after says
+    analytic heuristic rather than something close to it; divergence after says
     `Sigma_C` reaches the filter at all.  A seam that dropped the network's
     output would pass the first half alone.
     """
@@ -130,16 +139,48 @@ def test_warmup_is_bit_identical_then_diverges(fused, sensors_seq):
     _, got = me.run_fused(cn, me.init_fused_carry(
         cn, q0=jnp.zeros(cn.n_joints)), sensors_seq)
 
-    chol = np.asarray(got.inekf_inputs.contact_meas_chol)
-    assert np.array_equal(chol[:span - 1], np.zeros_like(chol[:span - 1])), (
-        "warm-up did not emit the analytic zero")
-    assert np.abs(chol[span - 1:]).max() > 0.0, "Sigma_C never reached the filter"
+    chol = np.asarray(got.inekf_inputs.contact_chol)
+    heur = np.asarray(sensors_seq.contact_chol)
+    assert np.array_equal(chol[:span - 1], heur[:span - 1]), (
+        "warm-up did not emit the analytic heuristic")
+    assert not np.array_equal(chol[span - 1:], heur[span - 1:]), (
+        "Sigma_C never reached the filter")
+    # The measurement socket is not touched by attaching a network any more.
+    assert bool(jnp.all(got.inekf_inputs.contact_meas_chol == 0.0))
 
     # States agree bit-for-bit through the warm-up...
     assert np.array_equal(np.asarray(base.v[:span - 1]),
                           np.asarray(got.v[:span - 1]))
     # ...and stop agreeing once the network takes over.
     assert not np.array_equal(np.asarray(base.v[span:]), np.asarray(got.v[span:]))
+
+
+def test_warmup_fallback_is_the_heuristic_not_zeros(fused, sensors_seq):
+    r"""The §7 named trap, as a test.
+
+    ``contact_meas_chol = zeros`` meant "the shipped filter" on the measurement
+    socket.  The same idiom on the process socket means ``Sigma_C = 0``: every
+    anchor, swing feet included, asserted perfectly world-static.  That is the
+    run-1 failure mode, and it would be invisible in a test that only checked
+    "the warm-up is constant" or "the graph did not change".
+
+    Asserted against the *heuristic value the caller supplied*, not against a
+    literal, so a future change to `sim.sensors`' stance/swing constants cannot
+    quietly make this vacuous.
+    """
+    cn, cfg = _attach(fused, perturb=0.05)
+    span = online.span_ticks(cfg)
+    if sensors_seq.encoders.shape[0] <= span + 5:
+        pytest.skip("fixture trajectory is shorter than the warm-up")
+
+    _, got = me.run_fused(cn, me.init_fused_carry(
+        cn, q0=jnp.zeros(cn.n_joints)), sensors_seq)
+    warm = np.asarray(got.inekf_inputs.contact_chol[:span - 1])
+
+    assert np.abs(warm).max() > 0.0, (
+        "warm-up emitted zeros into the PROCESS socket — that pins every anchor, "
+        "including swing feet, as perfectly world-static")
+    assert np.array_equal(warm, np.asarray(sensors_seq.contact_chol[:span - 1]))
 
 
 def test_attached_step_stays_one_constant_graph(fused, sensors_seq):

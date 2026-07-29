@@ -630,11 +630,31 @@ def measure_p0(fused, prep: PreparedRollout, cfg: ContactNetConfig, *,
 
     Measuring it beats picking it, and the measurement is cheap: run the InEKF
     alone (no joint KF, no MJX beyond the FK the step already does) over
-    ``ticks`` of recorded input from a diffuse prior, with ``contact_chol``
-    frozen at the constant and ``contact_meas_chol`` at zero — i.e. exactly the
-    conventions a training segment runs under, at the network's initialization
-    where ``Σ_C = σ₀²I`` is negligible against ``J Σ_q Jᵀ``.  Take the final
-    ``P``.
+    ``ticks`` of recorded input from a diffuse prior, under **exactly the
+    conventions a training segment runs under**, and take the final ``P``.
+
+    Those conventions changed on 2026-07-29, and this function changed with them.
+    Until then it burned in with ``contact_chol`` frozen at
+    `ContactNetConfig.contact_chol_const` and ``contact_meas_chol`` at zero,
+    because the network drove the measurement socket and its initialization
+    ``Σ_C = σ₀²I`` was negligible against ``J Σ_q Jᵀ``.  The network now drives
+    ``contact_chol`` itself, so:
+
+    * ``contact_chol`` burns in on the **recorded heuristic**, which is what the
+      supervised warm-start starts the network at and what
+      `rollout.make_warm_in` warms a chain in on.  Freezing it at the stance
+      constant would seed every segment from the covariance of a filter that
+      believes its swing feet are world-static.
+    * ``contact_meas_chol`` stays at zero, which is now simply the shipped
+      filter's ``N = J Σ_q Jᵀ`` and is no longer a training convention at all.
+
+    **A `P0` measured before that date is stale and must not be reused.**  It
+    seeds every segment from the wrong prior and moves `train.Metrics.
+    nis_over_dof` for reasons that have nothing to do with the network — write a
+    new ``artifacts/p0_*.npz`` rather than reaching for ``p0_dr.npz``.
+
+    Passing ``freeze_contact_chol=True`` in the config still reproduces the old
+    burn-in, so a run-1 comparison stays available.
 
     Returned as one ``(3N+9, 3N+9)`` matrix shared by every segment.  A
     per-gait-phase ``P0`` would be more faithful still — it would mean storing
@@ -648,10 +668,12 @@ def measure_p0(fused, prep: PreparedRollout, cfg: ContactNetConfig, *,
         raise ValueError(f"burn-in [{t0}, {t0 + ticks}) runs past T={prep.smoothed.shape[0]}")
 
     xs = jax.tree.map(lambda a: jnp.asarray(a[t0:t0 + ticks]), prep.inputs)
-    xs = xs._replace(
-        contact_chol=jnp.asarray(_constant_contact_chol(cfg, ticks, prep.y_fk.shape[1])),
-        contact_meas_chol=jnp.zeros_like(xs.contact_meas_chol),
-    )
+    if cfg.freeze_contact_chol:
+        xs = xs._replace(contact_chol=jnp.asarray(
+            _constant_contact_chol(cfg, ticks, prep.y_fk.shape[1])))
+    # `contact_meas_chol` is zero in every recorded rollout (the analytic filter
+    # writes it), so it is left alone rather than re-zeroed: an explicit
+    # `zeros_like` here would read as "a training convention" and it is not one.
     d0 = jnp.asarray(np.einsum("ij,kj->ki", prep.R_true[t0], prep.y_fk[t0])
                      + prep.p_true[t0][None, :])
     state0 = inekf_mod.initialize(

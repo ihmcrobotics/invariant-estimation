@@ -448,17 +448,26 @@ attitude, gyro, velocity, position drift, joint state) over the whole run and ov
 
 ### ContactNet in the closed loop
 
+> **Do not run runs 1–4 through this after the socket move.** They were trained
+> on `contact_meas_chol`, where ~1e-4 is a sensible FK measurement std; the same
+> output in `contact_chol` is the *stance* value, so every anchor — swing feet
+> included — is asserted world-static. That is `freeze_contact_chol`, and in the
+> closed loop it is a fall. `run_estimator.py` prints a warning if the checkpoint
+> filename looks like one of them. To score an old checkpoint fairly, use
+> `experiments/replay_eval.py --socket meas`. The table below was measured
+> **before** the move and is kept as the run-4 record.
+
 ```bash
 uv run python run_estimator.py --policy baseline --headless --ticks 1500 --vx 0.6 \
     --imu-noise --contact-fk measured \
-    --contactnet artifacts/contactnet_run4.npz --contactnet-norm data/dr/norm_constants.npz
+    --contactnet artifacts/contactnet_run5.npz --contactnet-norm data/dr/norm_constants.npz
 ```
 
 The provider needs `span_ticks(cfg)` = **400** ticks of history (0.4 s at the 1 kHz filter rate,
-i.e. 20 control ticks) before it emits anything; until then it falls back to the analytic
-`sigma_0**2 I`. An attached run is therefore **bit-identical** to an unattached one for the first
-19 control ticks and diverges at tick 19 — that identity-then-divergence is the cheapest proof the
-network is actually reaching the filter rather than being silently dropped.
+i.e. 20 control ticks) before it emits anything; until then it falls back to `sensors.contact_chol`,
+the analytic heuristic. An attached run is therefore **bit-identical** to an unattached one for the
+first 19 control ticks and diverges at tick 19 — that identity-then-divergence is the cheapest proof
+the network is actually reaching the filter rather than being silently dropped.
 
 **Measured, 30 s at vx = 0.6, `--imu-noise`, `--contact-fk measured`, 3 noise seeds
 (2026-07-29).** The headline is vertical drift, `est_z - true_z`, which the 3D `p_err` norm hides:
@@ -541,7 +550,7 @@ big log linearly — always stride, or narrow with `--start/--end`.
 ## ContactNet — the learned contact covariance (`contactnet/`)
 
 Spec: `src/invariant_estimation/contactnet/network_plan.md`. Trains an MLP that
-emits the contact **FK measurement** noise `Σ_C`, by BPTT through the InEKF.
+emits a contact covariance `Σ_C` by BPTT through the InEKF.
 
 `optax` is the only added dependency (training-time only — the forward pass is
 hand-written because it is transliterated into Java per §7).
@@ -554,8 +563,38 @@ thing (`inEKF/filter.py`, "Two contact covariance sockets"; `PORT_NOTES.md`):
 | `contact_chol` | process, `Q_d` | is this foot world-static? |
 | `contact_meas_chol` | measurement, `N` | how well do we know where it is? |
 
-ContactNet feeds `contact_meas_chol`. Zeros there reproduce the pre-ContactNet
-filter bit-for-bit, which is what `pipeline/main_estimator.py` passes today.
+**ContactNet feeds `contact_chol`** — the process socket — since 2026-07-29.
+Runs 1–4 fed `contact_meas_chol`; `network_plan.md` §1 still says so and is
+superseded. `contact_meas_chol` is now zeros everywhere, which is the shipped
+analytic filter bit-for-bit.
+
+The reason, in one line: `N` sits inside the inverted factor of
+`K = P Hᵀ (H P Hᵀ + N)⁻¹`, so it can scale a correction but cannot change how a
+residual is split between the base and the anchor — and the drift being trained
+out is an integrated velocity bias, which lives entirely on that split. Measured
+in `experiments/process_socket_ablation.py`; full argument in `PORT_NOTES.md`,
+"ContactNet moves to the process socket".
+
+Three things this changes that will bite if skipped:
+
+* `sigma_0 = 1e-4` is a *measurement*-socket number. On this socket a constant at
+  that value is the run-1 configuration — `network.init` zeroes the head, so
+  iteration 0 emits a constant `Sigma_C` at every gait phase. **Nothing enforces
+  this**; pick the initialization deliberately, see `TODO.md` item 1.
+* **`artifacts/p0_dr.npz` is stale.** `measure_p0` runs under different
+  conventions now. `artifacts/p0_process_dr.npz` is the re-measured one for
+  `data/dr` (1.06% off the stale one, in the position/anchor block); for any
+  other dataset run `train_contactnet.py p0 --p0 <path.npz>`.
+* `contact_floor` (`config/alex_inekf.yaml`) is now safety-critical: it is the
+  only bound on a mis-predicted `Σ_C` pinning a swing foot.
+
+```bash
+# Does the process socket even move the thing you are trying to fix?
+# Replays recorded rollouts under shifted/retightened anchor noise. No network.
+uv run python -m experiments.process_socket_ablation --data data/dr
+# Score a checkpoint on either socket (--socket process is the default path now):
+uv run python -m experiments.replay_eval artifacts/contactnet_run4.npz --data data/dr
+```
 
 ### Driving a run — `train_contactnet.py`
 
@@ -565,9 +604,11 @@ From nothing to a trained network is four commands; only the first is slow.
 uv run python -m invariant_estimation.sim.collect --seconds 60 --seeds 0 1 2  # ~50 min, 1.5 GB
 uv run python train_contactnet.py cache        # ~25 min: MJX features -> data/cache/ (23 MB each)
 uv run python train_contactnet.py norm         # seconds: freezes data/norm_constants.npz
+# Measure P0 under the CURRENT conventions first -- p0_dr.npz is stale (TODO.md 2).
+JAX_PLATFORMS=cuda uv run python train_contactnet.py p0 --p0 artifacts/p0_process_dr.npz
 JAX_PLATFORMS=cuda uv run python -u train_contactnet.py train --steps 10000 \
     --objective l2_velocity --B 32 --no-remat \
-    --out artifacts/contactnet_run2.npz --p0 artifacts/p0.npz
+    --out artifacts/contactnet_run5.npz --p0 artifacts/p0_process.npz
 ```
 
 **Use `-u`.** The first launch of run 1 buffered and showed nothing for 3.5

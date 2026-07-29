@@ -82,11 +82,21 @@ is additive on the encoder term, ``N_i = J_{C_i} Σ_q J_{C_i}ᵀ + Σ_{C_i}``, a
 models sole compliance and contact-point geometry — uncertainty that is present
 in *firm* stance and that the encoder term structurally cannot express.
 
-ContactNet (network_plan.md §1) is specified to learn the **measurement** one.
-The process one predates it, is a large and largely untuned knob, and is a
-candidate for removal once the learned path is trained — see PORT_NOTES.md.
-Setting ``contact_meas_chol`` to zeros recovers the pre-ContactNet filter
-bit-for-bit.
+**ContactNet learns the process one** (`pipeline/main_estimator.py`), as of
+2026-07-29.  network_plan.md §1 specified the measurement socket and runs 1–4
+trained on it; that is superseded.  The argument is structural rather than
+empirical: for one contact ``H = [0 0 I −I]``, so ``K = P Hᵀ (H P Hᵀ + N)⁻¹``
+and ``N`` appears *only inside the inverted factor*.  It scales the correction
+and reweights residual axes, but it cannot change how a residual is apportioned
+between the base and the anchor — and that apportionment, which is pure prior
+and hence pure process noise, is what an integrated velocity bias lives on.
+CoCo-InEKF Eq. (5) puts the learned covariance in the same place (the network is
+called inside Prediction, Alg. 1 line 1).
+
+``contact_meas_chol`` is consequently **unused**: it stays at zeros, which is the
+pre-ContactNet filter bit-for-bit.  It is kept rather than deleted because it is
+a real and separate physical quantity, it is what runs 1–4 were trained into, and
+`ContactUpdaterTest`'s ported cases exercise it.
 
 The joint-filter boundary
 -------------------------
@@ -95,7 +105,7 @@ Per the boundary contract those enter **only** on the correction side, always
 pre-multiplied by a kinematic Jacobian::
 
     N^p_i = J_{C_i}(q̂) Σ_q J_{C_i}ᵀ         position FK noise  (used)
-    N^v_i = J_{Ċ_i}(q̂) Σ_q̇ J_{Ċ_i}ᵀ        contact velocity noise (see TODO)
+    N^v_i = J_{C_i}(q̂) Σ_q̇ J_{C_i}ᵀ         contact velocity noise (see TODO)
 
 They never reach the propagation ``Φ`` or the inertial ``Q``.  The kinematics
 themselves come from a caller-supplied `ContactKinematics` callable — the
@@ -209,20 +219,21 @@ class InEKFInputs(NamedTuple):
         docstring.  Firm contact ⇒ small; slip ⇒ anisotropic; swing ⇒ large.
         Default heuristic: a constant diagonal factor, inflated for swing feet.
 
-        This is a large, largely untuned knob (PORT_NOTES.md, "Two contact
-        covariance sockets"): it sets how fast an anchor is allowed to drift,
-        and it is *not* the quantity ContactNet is specified to learn.
+        **This is what ContactNet learns** (since 2026-07-29): it sets how fast
+        an anchor is allowed to drift, which is the apportionment the sink lives
+        on.  `contact.apply_floor` is the safety bound on it, and is
+        safety-critical now that the supplier is learned.
     contact_meas_chol : Array, shape (N, 3, 3)
         Cholesky factors of the **contact FK measurement noise** ``Σ_C``, added
-        to the encoder term: ``N_i = J_{C_i} Σ_q J_{C_i}ᵀ + Σ_{C_i}``.  This is
-        ContactNet's target per network_plan.md §1 — sole compliance, contact
-        point geometry, foot deformation: real uncertainty in *where the foot
-        is*, which the encoder term alone does not model.
+        to the encoder term: ``N_i = J_{C_i} Σ_q J_{C_i}ᵀ + Σ_{C_i}``.  Sole
+        compliance, contact-point geometry, foot deformation: real uncertainty in
+        *where the foot is*, which the encoder term alone does not model.
 
-        Distinct from ``contact_chol`` and does not reopen the DECISION above:
-        that decision is about contact *condition* (is this foot world-static?),
-        which stays in the process noise.  Zeros here recover the pre-ContactNet
-        filter exactly.
+        **Zeros in every shipped path**, which is the pre-ContactNet filter
+        exactly.  It was ContactNet's target through run 4; see the module
+        docstring for why the network moved to ``contact_chol``.  A caller may
+        still drive it — `experiments/replay_eval.py --socket meas` does, to
+        score the old checkpoints — and the update consumes it unchanged.
     """
     omega: Array
     accel: Array
@@ -261,14 +272,25 @@ def contact_position_noise(J: Array, sigma_q: Array) -> Array:
     return jax.vmap(map_encoder_noise, in_axes=(0, None))(J, sigma_q)
 
 
-def contact_velocity_noise(J_dot: Array, sigma_q_dot: Array) -> Array:
-    """``N^v_i = J_{Ċ_i} Σ_q̇ J_{Ċ_i}ᵀ`` for every contact.
+def contact_velocity_noise(J: Array, sigma_q_dot: Array) -> Array:
+    r"""``N^v_i = J_{C_i} Σ_q̇ J_{C_i}ᵀ`` for every contact.
 
-    Kept as its own term, never folded into ``N^p``: they are noises on two
-    different measurements.  See the TODO in `step` for why it is not yet
-    consumed.
+    **Zero call sites — deliberately** (see the TODO in `make_step`).  Neither
+    Lucas's derivation nor CoCo-InEKF (whose only correction is its Eq. (8), the
+    FK position update with ``N = J Σ_q Jᵀ``) has a velocity-level measurement,
+    and without one there is no dimensionally consistent home for ``Σ_q̇`` in the
+    position block's ``N``.  Kept so ``sigma_q_dot``'s trip through the boundary
+    ends at a named, corrected term rather than at nothing.
+
+    **The Jacobian is ``J_{C_i}``, not ``J_{Ċ_i}``** — corrected 2026-07-29.  The
+    world velocity of contact ``i`` is ``v + R(ω × h_i + J_{C_i} q̇)``, so the
+    sensitivity of a measured contact velocity to ``q̇`` is the *position*
+    Jacobian.  Two independent checks: ``J_{Ċ} Σ_q̇ J_{Ċ}ᵀ`` has units ``m²/s⁴``
+    (not a velocity covariance), and `pipeline.main_estimator`'s MJX kinematics
+    returns ``J_dot = 0``, so the old pairing would have been identically zero on
+    the deployment path while looking wired.
     """
-    return jax.vmap(map_encoder_noise, in_axes=(0, None))(J_dot, sigma_q_dot)
+    return jax.vmap(map_encoder_noise, in_axes=(0, None))(J, sigma_q_dot)
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +314,9 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
         state, gravity_ref = carry
 
         # -- 1. propagate on the bias-corrected IMU (§3) --------------------
+        # `contact_chol` is ContactNet's output on the deployment path; `digest`
+        # is unchanged by that and does not know the difference. The floor it
+        # applies is what bounds a mis-prediction — see `contact.apply_floor`.
         sigma_c = digest(inputs.contact_chol, ekf.params)
         state = propagate(state, inputs.omega, inputs.accel, sigma_c, ekf.params)
 
@@ -303,19 +328,12 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
         # the *process* Σ_C (the DECISION note above).
         Np = contact_position_noise(frames.J, inputs.joint.sigma_q)
 
-        # ContactNet's FK measurement noise, additive per contact and in the
-        # same frame as Np (network_plan.md §1).  No floor is applied: S =
-        # H P Hᵀ + N needs only N PSD (H P Hᵀ is already SPD — see
-        # `kalman_gain`), and ContactNet owns strict positivity of its own
-        # factor diagonal.  Zeros recover the pre-ContactNet filter exactly.
+        # The FK measurement noise, additive per contact and in the same frame as
+        # Np.  Zero on every shipped path (ContactNet drives `contact_chol`
+        # instead), so this reduces to the pre-ContactNet filter exactly.  No
+        # floor is applied: S = H P Hᵀ + N needs only N PSD (H P Hᵀ is already
+        # SPD — see `kalman_gain`).
         Nc = reconstruct_cov(inputs.contact_meas_chol)
-
-        # TODO(N^v / zero-velocity): `contact_velocity_noise(frames.J_dot,
-        # inputs.joint.sigma_q_dot)` is the noise on the contact *zero-velocity*
-        # constraint.  That constraint is a separate measurement block with its
-        # own H rows stacked below the position block — it is NOT folded into
-        # N^p.  Deferred (design §10, still open); `sigma_q_dot` is carried
-        # through the boundary so adding it later is a change here only.
 
         nu = innovation(state, frames.y)
 
@@ -337,6 +355,17 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
         state, contact_diagnostics = linear_update(
             state, ekf.params.H, nu, measurement_noise(N_world)
         )
+
+        # TODO(N^v / zero-velocity): `contact_velocity_noise(frames.J,
+        # inputs.joint.sigma_q_dot)` is the noise on a contact *zero-velocity*
+        # constraint, which would be a SEPARATE measurement block with its own H
+        # rows -- never folded into N^p, since the two are noises on different
+        # measurements.  Deferred: neither Lucas's derivation nor CoCo-InEKF has a
+        # velocity-level correction (CoCo's only one is its Eq. (8), the FK
+        # position update with N = J Sigma_q J^T), and the constant `H_v` such a
+        # block would want is NOT exactly state-independent -- see TODO.md.
+        # `sigma_q_dot` stays plumbed through the boundary so adding it later is a
+        # change here only.
 
         # -- 3. gravity leveling (G4), gated --------------------------------
         gate = is_quasi_static(

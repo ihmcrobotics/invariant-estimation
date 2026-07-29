@@ -20,10 +20,12 @@ class Segment(NamedTuple):
     ----------
     inputs : InEKFInputs
         Every leaf carries a leading time axis of length ``L``. Its
-        ``contact_meas_chol`` field is a **placeholder** -- `segment_loss`
-        overwrites it with the network's actual output. Its ``contact_chol`` field is
-        the *stance anchor* process noise, held at a constant for training so
-        the network can't lean on the sim's ground truth stance anchor.
+        ``contact_chol`` field -- the *stance anchor* process noise -- is a
+        **placeholder**: `segment_loss` overwrites it with the network's actual
+        output. Its recorded value is the analytic Schmitt-switched heuristic.
+
+        ``contact_meas_chol`` is not driven by anything and stays at the
+        recorded zeros, i.e. the shipped filter's ``N = J Σ_q Jᵀ``.
 
     windows: Array, shape (L, N_c, H, F)
         Per-tick, per-contact normalized feature windows.
@@ -94,8 +96,10 @@ def make_segment_loss(ekf, kinematics, eps, beta = 0.5, objective="beta_nll", re
         # Network first, over the full segment - see `contact_factors`
         L_c = contact_factors(params, segment.windows, eps)
 
-        # The one field ContactNet has - the inputs:
-        inputs = segment.inputs._replace(contact_meas_chol=L_c)
+        # The one field ContactNet has - the STANCE-ANCHOR PROCESS noise. It was
+        # `contact_meas_chol` through run 4; see `pipeline/main_estimator._boundary`
+        # for why the measurement socket cannot reach the drift being trained out.
+        inputs = segment.inputs._replace(contact_chol=L_c)
 
         # `carry0=None` re-seeds from `segment.state0` (run-1 behaviour, and what
         # the standalone tests use).  `ChainedBatcher` passes the previous
@@ -118,14 +122,26 @@ def make_segment_loss(ekf, kinematics, eps, beta = 0.5, objective="beta_nll", re
     return segment_loss
 
 
-def make_warm_in(ekf, kinematics, sigma_0: float):
+def make_warm_in(ekf, kinematics, sigma_0: float | None = None):
     r"""``(state0, inputs) -> carry``: run the filter forward without training on it.
 
     `dataset.ChainedBatcher` uses this to grow a freshly seeded chain's error to
-    its natural level before the chain contributes a gradient.  ``Σ_C`` is held
-    at the network's initialization ``σ₀²I`` — exact at step 0, and an
-    approximation at later re-seeds that decays over an episode ten times longer
-    than the warm-in.
+    its natural level before the chain contributes a gradient.
+
+    ``sigma_0=None`` (the default) warms in on the recorded heuristic
+    ``inputs.contact_chol``, i.e. on the shipped filter. That is the right
+    default on the **process** socket for the same reason
+    `online.make_provider`'s fallback defers to the heuristic: this socket has no
+    "reproduces the shipped filter" constant to hold. A constant here is not a
+    harmless approximation — a constant at the *stance* value is
+    `freeze_contact_chol`, measured 10.2x worse in body-frame velocity than not
+    using contacts at all, and it would grow the chain's error under a filter the
+    trained network never runs inside.
+
+    Passing a float restores the old behaviour, broadcasting ``σ₀·I₃`` over the
+    warm-in slice. Note that `ContactNetConfig.sigma_0` is a **measurement**-socket
+    number (three orders below ``J Σ_q Jᵀ``); that argument does not transfer, so
+    reusing it here is a deliberate choice and not a default.
 
     Built here rather than in `dataset` so that module keeps its "no MJX, no
     estimator build" property.
@@ -134,11 +150,10 @@ def make_warm_in(ekf, kinematics, sigma_0: float):
 
     @jax.jit
     def warm_in(state0, inputs: InEKFInputs):
-        L_c = jnp.broadcast_to(
-            sigma_0 * jnp.eye(3, dtype=jnp.float64),
-            inputs.contact_meas_chol.shape)
-        carry, _ = jax.lax.scan(
-            step, init_carry(state0), inputs._replace(contact_meas_chol=L_c))
+        if sigma_0 is not None:
+            inputs = inputs._replace(contact_chol=jnp.broadcast_to(
+                sigma_0 * jnp.eye(3, dtype=jnp.float64), inputs.contact_chol.shape))
+        carry, _ = jax.lax.scan(step, init_carry(state0), inputs)
         return carry
 
     return warm_in

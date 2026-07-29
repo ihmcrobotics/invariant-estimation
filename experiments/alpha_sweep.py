@@ -129,7 +129,7 @@ def main() -> None:
             cfg, P0)
         carry0 = None
     else:
-        warm_in = make_warm_in(fused.ekf, fused.kinematics, cfg.sigma_0)
+        warm_in = make_warm_in(fused.ekf, fused.kinematics)   # heuristic; see make_warm_in
         batcher = dataset.ChainedBatcher(preps, cfg, P0, warm_in, seed=args.seed)
         batch, carry0 = batcher.batch()
 

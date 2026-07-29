@@ -2,6 +2,7 @@ r"""`train_contactnet.py` — collected rollouts → a trained ContactNet, in on
 
     uv run python train_contactnet.py cache          # pass 1: MJX features -> data/cache/
     uv run python train_contactnet.py norm           # pass 2: freeze data/norm_constants.npz
+    uv run python train_contactnet.py p0 --p0 artifacts/p0_process.npz   # measure P0
     uv run python train_contactnet.py train --steps 200 --objective l2_velocity
     uv run python train_contactnet.py measure-b      # peak RSS vs B, remat on/off
     uv run python train_contactnet.py check-init     # the §4 init-parity properties
@@ -302,7 +303,9 @@ def run_train(args):
         print(f"  {k:26s} {v}")
 
     if args.chained:
-        warm_in = make_warm_in(c.fused.ekf, c.fused.kinematics, cfg.sigma_0)
+        # No `sigma_0`: on the process socket the warm-in runs on the recorded
+        # heuristic, i.e. on the shipped filter. See `make_warm_in`.
+        warm_in = make_warm_in(c.fused.ekf, c.fused.kinematics)
         t_build = time.perf_counter()
         batcher = dataset.ChainedBatcher(preps, cfg, P0, warm_in, seed=args.seed)
         print(f"chains: {cfg.B} seeded + warmed in "
@@ -341,6 +344,31 @@ def run_train(args):
     return params, hist
 
 
+def run_p0(args):
+    """Measure `P0` under the CURRENT training conventions and write it.
+
+    Its own subcommand because a stale `P0` is silent: it seeds every segment
+    from the wrong prior and moves `nis_over_dof` for reasons unrelated to the
+    network. `measure_p0`'s conventions changed with the socket move on
+    2026-07-29 (it burns in on the recorded heuristic now, not on the frozen
+    constant), so **every `p0_*.npz` written before that date is stale** —
+    including `artifacts/p0_dr.npz`.
+    """
+    if not args.p0:
+        raise SystemExit("pass --p0 <path.npz>: this subcommand exists to write one")
+    cfg = make_config(args)
+    c = build_estimator(args)
+    preps = stage_prepare(args, cfg)
+    P0 = dataset.measure_p0(c.fused, preps[0], cfg, ticks=args.p0_ticks)
+    Path(args.p0).parent.mkdir(parents=True, exist_ok=True)
+    np.savez(args.p0, P0=P0)
+    w = np.linalg.eigvalsh(P0)
+    print(f"\n-> {args.p0}  ({P0.shape[0]}x{P0.shape[0]}, "
+          f"eig [{w.min():.3e}, {w.max():.3e}], "
+          f"freeze_contact_chol={cfg.freeze_contact_chol})")
+    return P0
+
+
 def run_check_init(args):
     cfg = make_config(args)
     c = build_estimator(args)
@@ -357,7 +385,7 @@ def run_check_init(args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("command", choices=["cache", "norm", "prepare", "train",
+    ap.add_argument("command", choices=["cache", "norm", "prepare", "train", "p0",
                                         "measure-b", "measure-one", "check-init"])
     ap.add_argument("--data", default=str(dataset.DATA_DIR))
     ap.add_argument("--cache", default=str(dataset.CACHE_DIR))
@@ -400,6 +428,8 @@ def main():
         stage_prepare(args, make_config(args))
     elif args.command == "train":
         run_train(args)
+    elif args.command == "p0":
+        run_p0(args)
     elif args.command == "check-init":
         run_check_init(args)
     elif args.command == "measure-b":
