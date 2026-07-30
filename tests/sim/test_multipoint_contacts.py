@@ -230,3 +230,54 @@ def test_point_loads_sum_to_the_foot_loads():
                     f"foot {f}: points sum to {pair} but the foot reads {fl[f]} -- "
                     f"the split lost or duplicated normal force")
     assert seen_unsaturated, "never observed an unsaturated tick; test was vacuous"
+
+
+# ---------------------------------------------------------------------------
+# 5. The ContactNet feature table must agree with N
+# ---------------------------------------------------------------------------
+
+def test_subchain_is_one_row_per_contact_point_not_per_foot():
+    r"""`make_contact_channels` reads ``N_c`` from the subchain's shape while
+    ``p``/``v`` come from the contact FK, so the two must agree.
+
+    `ALEX_FOOT_CHAINS` has one entry per *leg*, so the table is `(2, 6)` by
+    default and must become `(4, 6)` for toe/heel — foot-major, with each leg's
+    chain repeated, because heel and toe share that leg entirely.
+
+    A silently-permuted or wrongly-sized subchain still produces a network that
+    trains, which is why this is asserted rather than assumed.
+    """
+    from invariant_estimation.contactnet import features as F
+
+    jn = [n for c in F.ALEX_FOOT_CHAINS for n in c[:4]]
+    un = [n for c in F.ALEX_FOOT_CHAINS for n in c[4:]]
+
+    one = F.build_subchain_indices(jn, un)
+    assert one.shape == (2, 6)
+    two = F.build_subchain_indices(jn, un, contacts_per_foot=2)
+    assert two.shape == (4, 6)
+    # Foot-major: [L, L, R, R]. Heel and toe of one foot are the SAME chain.
+    assert np.array_equal(two[0], two[1]) and np.array_equal(two[2], two[3])
+    assert np.array_equal(two[0], one[0]) and np.array_equal(two[2], one[1])
+    # ...and the two feet are different chains, or the split is meaningless.
+    assert not np.array_equal(two[0], two[2])
+
+    with pytest.raises(ValueError, match="contacts_per_foot"):
+        F.build_subchain_indices(jn, un, contacts_per_foot=0)
+
+
+def test_subchain_for_derives_the_count_from_the_estimator(_pair):
+    """`subchain_for` is the single place N is divided by the number of feet."""
+    from invariant_estimation.contactnet import features as F
+    from invariant_estimation.sim import collect
+
+    base, th = _pair
+    for fused, want in ((base, (2, 6)), (th, (4, 6))):
+        un = collect._unfiltered_names(
+            type("C", (), {"fused": fused, "dt": 1.0e-3})())
+        assert F.subchain_for(fused, un).shape == want
+
+    # A contact count that is not a whole number per foot must not be guessed at.
+    bad = type("F", (), {"n_contacts": 3, "build": base.build})()
+    with pytest.raises(ValueError, match="whole number per foot"):
+        F.subchain_for(bad, [])

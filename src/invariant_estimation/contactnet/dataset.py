@@ -185,8 +185,7 @@ def build_channel_cache(paths: Sequence[Path | str], collector: collect.Collecto
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     fused = collector.fused
-    sub = features.build_subchain_indices(
-        fused.build.joint_names, collect._unfiltered_names(collector))
+    sub = features.subchain_for(fused, collect._unfiltered_names(collector))
     channels = features.make_contact_channels(
         sub, fused.base_imu, fused.kinematics, collector.dt)
 

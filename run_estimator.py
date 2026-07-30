@@ -230,7 +230,7 @@ def attach_contactnet(fused, reader, ckpt, norm_path, *, verbose=True):
 
     from invariant_estimation.contactnet import network, normalize, train
     from invariant_estimation.contactnet.config import ContactNetConfig
-    from invariant_estimation.contactnet.features import build_subchain_indices
+    from invariant_estimation.contactnet.features import subchain_for
 
     # The trained config (artifacts/contactnet_run{2,4}.history.json): F=24, sigma_0=1e-4, and
     # the ContactNetConfig defaults for everything else (H=50, window_span_s=0.392, dt=1e-3,
@@ -267,7 +267,7 @@ def attach_contactnet(fused, reader, ckpt, norm_path, *, verbose=True):
     # `reader.unfiltered_names` is the same resolution `sim.collect._unfiltered_names` does
     # (`_dof_joint_names(mj_model, build.dof_anchor_unfiltered)`) -- one source of truth, never
     # a hand-written ankle list.
-    sub = build_subchain_indices(fused.build.joint_names, reader.unfiltered_names)
+    sub = subchain_for(fused, reader.unfiltered_names)
     fused = me.with_contactnet(fused, params, cfg, consts, sub)
     if verbose:
         print(f"ContactNet: ATTACHED  ckpt={ckpt}  norm={norm_path} "

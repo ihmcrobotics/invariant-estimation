@@ -71,6 +71,8 @@ def make_config(args) -> ContactNetConfig:
         warmup_steps=min(args.warmup_steps, max(1, args.steps - 1)),
         total_steps=args.steps,
         remat=not args.no_remat,
+        n_contacts=4 if getattr(args, "toe_heel", False) else 2,
+        widths=tuple(args.widths),
         freeze_contact_chol=getattr(args, "freeze_contact_chol", False),
         warm_in_s=getattr(args, "warm_in_s", 1.0),
         episode_s=getattr(args, "episode_s", 43.0),
@@ -84,7 +86,8 @@ def build_estimator(args, verbose: bool = True):
     six subchain joints) and ``contact_meas_var = 0.0`` is deliberate: it is the
     hand-tuned isotropic stand-in ContactNet replaces.
     """
-    return collect.build_collector(chunk_ticks=args.chunk, verbose=verbose)
+    return collect.build_collector(chunk_ticks=args.chunk, verbose=verbose,
+                                  toe_heel=getattr(args, "toe_heel", False))
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +409,11 @@ def main():
     ap.add_argument("--lr", type=float, default=1.0e-4)
     ap.add_argument("--warmup-steps", type=int, default=100)
     ap.add_argument("--no-remat", action="store_true")
+    # Must match the dataset: the cache and norm constants are (T, N_c, F).
+    ap.add_argument("--toe-heel", action="store_true",
+                    help="4 InEKF contacts (heel+toe); the data must be collected with it too")
+    ap.add_argument("--widths", type=int, nargs="+", default=[256, 256],
+                    help="trunk widths, e.g. --widths 128 64")
     # Chained segments are the default (PORT_NOTES, run-1 root cause).  --no-chained
     # restores run-1's per-segment truth re-seed for the ablation.
     ap.add_argument("--no-chained", dest="chained", action="store_false", default=True)

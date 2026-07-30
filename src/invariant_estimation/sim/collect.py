@@ -393,7 +393,7 @@ class Collector:
 
 def build_collector(policy_name: str = "baseline", *, dt: float = rp.DT,
                     chunk_ticks: int = 10_000, contact_meas_var: float = 0.0,
-                    verbose: bool = True) -> Collector:
+                    toe_heel: bool = False, verbose: bool = True) -> Collector:
     """Load the policy and build the fused estimator.
 
     `contact_fk_unfiltered=True` is NOT optional here: without it `FusedSensors.q_unfiltered` is
@@ -410,7 +410,8 @@ def build_collector(policy_name: str = "baseline", *, dt: float = rp.DT,
     policy = rp.load_policy(policy_name)
     fused = me.build_alex_fused_estimator_from_urdf(
         rp.cycloid_forearm_urdf(rp.URDF), dt=dt,
-        contact_meas_var=contact_meas_var, contact_fk_unfiltered=True)
+        contact_meas_var=contact_meas_var, contact_fk_unfiltered=True,
+        toe_heel=toe_heel)
     c = Collector(policy=policy, fused=fused, dt=dt, chunk_ticks=int(chunk_ticks),
                   policy_name=policy_name, build_s=time.time() - t0)
     if verbose:
@@ -1052,11 +1053,11 @@ def channel_report(c: Collector, sensors: FusedSensors, *, rest: slice | None = 
     (`terrain.spawn_lift`) and spends the first few hundred ms falling onto it, which is why the
     naive `slice(0, 500)` reports a 0.2 rad/s "resting" gyro.
     """
-    from ..contactnet.features import (build_subchain_indices, channel_names,
-                                       make_contact_channels)
+    from ..contactnet.features import (channel_names, make_contact_channels,
+                                       subchain_for)
 
     reader_unfiltered = _unfiltered_names(c)
-    sub = build_subchain_indices(c.fused.build.joint_names, reader_unfiltered)
+    sub = subchain_for(c.fused, reader_unfiltered)
     chan = make_contact_channels(sub, c.fused.base_imu, c.fused.kinematics, c.dt)
     x = contact_channels_chunked(chan, sensors)
     names = channel_names()
@@ -1153,7 +1154,7 @@ def collect_all(terrains: Sequence[str] | None = None, seeds: Sequence[int] = (0
 
 def _measure(args):
     """(A) warm-up + (B) throughput, on a long rollout per terrain. The two deliverables."""
-    c = build_collector(chunk_ticks=args.chunk)
+    c = build_collector(chunk_ticks=args.chunk, toe_heel=args.toe_heel)
     rows = []
     for name in (args.terrain or list(tr.TERRAINS)):
         r = collect_rollout(name, seed=args.seed, seconds=args.seconds, collector=c,
@@ -1199,6 +1200,11 @@ if __name__ == "__main__":
     ap.add_argument("--seconds", type=float, default=60.0)
     ap.add_argument("--vx", type=float, default=0.4)
     ap.add_argument("--chunk", type=int, default=10_000)
+    # N=4 InEKF contacts (heel+toe per foot). A rollout stores (T, N, 3, 3)
+    # arrays, so this is BAKED IN at collection: an N=2 dataset cannot be
+    # replayed under an N=4 filter or vice versa.
+    ap.add_argument("--toe-heel", action="store_true",
+                    help="collect with 4 InEKF contact points instead of 2")
     ap.add_argument("--out", default=str(DATA_DIR))
     ap.add_argument("--no-noise", action="store_true", help="clean sensors (no bias to converge)")
     ap.add_argument("--dr", nargs="?", const=str(DR_CONFIG_PATH), default=None,
@@ -1239,9 +1245,11 @@ if __name__ == "__main__":
         _measure(args)
     elif dr is not None:
         collect_all(args.terrain, args.seeds, args.seconds, out_dir=args.out,
-                    collector=build_collector(chunk_ticks=args.chunk),
+                    collector=build_collector(chunk_ticks=args.chunk,
+                                              toe_heel=args.toe_heel),
                     vx=args.vx, imu_noise=not args.no_noise, dr=dr, settle_s=settle)
     else:
         collect_all(args.terrain, args.seeds, args.seconds, out_dir=args.out,
-                    collector=build_collector(chunk_ticks=args.chunk),
+                    collector=build_collector(chunk_ticks=args.chunk,
+                                              toe_heel=args.toe_heel),
                     vx=args.vx, imu_noise=not args.no_noise, record_slip=args.record_slip)

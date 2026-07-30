@@ -176,7 +176,8 @@ JOINT_LABELS: tuple[str, ...] = ("hip_x", "hip_z", "hip_y", "knee_y", "ankle_y",
 """Side-agnostic labels for `ALEX_FOOT_CHAINS`, for `channel_names`."""
 
 
-def build_subchain_indices(joint_names, unfiltered_names, foot_chains=ALEX_FOOT_CHAINS):
+def build_subchain_indices(joint_names, unfiltered_names, foot_chains=ALEX_FOOT_CHAINS,
+                           contacts_per_foot: int = 1):
     r"""Resolve joint NAMES to indices into ``concat(filtered, unfiltered)``.
 
     One index space for both ``q`` and ``τ``: `FusedSensors.torques` already
@@ -187,10 +188,30 @@ def build_subchain_indices(joint_names, unfiltered_names, foot_chains=ALEX_FOOT_
     discipline `sim.sensors.SimSensorReader` applies at the plant boundary, and
     for the same reason: a permuted gather still produces a network that trains.
 
+    ``contacts_per_foot``
+    ---------------------
+    The returned table is one row per **contact point**, not per foot, because
+    `make_contact_channels` reads ``N_c`` from its shape and must agree with the
+    contact FK's ``y`` (``(T, N_c, 3)``). With toe/heel contacts
+    (`pipeline.main_estimator.ALEX_CONTACT_SITES`) there are two contact points on
+    each leg, and they share that leg's joints entirely — so each chain is
+    repeated ``contacts_per_foot`` times, **foot-major**, matching the
+    ``(left_heel, left_toe, right_heel, right_toe)`` slot order.
+
+    Heel and toe therefore receive *identical* ``q_sub`` and ``tau_sub``; they are
+    distinguished only by the ``p``/``v`` channels, which come from their own FK.
+    That is sufficient rather than accidental: ``p_x`` is a near-constant +0.1475
+    for a toe and −0.0495 for a heel, so the shared-weight network has an implicit
+    "which point am I" identifier and can read the shared ankle-pitch torque
+    accordingly. Worth knowing that the *load* signal alone cannot say which end
+    of the foot is carrying weight.
+
     Returns
     -------
-    np.ndarray, shape (N_c, J_sub)
+    np.ndarray, shape (N_c, J_sub) with ``N_c = len(foot_chains) * contacts_per_foot``
     """
+    if contacts_per_foot < 1:
+        raise ValueError(f"contacts_per_foot must be >= 1, got {contacts_per_foot}")
     order = list(joint_names) + list(unfiltered_names)
     pos = {n: i for i, n in enumerate(order)}
     if len(pos) != len(order):
@@ -205,8 +226,29 @@ def build_subchain_indices(joint_names, unfiltered_names, foot_chains=ALEX_FOOT_
         missing = [n for n in chain if n not in pos]
         if missing:
             raise KeyError(f"joints not present in the model: {missing}")
-        idx.append([pos[n] for n in chain])
+        row = [pos[n] for n in chain]
+        idx.extend([row] * contacts_per_foot)     # foot-major: L,L,R,R for 2/foot
     return np.asarray(idx, dtype=int)
+
+
+def subchain_for(fused, unfiltered_names, foot_chains=ALEX_FOOT_CHAINS):
+    r"""`build_subchain_indices` with ``contacts_per_foot`` taken from the estimator.
+
+    The single place that division lives. `make_contact_channels` reads ``N_c``
+    from the subchain's shape while ``p``/``v`` come from the contact FK, so the
+    two MUST agree — and the authority on how many contact points there are is the
+    filter that was built, not a constant here. `with_contactnet` re-checks it and
+    raises, so a mismatch is loud, but deriving it removes the chance entirely.
+    """
+    n_feet = len(foot_chains)
+    n_c = int(fused.n_contacts)
+    per, rem = divmod(n_c, n_feet)
+    if rem:
+        raise ValueError(
+            f"estimator has N={n_c} contacts, which is not a whole number per foot "
+            f"over {n_feet} feet — `ALEX_FOOT_CHAINS` cannot be expanded to match")
+    return build_subchain_indices(fused.build.joint_names, unfiltered_names,
+                                  foot_chains=foot_chains, contacts_per_foot=per)
 
 
 def channel_names(joint_labels: tuple[str, ...] = JOINT_LABELS) -> tuple[str, ...]:
