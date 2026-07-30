@@ -26,6 +26,19 @@ dependencies = [
   "optax>=0.2.8",
 ]
 
+[project.optional-dependencies]
+# OPT-IN GPU backend: `uv sync --extra gpu`. A default `uv sync` and every macOS install are
+# unaffected -- this is additive (`jaxlib` stays; a `jax-cuda13-plugin` is added alongside).
+# cuda13 matches the driver this was developed against (580.173.02 / CUDA 13.0).
+#
+# NOTE `uv lock` resolves ALL extras, so `uv.lock` carries a large `nvidia-*` block even though a
+# default sync downloads none of it.
+#
+# This is NOT expected to speed up the estimator, and the estimator does not default to it -- see
+# `experiments/bench_estimator_device.py` and the verdict in RUNNING.md. It is here because it
+# unblocks TERRAIN.md Stage 0 (vmapped MJX rollouts), where a GPU genuinely wins.
+gpu = ["jax[cuda13]"]
+
 [project.scripts]
 docs = "invariant_estimation._docs:serve"
 docs-build = "invariant_estimation._docs:build"

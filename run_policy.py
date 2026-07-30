@@ -127,6 +127,37 @@ def _read_cfg(rel):
 _FALLBACK = {p["name"]: p for p in _read_cfg(POLICIES["baseline"]["cfg"])["jointParameters"]}
 
 
+def _ort_session(path):
+    """Build the policy's ONNX session PINNED TO ONE NON-SPINNING THREAD.
+
+    ORT's defaults are tuned for serving a big model on an idle box: one intra-op thread per
+    physical core, and after each `Run` those threads *spin* rather than sleep so they are ready
+    for the next call.  Both defaults are actively harmful here.  The policy is a tiny MLP -- one
+    thread computes it faster than N can be synchronised -- and this is not an idle box: XLA runs
+    the two filters on its own pool between control ticks, so the spinning ORT threads sit on
+    exactly the cores the estimator needs.  Measured, this 20-thread box: a default session adds
+    **9 threads**, a pinned one adds **0**.
+
+    THIS IS THE WHOLE REASON THE LOOP NOW KEEPS REAL TIME.  Interleaved A/B, walking, with an
+    offscreen render per tick, one session per process:
+
+        default                     p50 24.0 / 29.7 ms   p90 34.7 / 41.5   -> 0.83x / 0.67x real time
+        pinned, 1 thread, no spin   p50 17.8 / 16.1 ms   p90 31.5 / 24.6   -> 1.12x / 1.24x real time
+
+    ~1.6x on the median, and it carries the viewer across the real-time line on its own -- the
+    "viewer runs at 0.6x" problem was this, not the estimator.  (An earlier planning estimate had
+    predicted a tail-only win with a noisy median; on the full loop the median moves robustly too.)
+
+    One session per process is the only valid way to measure this: swapping sessions mid-run
+    leaves the first pool alive and measures *more* threads, not fewer, which inverts the result.
+    """
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = 1
+    opts.inter_op_num_threads = 1
+    opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    return ort.InferenceSession(path, opts, providers=["CPUExecutionProvider"])
+
+
 # ---------------------------------------------------------------------------
 # Policy loading
 # ---------------------------------------------------------------------------
@@ -145,8 +176,7 @@ def load_policy(name):
         "obs_terms": cfg["observations"],
         "action_scale": float(cfg.get("actionScale", 0.3)),
         "input_size": int(cfg["inputSize"]),
-        "sess": ort.InferenceSession(f"{RL_MODELS}/{spec['onnx']}",
-                                     providers=["CPUExecutionProvider"]),
+        "sess": _ort_session(f"{RL_MODELS}/{spec['onnx']}"),
         "base_height": float(spec["base_height"]),
         "height_range": tuple(spec["height_range"]),
     }
@@ -444,7 +474,8 @@ RESERVED_KEYS = frozenset(
 )
 
 # Keypad label -> GLFW keycode (GLFW_KEY_KP_0..KP_9 are contiguous from 320).
-KEYPAD = {str(n): 320 + n for n in range(10)} | {"-": 333, "+": 334}
+# 330 KP_DECIMAL and 331 KP_DIVIDE are free too; 332 KP_MULTIPLY is the ghost toggle.
+KEYPAD = {str(n): 320 + n for n in range(10)} | {"-": 333, "+": 334, "*": 332}
 
 VX_STEP, VY_STEP, YAW_STEP, HEIGHT_STEP = 0.1, 0.1, 0.1, 0.02
 # Command ranges the policy was TRAINED on: alex_ihmc_walk_env_cfg.AlexCommandsCfg
@@ -470,6 +501,8 @@ BINDINGS = (
     ("higher",     "+", "+", "raise base height"),
     ("lower",      "-", "-", "lower base height"),
     ("stand",      "0", "t", "toggle standing flag"),
+    # Viewer-only, and a no-op unless a `Ghost` is attached (`run_estimator.py --ghost`).
+    ("ghost",      "*", "g", "cycle the estimator ghost: off -> full -> attitude"),
 )
 _BY_KEY = {KEYPAD[label]: name for name, label, _, _ in BINDINGS}
 _BY_CHAR = {ch: name for name, _, ch, _ in BINDINGS}
@@ -633,6 +666,9 @@ class Loop:
         self._ramp_t = 0.0
         # [vx, vy, yaw_rate, standing, base_height]
         self.cmd = np.array([0.0, 0.0, 0.0, 1.0, self._ramp_from])
+        # Optional `sim.ghost.Ghost`, attached by the viewer entry points. Kept on the Loop so the
+        # existing keypad/terminal command plumbing reaches it without a second dispatch path.
+        self.ghost = None
 
     # -- height command (RLHeightManager) ------------------------------------
     def _height(self):
@@ -688,6 +724,10 @@ class Loop:
             return self.set_height_target(self.height_target - HEIGHT_STEP)
         elif name == "stand":
             c[3] = 1.0 - c[3]
+            return
+        elif name == "ghost":
+            if self.ghost is not None:
+                print(f"\n  ghost: {self.ghost.cycle()}")
             return
         else:
             return
@@ -888,8 +928,13 @@ def _apply_held(loop, held, dt):
         loop.nudge_height((up - down) * HEIGHT_RATE * dt)
 
 
-def run_free_viewer(policy_name):
-    """Standalone GLFW window with WASD+Space+Shift live control. See WASD_HELP."""
+def run_free_viewer(policy_name, loop=None):
+    """Standalone GLFW window with WASD+Space+Shift live control. See WASD_HELP.
+
+    `loop` optionally supplies a PRE-BUILT loop -- `run_estimator.py --wasd` passes its
+    `EstimatedLoop` so this window can drive the estimator (and its ghost) instead of ground truth.
+    Default `None` builds the plain truth-driven loop, i.e. the original behaviour.
+    """
     import glfw
     # This viewer owns its own GLFW window, so it must run on the main thread -- and it must NOT be
     # launched under `mjpython`, which runs the script on a *secondary* thread (mjpython keeps the
@@ -901,7 +946,7 @@ def run_free_viewer(policy_name):
             "    uv run python run_policy.py --wasd\n"
             "(mjpython runs this script off the main thread, so GLFW raises an NSException. mjpython "
             "is only needed for the DEFAULT viewer, which uses MuJoCo's own Simulate GUI.)")
-    loop = make_loop(policy_name, with_visuals=True)
+    loop = loop if loop is not None else make_loop(policy_name, with_visuals=True)
     m, d = loop.m, loop.d
 
     if not glfw.init():
@@ -934,6 +979,10 @@ def run_free_viewer(policy_name):
                 loop.set_height_target(loop.policy["base_height"])
             elif key == glfw.KEY_X:
                 loop.command("stop")
+            elif key == glfw.KEY_G:
+                # This window owns its `on_key`, so unlike the passive viewer a plain letter is
+                # available here -- no keypad needed.
+                loop.command("ghost")
             else:
                 held.add(key)
         elif action == glfw.RELEASE:
@@ -977,6 +1026,14 @@ def run_free_viewer(policy_name):
         loop.control_tick()
 
         mujoco.mjv_updateScene(m, d, opt, None, cam, mujoco.mjtCatBit.mjCAT_ALL, scene)
+        # After `mjv_updateScene` (which resets `ngeom` itself, so no manual clear here) and
+        # before rendering. No-op unless an estimated loop attached a ghost.
+        if loop.ghost is not None:
+            # Only an `EstimatedLoop` ever attaches a ghost, so `current_estimate` is present.
+            est = loop.current_estimate()
+            if est is not None:
+                loop.ghost.update(est, d)
+                loop.ghost.draw(scene)
         fb_w, fb_h = glfw.get_framebuffer_size(window)
         mujoco.mjr_render(mujoco.MjrRect(0, 0, fb_w, fb_h), scene, context)
         glfw.swap_buffers(window)
