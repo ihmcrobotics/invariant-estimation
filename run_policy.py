@@ -802,10 +802,15 @@ class VideoRecorder:
     """Renders a tracking view of `body` and streams it to `path` as H.264."""
 
     def __init__(self, m, path, *, body=0, width=1280, height=720, fps=50,
-                 distance=3.2, azimuth=120.0, elevation=-15.0):
+                 distance=3.2, azimuth=120.0, elevation=-15.0, extra_geoms=0):
         import subprocess
         self.m, self.path, self.fps = m, path, fps
-        self.renderer = mujoco.Renderer(m, height, width)
+        # `extra_geoms` reserves room for anything `capture(overlay=...)` appends -- a
+        # `sim.ghost.Ghost` draws a whole second robot, and `mjv_addGeoms` silently
+        # stops at `max_geom` rather than raising, so an under-sized scene loses
+        # geoms with no error and a video that just looks subtly wrong.
+        self.renderer = mujoco.Renderer(m, height, width,
+                                        max_geom=10000 + int(extra_geoms))
         self.cam = mujoco.MjvCamera()
         mujoco.mjv_defaultCamera(self.cam)
         self.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
@@ -821,8 +826,16 @@ class VideoRecorder:
              "-pix_fmt", "yuv420p", path],
             stdin=subprocess.PIPE)
 
-    def capture(self, d):
+    def capture(self, d, overlay=None):
+        """Render one frame. `overlay` is anything with `draw(scn) -> int`.
+
+        The overlay is drawn AFTER `update_scene`, which rebuilds the scene from
+        scratch every call -- so unlike the viewer's persistent `user_scn` there is
+        nothing to clear first and no way to accumulate geoms across frames.
+        """
         self.renderer.update_scene(d, camera=self.cam, scene_option=self.opt)
+        if overlay is not None:
+            overlay.draw(self.renderer.scene)
         self.proc.stdin.write(self.renderer.render().tobytes())
         self.n += 1
 

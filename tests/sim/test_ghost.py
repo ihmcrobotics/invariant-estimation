@@ -292,3 +292,89 @@ def test_draw_appends_rather_than_clobbering_and_tints_only_its_own(model, maps,
     np.testing.assert_array_equal(scn.geoms[0].rgba, pre)        # the floor is untouched
     for i in range(n_before, scn.ngeom):
         assert scn.geoms[i].rgba[3] == pytest.approx(0.35)
+
+
+# ---------------------------------------------------------------------------
+# The ghost in the OFFSCREEN renderer (`--video`), not just the viewer
+# ---------------------------------------------------------------------------
+
+def _offscreen(model, maps, tmp_path, extra_geoms):
+    """A `VideoRecorder` writing to a throwaway path. Needs EGL + ffmpeg."""
+    pytest.importorskip("OpenGL")
+    import shutil
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not on PATH")
+    return rp.VideoRecorder(model, str(tmp_path / "t.mp4"), body=maps["BASE_BID"],
+                            width=320, height=240, fps=50, extra_geoms=extra_geoms)
+
+
+def test_video_recorder_reserves_room_for_the_overlay(model, maps, tmp_path):
+    r"""`mjv_addGeoms` stops silently at `max_geom` rather than raising.
+
+    An under-sized scene therefore drops the tail of the ghost with no error and
+    yields a video that merely looks subtly wrong — so the headroom is asserted,
+    not assumed.
+    """
+    rec = _offscreen(model, maps, tmp_path, extra_geoms=2 * model.ngeom)
+    try:
+        assert rec.renderer._scene.maxgeom >= 10000 + 2 * model.ngeom
+    finally:
+        rec.close()
+
+
+def test_ghost_reaches_the_offscreen_renderer_and_changes_pixels(model, maps, ghost, tmp_path):
+    r"""The `--video` path draws the ghost — the regression this test exists for.
+
+    The ghost was viewer-only: it drew into `viewer.user_scn`, and `run_estimator.py`
+    refused `--ghost` alongside `--headless`/`--video`. Wiring it into the offscreen
+    renderer is what makes a comparison *video* possible.
+
+    Checked two ways, because each alone can pass while the feature is broken:
+    the geom count must rise (the overlay ran, and fits), and the rendered pixels
+    must actually differ (the geoms are on screen rather than behind the camera or
+    fully transparent).
+    """
+    d = mujoco.MjData(model)
+    d.qpos[maps["ALL_QADR"]] = maps["ALL_HOME"]
+    d.qpos[0:3] = [0.0, 0.0, rp.lowest_foot_to_root_height(model, d)]
+    d.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+    mujoco.mj_forward(model, d)
+    # Offset laterally so the ghost cannot be perfectly hidden inside the real robot.
+    ghost.offset = 1.0
+    ghost.update(_rest_est(model, maps, d), d)
+
+    rec = _offscreen(model, maps, tmp_path, extra_geoms=2 * model.ngeom)
+    try:
+        rec.renderer.update_scene(d, camera=rec.cam, scene_option=rec.opt)
+        base_n = rec.renderer.scene.ngeom
+        added = ghost.draw(rec.renderer.scene)
+        assert added > 0, "the ghost appended nothing to the offscreen scene"
+        assert base_n + added <= rec.renderer._scene.maxgeom, "overlay was truncated"
+        with_ghost = rec.renderer.render().astype(int)
+
+        rec.renderer.update_scene(d, camera=rec.cam, scene_option=rec.opt)
+        assert rec.renderer.scene.ngeom == base_n, "update_scene did not reset the scene"
+        without = rec.renderer.render().astype(int)
+    finally:
+        rec.close()
+
+    changed = int((np.abs(with_ghost - without) > 8).sum())
+    assert changed > 0.002 * with_ghost.size, (
+        f"only {changed} of {with_ghost.size} pixels changed — the ghost geoms are "
+        f"in the scene but not visible on screen")
+
+
+def test_capture_without_an_overlay_is_the_plain_scene(model, maps, tmp_path):
+    """`overlay=None` must be exactly the old behaviour, so `--video` alone is unchanged."""
+    d = mujoco.MjData(model)
+    mujoco.mj_forward(model, d)
+    rec = _offscreen(model, maps, tmp_path, extra_geoms=0)
+    try:
+        rec.renderer.update_scene(d, camera=rec.cam, scene_option=rec.opt)
+        n = rec.renderer.scene.ngeom
+        rec.capture(d)                      # no overlay
+        rec.renderer.update_scene(d, camera=rec.cam, scene_option=rec.opt)
+        assert rec.renderer.scene.ngeom == n
+        assert rec.n == 1
+    finally:
+        rec.close()

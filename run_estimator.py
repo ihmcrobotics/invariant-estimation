@@ -413,15 +413,25 @@ def run_headless(loop, ticks, cmd=None, out=None, every=25, video=None, video_fp
         control_hz = 1.0 / (rp.DECIMATION * rp.DT)
         stride = max(1, int(round(control_hz / video_fps)))
         w, h = video_size
+        # The ghost is a whole second robot's worth of geoms on top of the scene.
+        ghost_geoms = 2 * loop.m.ngeom if loop.ghost is not None else 0
         rec = rp.VideoRecorder(loop.m, video, body=loop.maps["BASE_BID"], width=w, height=h,
-                               fps=control_hz / stride)
-        print(f"  recording {w}x{h} @ {control_hz / stride:.0f} fps -> {video}")
+                               fps=control_hz / stride, extra_geoms=ghost_geoms)
+        print(f"  recording {w}x{h} @ {control_hz / stride:.0f} fps -> {video}"
+              + (f"  (+ghost: {loop.ghost.mode})" if loop.ghost is not None else ""))
     x0, y0 = loop.d.qpos[0], loop.d.qpos[1]
     t0 = time.time()
     for k in range(ticks):
         loop.control_tick()
         if rec is not None and k % stride == 0:
-            rec.capture(loop.d)
+            # Same order as the viewer path: place the ghost at the estimate, then
+            # draw. `update` is a no-op when the ghost is off, and `current_estimate`
+            # is None until the first estimator tick has published one.
+            if loop.ghost is not None:
+                est = loop.current_estimate()
+                if est is not None:
+                    loop.ghost.update(est, loop.d)
+            rec.capture(loop.d, overlay=loop.ghost)
         if k % every == 0:
             print(f"  t={k * rp.DECIMATION * rp.DT:5.2f}s  {loop.status()}\n"
                   f"            {loop.est_status()}")
@@ -571,10 +581,11 @@ if __name__ == "__main__":
         contactnet=args.contactnet, contactnet_norm=args.contactnet_norm,
         toe_heel=args.toe_heel,
         threaded=args.realtime, max_backlog_ticks=args.max_backlog_ticks)
-    # The ghost is a viewer feature: it draws, and headless has nothing to draw into.
-    if args.ghost != "off" and headless:
-        raise SystemExit("--ghost needs a viewer; drop --headless/--video")
-    if not headless:
+    # The ghost needs somewhere to draw: a viewer's `user_scn`, or the offscreen
+    # renderer behind `--video`. Plain `--headless` with no video has neither.
+    if args.ghost != "off" and headless and not args.video:
+        raise SystemExit("--ghost needs a viewer or --video; there is nothing to draw into")
+    if not headless or args.video:
         loop.ghost = Ghost(loop.m, loop.maps, loop.filtered_slots,
                            offset=args.ghost_offset, mode=args.ghost)
     if headless:
