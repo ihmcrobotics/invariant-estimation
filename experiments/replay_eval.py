@@ -199,10 +199,22 @@ def main() -> None:
     # seam writes since 2026-07-29; `meas` is what runs 1-4 were trained against,
     # and is the only fair way to score one of those.
     ap.add_argument("--socket", default="process", choices=["process", "meas"])
+    # A rollout stores `(T, N, 3, 3)` contact arrays, so the estimator built here
+    # must have the same `N` the data was collected with or every contact field
+    # mismatches on the first tick. There is no way to infer it from the
+    # checkpoint (the network is per-contact and shape-agnostic), so it is a flag.
+    ap.add_argument("--toe-heel", dest="toe_heel", action="store_true",
+                    help="score against an N=4 (heel+toe per foot) InEKF; the "
+                         "dataset must have been collected with --toe-heel too")
     args = ap.parse_args()
 
-    cfg = ContactNetConfig(F=24, sigma_0=1.0e-4)
-    fused = collect.build_collector(verbose=False).fused
+    n_c = 4 if args.toe_heel else 2
+    # `n_contacts` only reaches `cfg.dof`, but a wrong `dof` silently rescales
+    # every NIS this script would report.
+    cfg = ContactNetConfig(F=24, sigma_0=1.0e-4, n_contacts=n_c)
+    fused = collect.build_collector(verbose=False, toe_heel=args.toe_heel).fused
+    if int(fused.n_contacts) != n_c:
+        raise SystemExit(f"estimator has {fused.n_contacts} contacts, expected {n_c}")
     data = Path(args.data)
     cache = Path(args.cache) if args.cache else data / "cache"
     norm = normalize.load(str(Path(args.norm) if args.norm
@@ -223,14 +235,29 @@ def main() -> None:
 
     rows = {"heuristic": [], "trained": []}
     for prep in preps:
-        # Window the whole stream once; the cache makes this a gather.
-        w = features.window(jnp.asarray(prep.smoothed), cfg.H, cfg.stride)
+        # `features.window` over a whole rollout materialises (T, N_c, H, F) —
+        # at N=4 that is 62000*4*50*24*8 = 2.38 GB, and its `swapaxes` needs
+        # input AND output resident, so 4.8 GB of device memory for a quantity
+        # only ever consumed `args.ticks` rows at a time. On a 12 GB card that
+        # OOMs partway through the rollout loop (it fit at N=2, which is why this
+        # only appeared now).
+        #
+        # Split by WHERE, not by WHAT: `boxcar` is the only arithmetic and stays
+        # on device (it is (T, N_c, F), 47 MB); the gather and transpose are pure
+        # data movement and move to the host, gathered per-t0 instead of whole.
+        # Gather is elementwise-independent, so gathering sliced indices is
+        # bit-identical to slicing a whole-rollout gather.
+        sm = np.asarray(features.boxcar(jnp.asarray(prep.smoothed), cfg.stride))
+        idx = np.asarray(features.window_indices(sm.shape[0], cfg.H, cfg.stride))
+        n_c = sm.shape[1]
         hi = min(prep.t_hi, prep.smoothed.shape[0] - args.ticks - 1)
         if hi <= prep.t_lo:
             continue
         for t0 in np.linspace(prep.t_lo, hi, args.starts).astype(int):
             t0 = int(t0)
-            flat = w[t0:t0 + args.ticks].reshape(args.ticks, w.shape[1], -1)
+            # (ticks, H, N_c, F) -> (ticks, N_c, H, F) -> (ticks, N_c, H*F)
+            flat = np.swapaxes(sm[idx[t0:t0 + args.ticks]], 1, 2).reshape(
+                args.ticks, n_c, -1)
             L_net = fwd(flat)
             # The baseline is "what the shipped filter puts in this socket", and
             # that differs BY SOCKET. On `meas` the shipped value is zero, and

@@ -4070,3 +4070,56 @@ kernel selection is not fixed across processes, so rounding at 1e-16 amplifies t
 comparing two runs "bit-for-bit" therefore measured nothing — the real evidence is
 the exact-0.0 agreement of every estimator input above. Effects below ~1e-5 in this
 harness are not measurable; the toe/heel results are 1.3–5.6x, far above it.
+
+---
+
+## `test_threaded_mode_agrees_with_synchronous_within_noise` fails, and it is a stale threshold (2026-07-30)
+
+Merging `worktree-estimator-ghost-realtime` brings this test, and it fails on the
+merge: `threaded tilt 0.748 vs sync 1.307 deg`, against an assertion of
+`|sync − threaded| < 0.3`. **It is not a regression, and nothing in the
+process-socket branch caused it.** Bisected on the sync arm's `tilt_deg_tail_rms`
+(250 ticks, `vx = 0.6`, no IMU noise):
+
+| commit | date | sync tilt tail [deg] |
+|---|---|---|
+| `c6ebc14` ghost branch tip | 07-27 | **0.856** |
+| `83ede89` "sim at 1 kHz physics" | 07-27 | **1.304** |
+| `c4f3f98` terrain refactor | 07-28 | 1.304 |
+| `de73c49` rotate contact meas. noise to world | 07-28 | 1.307 |
+| `f063841` main, our branch point | 07-29 | **1.307** |
+| `d630142` process-socket + ghost merge | 07-30 | **1.307** |
+
+Three things fall out.
+
+1. **The branch is exonerated element-for-element.** `f063841` and `d630142` give
+   the identical 1.3074 — the five process-socket/N=4/ghost commits move the
+   analytic estimator by nothing, which is what the N=2-unchanged claims elsewhere
+   in this file assert and this measures independently.
+2. **The cause is `83ede89`, which changed the PLANT, not the filter**: sim physics
+   200 Hz → 1 kHz (`DT` 0.005 → 0.001, `DECIMATION` 4 → 20). The ghost branch was
+   cut before it. So the test's hard-coded 0.3° tolerance was calibrated against a
+   *different simulator*, and its docstring's claim that "both numbers are
+   reproducible to 1e-3 across repeats" is true but irrelevant — they are
+   reproducible, at values the threshold no longer admits.
+3. **The rotation fix (`de73c49`) is not the culprit**, which was the obvious
+   suspect: it moved the number 0.3% (1.3039 → 1.3074). Worth recording because
+   "the commit that changed the measurement noise" is where anyone would look first.
+
+Note the failure direction: threaded (0.748) is **better** than sync (1.307), while
+the assertion message reads "staleness is costing accuracy". The test fires on the
+opposite of what it guards. That is itself informative — with a 1 kHz plant the
+stale estimate is *helping*, presumably because delay low-passes what is fed back
+into the policy — but it is a different question from the one the test asks.
+
+**Not fixed here**, deliberately: retuning a threshold is a judgement call, and the
+options differ in what they keep catching. Ranked:
+
+1. **Make the bound relative** (`|Δ| < 0.5 · sync`) so it survives the next plant
+   change instead of rotting silently. Preferred.
+2. Re-baseline the absolute bound at 1 kHz from measured values, kept two-sided.
+3. Make it one-sided (fail only when threaded is worse). Cheapest, but stops
+   catching "threading looks good because sync broke", which is arguably the
+   present situation.
+
+Until then the suite is **780 passed, 1 failed** on this one test.

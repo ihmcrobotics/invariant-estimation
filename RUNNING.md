@@ -512,6 +512,36 @@ one file and some die with an XML `ParseError`. Give each background run its own
 
 ### Recording a video
 
+**Seeing the estimate: `--ghost`.** A translucent second robot drawn at the
+ESTIMATED state, so the filter's error is visible rather than tabulated. It works
+in the viewer *and* (since 2026-07-30) in `--video`:
+
+```bash
+# side-by-side, current best checkpoint (N=4, so --toe-heel is REQUIRED)
+uv run python run_estimator.py --policy baseline --ticks 1500 --vx 0.6 \
+    --imu-noise --contact-fk measured --toe-heel \
+    --contactnet artifacts/contactnet_run6_w128.npz \
+    --contactnet-norm data/dr4/norm_constants.npz \
+    --ghost --ghost-offset 0.9 --video artifacts/video/out.mp4 --video-size 1280x720
+```
+
+* `--contactnet-norm` defaults to `data/dr/` (run 4's). **A run-6 checkpoint needs
+  `data/dr4/`** — wrong constants shift the input distribution and nothing raises.
+* `--ghost-offset` is a lateral displacement in **world Y**, applied after the pose
+  is set from the estimate (`ghost.py`, `q[1] += offset`). `0` overlays the two.
+  Because it is world-frame rather than body-relative, on a turning walk the ghost
+  does not stay beside the robot.
+* `--ghost attitude` pins the ghost's position at truth so only ORIENTATION error
+  shows. This is the view that makes the yaw cost legible; `full` hides it behind
+  the (now small) position error.
+* `--ghost` with a bare `--headless` is rejected: there is no scene to draw into.
+
+Three reference clips are in `artifacts/video/` (gitignored, local only):
+`1_baseline_N2_no_contactnet.mp4` (ghost sinks 3.19 m),
+`2_N4_contactnet_w128.mp4` (holds height, final dz +0.07 m), and
+`3_N4_w128_attitude_yaw.mp4` (the 4.74° yaw cost). Same seed, so 1 and 2 are
+frame-comparable.
+
 `--video` renders the run offscreen with a chase camera on the pelvis and pipes raw frames into
 `ffmpeg` — no `imageio`/`mediapy` dependency and nothing buffered in memory. It needs `ffmpeg` on
 `PATH` and an offscreen GL context; the script sets `MUJOCO_GL=egl` for you (it has to happen
