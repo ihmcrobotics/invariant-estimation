@@ -468,10 +468,10 @@ indices is bit-identical to slicing a whole-rollout gather.
   in §3d is 1.3x or larger, well clear of it.
 * **Replay and the closed loop disagree on velocity** (§3d). Two different systems,
   both reported.
-* **`data/dr4` has 13 rollouts and 12 caches.** 12 were collected as planned; the
-  13th is a stray from the pre-flight smoke collection that shares the directory and
-  is *not* in the cache, so it did not enter training. Harmless, but it should be
-  deleted before anyone counts the dataset.
+* ~~`data/dr4` has 13 rollouts and 12 caches~~ — **retracted.** The dataset is
+  exactly 12 rollouts, all 62 000 ticks, all `(T, 4, 3, 3)`, all cached. The "13th"
+  was `norm_constants.npz` being caught by a `*.npz` glob. Nothing is stray and
+  nothing needed deleting.
 * **The N=4 analytic baseline is itself new**, measured in this run rather than
   independently replicated.
 * **Nothing here tests slip**, which is the other thing a learned contact covariance
