@@ -3722,3 +3722,120 @@ full-directory run: JAX's jit cache is a process-wide LRU, so an unrelated suite
 evicts the entry and the assertion reads a *miss* as a recompile. Now compares the
 lowered HLO across contact conditions, which says the thing under test directly
 and cannot be evicted. (It was failing on `main` too — verified by stashing.)
+
+---
+
+## Run 5 — the first process-socket network (2026-07-29)
+
+`sigma_0 = 1e-1`, `contact_floor` 1e-4, `l2_velocity`, `artifacts/p0_process_dr.npz`,
+10 000 steps in 63 min on the 4070 SUPER. Checkpoint `artifacts/contactnet_run5.npz`.
+
+Loss 3.96e-3 → **1.06e-3** (median of the last 1000), plateaued over the final
+2000 steps. `applied_frac = 1.000` for the entire run — not one gated update, so
+the loss scored real corrections throughout — and `cond_proxy_max` peaked at
+1.8e4 against the 1e9 gate. The step-50 spike to 1.1e-1 is the chains
+equilibrating away from their truth seed under the deliberately-loose init, not
+divergence.
+
+### Same weights, two sockets — the head-to-head
+
+The only apples-to-apples statement about the move: one network, one `P0`, same
+seeds and rollouts, differing *only* in which field it drives.
+
+**In sample** (`data/dr`, 3×2×20 s, `p0_process_dr.npz`):
+
+| arm | slope(e_pz) | ratio | vel_rms | height_rms | tilt [deg] |
+|---|---|---|---|---|---|
+| heuristic | −0.03751 | 1.162 | 0.0771 | 0.3993 | 0.590 |
+| run 5 → `N` (meas) | −0.00696 | 1.572 | 0.0448 | 0.0806 | 0.328 |
+| run 5 → `Q_d` (proc) | **+0.00356** | **1.063** | **0.0378** | **0.0636** | 0.365 |
+
+**Held out** (`data/control`, never trained on; DR norm constants, which travel
+with the checkpoint; `p0_process_control.npz`):
+
+| arm | slope(e_pz) | ratio | vel_rms | height_rms | tilt [deg] |
+|---|---|---|---|---|---|
+| heuristic | −0.06694 | 1.081 | 0.0846 | 0.7825 | 0.690 |
+| run 5 → `N` (meas) | −0.00606 | 1.562 | **0.0293** | 0.0855 | **0.303** |
+| run 5 → `Q_d` (proc) | **+0.00517** | **1.044** | 0.0335 | **0.0483** | 0.390 |
+
+Every acceptance criterion in `branch_out.md` §5 passes: the sink is 10.5x (in
+sample) / 12.9x (held out) smaller than the heuristic, `ratio` stays ≈1, and
+nothing regresses against the heuristic.
+
+**What replicates and what does not.** The process socket is robustly better on
+the **vertical** axis in both datasets — sink 2.0x / 1.2x and `height_rms` 1.3x /
+1.8x better than the same weights on the measurement socket. On **velocity and
+tilt** the two sockets are within ~15% and *the ordering flips between datasets*
+(process wins in sample, measurement wins held out). So the defensible claim is
+narrow and exactly on target: **the socket move buys vertical drift**, which is
+what it was aimed at. It does not buy a uniform improvement, and anyone quoting
+the in-sample velocity win as evidence for the move is over-reading it.
+
+One mechanistic detail worth keeping: `ratio = slope(e_pz)/mean(e_vz)` is **1.04–1.06
+on the process socket and 1.56 on the measurement socket**, in both datasets. On
+the process socket the residual drift is still a clean integrated velocity bias;
+on the measurement socket it is not, so part of it is position injection. That is
+the §5 acceptance check doing real work rather than passing vacuously.
+
+### Closed loop — the policy driven by the estimate
+
+30 s at `vx = 0.6`, `--imu-noise`, `--contact-fk measured`, seed 0. Run 4's column
+is the recorded table above.
+
+| | no ContactNet | run 4 | **run 5** |
+|---|---|---|---|
+| final signed dz [m] | −3.194 | −0.399 | **−0.180** |
+| dz RMS, last half [m] | 2.435 | 0.303 | **0.143** |
+| sink rate, last 20 s [m/s] | −0.1079 | −0.0135 | **−0.0064** |
+| 3D pos drift, final [m] | 3.279 | 0.511 | 0.501 |
+| base velocity error RMS [m/s] | 0.1343 | — | 0.0304 |
+| tilt err, tail RMS [deg] | 1.210 | **0.252** | 0.370 |
+
+**2.1–2.2x better than run 4 on all three vertical metrics**, 17.8x better than no
+ContactNet. The robot walks normally in both arms (18.9 m vs 20.1 m travelled,
+true height held at 0.89 m).
+
+### The cost is rotational, and it is yaw
+
+`att_deg` (full 3D attitude error) *regressed* 1.13x rms / 1.34x tail against the
+no-ContactNet baseline while `tilt_deg` improved 2.3x / 3.3x. Decomposing:
+
+| | none | run 5 |
+|---|---|---|
+| tilt (gravity direction — observable) rms / tail | 1.276 / 1.210 | **0.546 / 0.370** |
+| yaw component rms / tail | 0.884 / 1.168 | 1.669 / 2.225 |
+
+The regression is **entirely yaw**, and it is structural rather than a bug. Yaw is
+unobservable in this filter (`enableYawSeeding=false`; `H_g` is rank 2 with null
+along `e_z` by construction), so the *only* thing constraining it is the contact
+update — planted feet at distinct world locations. The network bought its vertical
+win by loosening anchors, and loose anchors carry less yaw information. `trusted
+feet avg` is 1.211 vs 1.208, so this is genuinely `Σ_C` and not the Schmitt
+trigger behaving differently.
+
+Two consequences:
+
+* **`l2_velocity` has no attitude term.** Nothing in the objective was defending
+  tilt or yaw; that tilt improved 3.3x anyway is incidental. If the rotational
+  cost matters, the fix is an attitude term in the loss or `beta_nll`, not
+  reverting the socket.
+* Run 5 is decisively better than run 4 vertically and slightly worse
+  rotationally (tilt tail 0.370 vs 0.252). It is a **different point on the same
+  trade**, not a strict improvement.
+
+### Still not calibrated
+
+`nis_over_dof` sat at 2.2e-2 for the whole run (calibrated = 1.0) and the
+closed-loop NIS tail mean went 0.69 → 0.20. The filter is ~5–45x
+**over-conservative in absolute scale**, which is the known `l2_velocity` gap: the
+quadratic term constrains only *ratios* of `S`, and the `logdet` term that fixes
+absolute scale is exactly what `beta_nll` adds. Safe direction, but **G10's
+NIS/NEES consistency bands will not pass on this checkpoint.** That is the next
+run's job, not a defect in the socket move.
+
+Notably, `nis_over_dof` stayed *flat* while the loss fell 4x. That is the
+predicted signature of learning the right lever: `NIS` tracks the overall
+magnitude of `S`, which is the lever that trades velocity for sink, and the
+network improved velocity through timing and anisotropy instead — exactly the
+split the two-lever sweep said `l2_velocity` would enforce.

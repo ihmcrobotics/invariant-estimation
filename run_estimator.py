@@ -249,6 +249,11 @@ def attach_contactnet(fused, reader, ckpt, norm_path, *, verbose=True):
     # not refuse: replaying an old checkpoint on the new socket deliberately is a
     # legitimate experiment, and `experiments/replay_eval.py --socket meas` is the
     # way to score one on the socket it was trained for.
+    # `sigma_0` is STRUCTURAL ONLY here: `load_params` takes the tree structure
+    # from `like` and overwrites every leaf, and nothing on the inference path
+    # reads it (the warm-up fallback is `sensors.contact_chol`, not `sigma_0 * I`).
+    # So it does not need to match the value the checkpoint was trained at --
+    # run 5 used 1e-1 -- and the log line below reports the checkpoint, not this.
     cfg = ContactNetConfig(F=24, sigma_0=1.0e-4)
     if "run1" in ckpt or "run2" in ckpt or "run3" in ckpt or "run4" in ckpt:
         print(f"WARNING: {ckpt} looks like a run-1..4 checkpoint, which was trained "
@@ -268,7 +273,7 @@ def attach_contactnet(fused, reader, ckpt, norm_path, *, verbose=True):
         print(f"ContactNet: ATTACHED  ckpt={ckpt}  norm={norm_path} "
               f"({consts.n_ticks} ticks, source={consts.source!r})")
         print(f"            cfg F={cfg.F} H={cfg.H} span={cfg.window_span_s}s "
-              f"stride={cfg.stride} dt={cfg.dt} widths={cfg.widths} sigma_0={cfg.sigma_0}; "
+              f"stride={cfg.stride} dt={cfg.dt} widths={cfg.widths}; "
               f"warm-up {online_span(cfg)} ticks of the analytic heuristic before it acts")
     return fused
 

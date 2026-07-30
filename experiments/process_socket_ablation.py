@@ -25,6 +25,7 @@ differs in exactly one field of `InEKFInputs`:
                                                                    floor buy?
     I   a CONSTANT chol at every phase                             where does a
                                                                    run start?
+    N   the same network, on ``contact_chol``                       the head-to-head
 
 Arm B is deliberately **non-causal** — liftoff is known offline, so the swing
 value is dilated backwards in time.  It is a mechanism test, not a deployable
@@ -326,7 +327,7 @@ def main() -> None:
                 help="p0_dr is right for arms driven at the OLD conventions; "
                      "use p0_process_dr.npz once the network drives contact_chol")
     ap.add_argument("--checkpoint", default=str(REPO / "artifacts/contactnet_run4.npz"),
-                    help="arm D only")
+                    help="arms D and N")
     ap.add_argument("--arms", default="A,B,C,D")
     ap.add_argument("--shifts", default="0,10,25,50,100")
     ap.add_argument("--stances", default="1e-4,1e-3,1e-2")
@@ -343,7 +344,8 @@ def main() -> None:
     shifts = [int(x) for x in args.shifts.split(",")]
     stances = [float(x) for x in args.stances.split(",")]
     floors = [float(x) for x in args.floors.split(",")]
-    want_d = "D" in {c.strip().upper() for c in args.arms.split(",")}
+    _want = {c.strip().upper() for c in args.arms.split(",")}
+    want_d, want_n = "D" in _want, "N" in _want
 
     cfg = ContactNetConfig(F=24, sigma_0=1.0e-4)
     fused = collect.build_collector(verbose=False).fused
@@ -356,7 +358,7 @@ def main() -> None:
     P0 = np.load(args.p0)["P0"]
 
     fwd = None
-    if want_d:
+    if want_d or want_n:
         like = network.init(jax.random.PRNGKey(0), cfg.d_in, cfg.widths,
                             cfg.sigma_0, cfg.eps)
         params = train.load_params(args.checkpoint, like)
@@ -379,9 +381,16 @@ def main() -> None:
             sl = slice(t0, t0 + args.ticks)
             s_heur = chol_scale(np.asarray(prep.inputs.contact_chol[sl]))
             arms = build_arms(args.arms, s_heur, shifts, stances, floors)
-            if want_d:
+            if want_d or want_n:
                 flat = w[sl].reshape(args.ticks, w.shape[1], -1)
-                arms.append(("D  run4 on N", "meas", fwd(flat), None))
+                L_net = fwd(flat)
+                # The SAME network output, driven into the two different sockets --
+                # which is the only apples-to-apples statement about the move,
+                # since every other confound (P0, seeds, rollouts) is held fixed.
+                if want_d:
+                    arms.append((f"D  net on N (meas)", "meas", L_net, None))
+                if want_n:
+                    arms.append((f"N  net on Q_d (proc)", "process", L_net, None))
 
             for label, socket, chol, floor in arms:
                 first = label not in rows

@@ -481,6 +481,25 @@ the network is actually reaching the filter rather than being silently dropped.
 | base gyro, tail RMS [rad/s] | 0.0080 | 0.0056 | 0.0062 |
 | 3D position drift, final [m] | 3.260 | 0.511 | 2.220 |
 
+**Run 5 — the first PROCESS-socket network** (single seed 0, same command as
+above with `--contactnet artifacts/contactnet_run5.npz`). Vertical drift is
+**2.1–2.2x better than run 4**; the cost is rotational and it is yaw, which this
+filter cannot observe. Full analysis in `PORT_NOTES.md`, "Run 5".
+
+| seed 0 | no ContactNet | run 4 (rec.) | **run 5** |
+|---|---|---|---|
+| final signed dz [m] | −3.194 | −0.399 | **−0.180** |
+| dz RMS (last half) [m] | 2.435 | 0.303 | **0.143** |
+| sink rate, last 20 s [m/s] | −0.1079 | −0.0135 | **−0.0064** |
+| base velocity error RMS [m/s] | 0.1343 | — | **0.0304** |
+| 3D position drift, final [m] | 3.279 | 0.511 | 0.501 |
+| tilt error, tail RMS [deg] | 1.210 | **0.252** | 0.370 |
+| yaw component, tail [deg] | 1.168 | — | 2.225 |
+
+Run 5 is **not calibrated** (`nis_over_dof` 0.022, closed-loop NIS tail 0.20
+against 1.0) — the known `l2_velocity` gap. Good for drift, will not pass G10's
+consistency bands.
+
 The robot itself walks fine in every arm (true base height stays 0.88–0.91 m, 19–20 m travelled) —
 the sinking is entirely in the estimate. **A parallel-runs gotcha:** `run_policy.cycloid_forearm_urdf`
 writes its hands-free URDF to a fixed `tempfile.gettempdir()` path, so N concurrent runs race on

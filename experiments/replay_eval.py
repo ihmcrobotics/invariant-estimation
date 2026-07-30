@@ -255,9 +255,14 @@ def main() -> None:
                   f"height {rows['heuristic'][-1]['height_rms']:.4f} -> "
                   f"{rows['trained'][-1]['height_rms']:.4f}")
 
-    keys = ["vel_rms", "pos_rms", "height_rms", "height_final", "tilt_deg"]
+    # `slope_e_pz` is the branch's acceptance metric (the sink rate) and `ratio`
+    # is the check that the sink is still an integrated velocity bias -- both were
+    # computed and thrown away here until 2026-07-29.
+    keys = ["slope_e_pz", "e_vz", "ratio", "vel_rms", "pos_rms", "height_rms",
+            "height_final", "tilt_deg"]
     units = {"vel_rms": "m/s", "pos_rms": "m", "height_rms": "m",
-             "height_final": "m", "tilt_deg": "deg"}
+             "height_final": "m", "tilt_deg": "deg",
+             "slope_e_pz": "m/s", "e_vz": "m/s", "ratio": "-"}
     print(f"\n{'metric':>14}  {'heuristic':>12}  {'trained':>12}  {'ratio':>8}")
     verdict = {}
     for k in keys:
