@@ -91,6 +91,8 @@ __all__ = [
     "ALEX_IMU_SITES",
     "ALEX_PAIRS",
     "ALEX_FOOT_SITES",
+    "ALEX_CONTACT_SITES",
+    "ALEX_CONTACT_OFFSETS",
     "ALEX_EXTRA_SITES",
     "ALEX_SOLE_OFFSET",
     "ALEX_ANKLE_HEIGHT",
@@ -135,21 +137,53 @@ ALEX_FOOT_SITES: tuple[str, ...] = ("left_sole", "right_sole")
 ALEX_ANKLE_HEIGHT: float = 0.072
 ALEX_SOLE_OFFSET: tuple[float, float, float] = (0.197 / 2.0 - 0.052, 0.0, -ALEX_ANKLE_HEIGHT)
 
+# Toe/heel contact points, on the SAME sole plane, at the fore and aft edges of the
+# Java sole plate: `ACTUAL_FOOT_LENGTH = 0.197` with `FOOT_BACK = 0.052`, so in the
+# `*_FOOT` (ankle-roll) frame the plate spans x from -0.052 (heel) to +0.145 (toe)
+# and `ALEX_SOLE_OFFSET` is its centre. The collision box is more generous
+# (x from -0.085 to +0.175, half-extents 0.13 x 0.07 x 0.0275 at (0.045, 0, -0.05));
+# the PLATE is the right extent to anchor on, not the box.
+#
+# Why two points per foot: a single contact point carries **no information about
+# foot orientation**, so nothing in the filter observes rotation about the vertical
+# except through the base. Two points 0.197 m apart do constrain it -- which is
+# what run 5 gave up when it learned to loosen the anchors (PORT_NOTES, "the cost
+# is rotational, and it is yaw"). This is also CoCo-InEKF's own choice.
+ALEX_HEEL_X: float = -0.052
+ALEX_TOE_X: float = 0.197 - 0.052
+ALEX_CONTACT_SITES: tuple[str, ...] = (
+    "left_heel", "left_toe", "right_heel", "right_toe")
+"""The InEKF's `N` contact points when toe/heel is enabled. Ordered
+foot-major (left heel, left toe, right heel, right toe) so contact `2f + s`
+belongs to foot `f`; `sim.sensors` relies on that to split the load."""
+
+ALEX_CONTACT_OFFSETS: dict[str, tuple[str, tuple[float, float, float]]] = {
+    "left_heel": ("LEFT_FOOT", (ALEX_HEEL_X, 0.0, -ALEX_ANKLE_HEIGHT)),
+    "left_toe": ("LEFT_FOOT", (ALEX_TOE_X, 0.0, -ALEX_ANKLE_HEIGHT)),
+    "right_heel": ("RIGHT_FOOT", (ALEX_HEEL_X, 0.0, -ALEX_ANKLE_HEIGHT)),
+    "right_toe": ("RIGHT_FOOT", (ALEX_TOE_X, 0.0, -ALEX_ANKLE_HEIGHT)),
+}
+
 # extra_sites for `urdf2mjcf`: the InEKF body frame (pelvis root body) and the two foot soles
 # the stance anchors / contacts sit on.
 ALEX_EXTRA_SITES: dict[str, str | tuple[str, tuple[float, float, float]]] = {
     "base_body": "PELVIS_LINK",
     "left_sole": ("LEFT_FOOT", ALEX_SOLE_OFFSET),
     "right_sole": ("RIGHT_FOOT", ALEX_SOLE_OFFSET),
+    # Always emitted, even when the filter is built with N = 2: an unused site
+    # costs one FK row and keeps a single `alex_site_names()` ordering valid for
+    # every build, so a rollout collected under one N stays readable under the
+    # other. Whether they are USED is `contact_sites`.
+    **ALEX_CONTACT_OFFSETS,
 }
 
 
 def alex_site_names() -> tuple[str, ...]:
-    """The full site-name tuple for the Alex `MjxModel` (IMUs, body frame, soles)."""
-    return ALEX_IMU_SITES + ("base_body",) + ALEX_FOOT_SITES
+    """The full site-name tuple for the Alex `MjxModel` (IMUs, body frame, soles, toe/heel)."""
+    return ALEX_IMU_SITES + ("base_body",) + ALEX_FOOT_SITES + ALEX_CONTACT_SITES
 
 
-def build_alex_fused_estimator(spec, **overrides) -> "FusedEstimator":
+def build_alex_fused_estimator(spec, *, toe_heel: bool = False, **overrides) -> "FusedEstimator":
     """Build the fused estimator for real Alex from an `AlexModelSpec`.
 
     `spec` must come from `urdf2mjcf.convert_log_model(log_dir,
@@ -161,6 +195,7 @@ def build_alex_fused_estimator(spec, **overrides) -> "FusedEstimator":
     model = MjxModel.from_xml_string(spec.mjcf, site_names=alex_site_names(), pairs=ALEX_PAIRS)
     return build_fused_estimator(
         model, imu_sites=ALEX_IMU_SITES, pairs=ALEX_PAIRS, foot_sites=ALEX_FOOT_SITES,
+        contact_sites=ALEX_CONTACT_SITES if toe_heel else None,
         base_imu=0, base_body_site="base_body", effort_limits=spec.effort_limits,
         **overrides,
     )
@@ -360,7 +395,8 @@ class FusedEstimator:
     base_imu: int                 # IMU ordinal of the base IMU (star centre)
     base_site: int                # site ordinal of the base IMU (joint-KF anchor frame + gyro source)
     base_body_site: int           # site ordinal of the InEKF body frame B (root/pelvis body origin)
-    foot_site_ords: np.ndarray    # (K,) site ordinals of the sole sites
+    foot_site_ords: np.ndarray    # (K,) site ordinals of the joint-KF stance anchors
+    contact_site_ords: np.ndarray  # (N,) site ordinals of the InEKF contact points
     pair_sites: np.ndarray        # (n_pairs, 2) site ordinals per IMU pair
     R_mount: Array                # (3,3) ᴮR_S: base-IMU measurement frame -> InEKF body frame
     contact_meas_var: float       # isotropic floor on InEKF contact-position noise
@@ -387,7 +423,13 @@ class FusedEstimator:
 
     @property
     def n_contacts(self) -> int:
+        """`N` -- InEKF contact points, which is NOT `n_anchors` when toe/heel is on."""
         return self.ekf.N
+
+    @property
+    def n_anchors(self) -> int:
+        """`K` -- joint-KF stance anchors, one per foot."""
+        return len(self.foot_site_ords)
 
     @property
     def n_aux(self) -> int:
@@ -401,6 +443,7 @@ def build_fused_estimator(
     pairs: Sequence[tuple[int, int]],
     foot_sites: Sequence[str],
     *,
+    contact_sites: Sequence[str] | None = None,
     base_imu: int = 0,
     base_body_site: str | None = None,
     R_mount: Array | None = None,
@@ -414,6 +457,19 @@ def build_fused_estimator(
     contact_fk_unfiltered: bool = False,
 ) -> FusedEstimator:
     """Assemble the joint KF + InEKF into one fused estimator (plain Python, I7).
+
+    `contact_sites` decouples the InEKF's `N` contacts from the joint KF's `K`
+    stance anchors. `None` (the default) means they are the same sites, which is
+    the historical behaviour. Pass a longer list -- e.g. toe+heel per foot -- to
+    give the InEKF more contact points than the joint KF has anchors.
+
+    **They are deliberately NOT coupled.** Two anchors on one rigid foot are
+    kinematically locked, so stacking them as independent rows in the joint KF's
+    anchor block would double-count the bias information they carry, with no
+    cross-covariance modelling the lock -- the same class of error as the
+    block-diagonal `R_g` trap (I6). The InEKF has no such problem: its contacts are
+    independent *states*, not stacked measurement rows, and two points per foot is
+    what gives it any observability of foot orientation at all.
 
     `imu_sites`, `pairs`, `foot_sites` follow the same conventions as
     `build_joint_kf` / `MjxModel`: `imu_sites` fixes each IMU's ordinal; `pairs`
@@ -449,6 +505,7 @@ def build_fused_estimator(
     site_names = model.site_names
     imu_sites = tuple(imu_sites)
     foot_sites = tuple(foot_sites)
+    contact_sites = foot_sites if contact_sites is None else tuple(contact_sites)
 
     tree = kinematic_tree_from_mj(model.mj_model, effort_limits=effort_limits)
     build = build_joint_kf(
@@ -457,15 +514,18 @@ def build_fused_estimator(
     )
     params = default_params(dt=dt, imu_bias_process_var=imu_bias_process_var)
 
-    K = len(foot_sites)
+    # K = joint-KF stance anchors, N = InEKF contact points. Equal unless
+    # `contact_sites` says otherwise.
+    K, N = len(foot_sites), len(contact_sites)
     ekf = inekf_mod.create(
-        number_of_contacts=K, gyro_var=gyro_var, accel_var=accel_var,
+        number_of_contacts=N, gyro_var=gyro_var, accel_var=accel_var,
         contact_var=contact_var, dt=dt,
     )
 
     base_site = site_names.index(imu_sites[base_imu])
     base_body_ord = base_site if base_body_site is None else site_names.index(base_body_site)
     foot_site_ords = np.array([site_names.index(s) for s in foot_sites], dtype=int)
+    contact_site_ords = np.array([site_names.index(s) for s in contact_sites], dtype=int)
 
     # R_mount = ᴮR_S at qpos0. When base_body_site is the IMU site (synthetic case)
     # this is exactly I. When it is the pelvis body (real Alex) it carries the
@@ -490,8 +550,9 @@ def build_fused_estimator(
     # -- off-path anchor joints for the contact FK (Alex: the four ankles) ----
     aux_qpos, aux_var = _aux_joint_tables(model, build) if contact_fk_unfiltered else (
         np.zeros(0, dtype=int), np.zeros(0))
+    # The contact FK feeds the InEKF, so it runs on `contact_site_ords`.
     kinematics = _make_contact_kinematics(
-        model, base_body_ord, foot_site_ords,
+        model, base_body_ord, contact_site_ords,
         aux_qpos=aux_qpos, n_filtered=build.n_joints,
     )
     inekf_step = inf.make_step(ekf, kinematics)
@@ -507,6 +568,7 @@ def build_fused_estimator(
         base_site=base_site,
         base_body_site=base_body_ord,
         foot_site_ords=foot_site_ords,
+        contact_site_ords=contact_site_ords,
         pair_sites=np.asarray(model.pair_sites, dtype=int),
         R_mount=R_mount,
         contact_meas_var=float(contact_meas_var),

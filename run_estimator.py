@@ -287,7 +287,7 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
                         noise=None, est_dt=None, contact_meas_var=0.0,
                         stance_chol=1.0e-4, swing_chol=1.0e1,
                         contact_fk_unfiltered=True, est_every=1, verbose=True,
-                        contactnet=None, contactnet_norm=None):
+                        contactnet=None, contactnet_norm=None, toe_heel=False):
     t0 = time.time()
     policy = rp.load_policy(policy_name)
     m = rp.build_sim_model(policy, with_visuals=with_visuals, with_imu_sensors=True)
@@ -297,7 +297,7 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
     dt = est_dt or rp.DT * est_every
     fused = me.build_alex_fused_estimator_from_urdf(
         urdf, dt=dt, contact_meas_var=contact_meas_var,
-        contact_fk_unfiltered=contact_fk_unfiltered)
+        contact_fk_unfiltered=contact_fk_unfiltered, toe_heel=toe_heel)
     reader = SimSensorReader(m, fused, foot_geoms=rp.FOOT_GEOMS, dt=dt, noise=noise,
                              stance_chol=stance_chol, swing_chol=swing_chol)
     if verbose:
@@ -410,6 +410,12 @@ if __name__ == "__main__":
     ap.add_argument("--contact-meas-var", type=float, default=0.0,
                     help="isotropic floor on the InEKF contact measurement noise "
                          "(flight uses 1e-4; the port default is 0)")
+    # Two InEKF contact points per foot (heel + toe) instead of one at the sole
+    # centre. The joint KF keeps its two anchors either way -- see
+    # `build_fused_estimator(contact_sites=...)`. A single contact point carries no
+    # information about foot ORIENTATION, which is why run 5's yaw regressed.
+    ap.add_argument("--toe-heel", action="store_true",
+                    help="InEKF gets 4 contact points (heel+toe per foot), K stays 2")
     ap.add_argument("--contact-fk", choices=("measured", "pinned"), default="measured",
                     help="whether the InEKF's contact FK uses the MEASURED off-path joints "
                          "(the ankles) or pins them at qpos0 as the library default does")
@@ -451,7 +457,8 @@ if __name__ == "__main__":
         contact_meas_var=args.contact_meas_var,
         stance_chol=args.stance_chol, swing_chol=args.swing_chol,
         contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every,
-        contactnet=args.contactnet, contactnet_norm=args.contactnet_norm)
+        contactnet=args.contactnet, contactnet_norm=args.contactnet_norm,
+        toe_heel=args.toe_heel)
     if headless:
         run_headless(loop, args.ticks, cmd=(args.vx, args.vy, args.yaw), out=args.out,
                      video=args.video, video_fps=args.video_fps, video_size=video_size)

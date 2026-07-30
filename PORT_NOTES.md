@@ -3839,3 +3839,115 @@ predicted signature of learning the right lever: `NIS` tracks the overall
 magnitude of `S`, which is the lever that trades velocity for sink, and the
 network improved velocity through timing and anisotropy instead — exactly the
 split the two-lever sweep said `l2_velocity` would enforce.
+
+---
+
+## Toe/heel contact points — two per foot (2026-07-29)
+
+CoCo-InEKF anchors **two** contact points per foot; this port anchored one, at the
+sole centre. `build_fused_estimator(contact_sites=...)` /
+`build_alex_fused_estimator(toe_heel=True)` / `run_estimator.py --toe-heel` now
+give the InEKF four (`ALEX_CONTACT_SITES`), default off.
+
+### Why, and it is not fidelity
+
+A single contact point carries **no information about foot orientation**. Two
+points 0.197 m apart do — which is exactly what run 5 gave up when it learned to
+loosen the anchors (see "the cost is rotational, and it is yaw" above). So this
+was tested as a candidate *fix for that specific regression*, not as a general
+refinement.
+
+### `K` and `N` are decoupled, deliberately
+
+`foot_sites` used to set both the joint KF's `K` stance anchors and the InEKF's
+`N` contacts. They are now separate: **the joint KF keeps one anchor per foot.**
+Two anchors on one *rigid* foot are kinematically locked, so stacking them as
+independent rows in the anchor block would double-count the bias information they
+carry with nothing modelling the lock — the same class of error as the
+block-diagonal `R_g` trap (I6). The InEKF has no such problem: its contacts are
+independent *states*, not stacked measurement rows.
+
+`FusedEstimator` gains `contact_site_ords` and an `n_anchors` property; `n_contacts`
+is now `N`, which is no longer the same number.
+
+### Geometry — the Java sole plate, not the collision box
+
+`ACTUAL_FOOT_LENGTH = 0.197`, `FOOT_BACK = 0.052`, so in the `*_FOOT` frame the
+plate spans x ∈ [−0.052, +0.145] and `ALEX_SOLE_OFFSET` is its midpoint. Heel and
+toe go at the ends, both on the sole plane z = −0.072. The **collision box** is
+more generous (x ∈ [−0.085, +0.175], half-extents 0.13 × 0.07 × 0.0275 at
+(0.045, 0, −0.05)); anchoring at *its* corners would place the contact points 3.3 cm
+beyond the physical plate. The sole sites remain the exact midpoints of their
+toe/heel pairs, so the two builds are directly comparable.
+
+The toe/heel sites are emitted in **every** build, used or not, so one
+`alex_site_names()` ordering is valid for both and an `N = 2` rollout stays
+readable against an `N = 4` model. Verified that adding the unused sites perturbs
+nothing the estimator consumes: `site_poses`, `M`, `J_rel`, `J_ang` and `site_rot`
+all agree to **exactly 0.0**.
+
+### The load split needs no change to the collision geometry
+
+There is one collision geom per foot, so per-point normal force is recovered from
+contact *positions*: MuJoCo reports each contact's world position, and a contact is
+attributed toe/heel by the sign of its x in the foot frame relative to the sole
+centre (`sensors.point_loads`). The `(foot, fore) → slot` map is resolved at build
+time **from the estimator's own contact-site names**, so the sim cannot disagree
+with the filter about which slot is which foot's toe.
+
+Measured over 15 s of walking, it tracks the roll of the foot correctly — heel-only
+at spawn, flat mid-stance, and **toe-only during push-off** (`[1.0, 0.99, 0.0, 0.66]`
+= left flat, right heel lifted). That last state is precisely what a single centre
+point cannot represent.
+
+| | load mean | trusted |
+|---|---|---|
+| left heel / toe | 0.453 / 0.491 | 47.5% / 60.3% |
+| right heel / toe | 0.447 / 0.507 | 47.9% / 60.4% |
+| joint-KF anchors (per foot) | — | 63.3% |
+
+Toe is trusted more than heel, as toe-off implies. **A known cost:** splitting the
+load means each point sees ~half of it, so each clears the `enter = 0.35` Schmitt
+threshold less often than a whole foot does — per-point trust averages 54% against
+the per-foot 63.3%, i.e. slightly fewer live anchors. The per-point normaliser is
+still `0.5·m·g` (a whole foot's share); dividing by `0.25·m·g` instead would
+restore the margin and is the obvious knob if anchor availability ever binds.
+
+### Measured: it fixes the yaw regression, with no training at all
+
+Closed loop, 30 s at `vx = 0.6`, `--imu-noise`, seed 0. **The toe/heel column has
+no ContactNet attached** — this is the analytic filter.
+
+| | N=2 analytic | **N=4 toe/heel** | N=2 + run 5 |
+|---|---|---|---|
+| final signed dz [m] | −3.194 | −0.567 | **−0.180** |
+| dz RMS last half [m] | 2.435 | 0.432 | **0.143** |
+| tilt err rms / tail [deg] | 1.276 / 1.210 | **0.430 / 0.240** | 0.546 / 0.370 |
+| attitude err rms / tail [deg] | 1.552 / 1.682 | **0.806 / 0.929** | 1.756 / 2.255 |
+| yaw component rms / tail [deg] | 0.884 / 1.168 | **0.682 / 0.897** | 1.669 / 2.225 |
+| base vel err rms [m/s] | 0.1343 | 0.0347 | **0.0304** |
+| base pos err rms [m] | 1.885 | 0.338 | **0.239** |
+| base gyro err rms | 0.0116 | **0.0094** | 0.0101 |
+
+Two contact points per foot, on the **heuristic** filter, cut the sink 5.6x, the
+tilt error 5.0x in the tail, and the velocity error 3.9x — and they take yaw
+*below* the baseline (1.168 → 0.897 tail) where run 5 had pushed it 1.9x above.
+The hypothesis holds: the yaw cost was missing orientation observability, and two
+points restore it.
+
+**The two changes are complementary, not competing.** Run 5 owns the vertical axis
+(dz −0.180 against −0.567); toe/heel owns everything rotational (yaw tail 0.897
+against 2.225). Nothing yet combines them: a learned `Σ_C` over four contact
+points is the obvious next run, and it needs a **full re-collection** — a rollout
+stores `(T, N, 3, 3)` arrays, so every recorded rollout, the feature cache, the
+norm constants, `P0` and the checkpoint are all `N = 2` artifacts.
+
+### The closed loop is not bit-reproducible, so do not A/B it that way
+
+Two **identical** `run_estimator.py` invocations differ by `1.4e-6` in final `dz`
+(−3.1936414 vs −3.1936428). The policy↔estimator↔plant loop is chaotic and GPU
+kernel selection is not fixed across processes, so rounding at 1e-16 amplifies to
+1e-6 over 30 s. An earlier attempt to prove the `N = 2` path unchanged by
+comparing two runs "bit-for-bit" therefore measured nothing — the real evidence is
+the exact-0.0 agreement of every estimator input above. Effects below ~1e-5 in this
+harness are not measurable; the toe/heel results are 1.3–5.6x, far above it.

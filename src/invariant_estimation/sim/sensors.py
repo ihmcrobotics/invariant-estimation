@@ -165,6 +165,17 @@ class ContactTrust:
         return self.trusted.copy()
 
 
+def _contact_site_names(fused) -> tuple[str, ...]:
+    """The estimator's InEKF contact-site names, in slot order.
+
+    Read off `fused.model.site_names` via `contact_site_ords` rather than
+    hardcoded, so the sim's toe/heel split is driven by whatever the filter was
+    actually built with.
+    """
+    names = tuple(fused.model.site_names)
+    return tuple(names[int(o)] for o in fused.contact_site_ords)
+
+
 # ---------------------------------------------------------------------------
 # The reader
 # ---------------------------------------------------------------------------
@@ -188,6 +199,7 @@ class SimSensorReader:
         noise: IMUNoise | None = None,
         stance_chol: float = 1.0e-4,
         swing_chol: float = 1.0e1,
+        sole_centre_x: float = 0.197 / 2.0 - 0.052,
     ):
         self.m = m
         self.fused = fused
@@ -237,6 +249,48 @@ class SimSensorReader:
         self.weight = float(m.body_mass.sum()) * 9.81
         self.trust = ContactTrust(n_feet=len(self.foot_gids), dt=dt)
 
+        # -- multi-point contacts (toe/heel), if the estimator was built for them --
+        # `N > K` means the InEKF has more contact points than there are feet, and
+        # `contact_chol` must be sized N. The split is resolved HERE, from the
+        # estimator's own site names, so the sim cannot disagree with the filter
+        # about which slot is which foot's toe.
+        self.n_points = int(fused.n_contacts)
+        self.point_trust = None
+        self.gid_to_foot = {int(g): k for k, g in enumerate(self.foot_gids)}
+        self.foot_bids = np.array(
+            [int(m.geom_bodyid[g]) for g in self.foot_gids], dtype=int)
+        self.sole_centre_x = float(sole_centre_x)
+        self.point_slot: dict[tuple[int, bool], int] = {}
+        if self.n_points != len(self.foot_gids):
+            names = _contact_site_names(fused)
+            if len(names) != self.n_points:
+                raise ValueError(
+                    f"estimator has N={self.n_points} contacts but its site table "
+                    f"resolved {len(names)} names ({names}); cannot split the load")
+            for j, nm in enumerate(names):
+                low = nm.lower()
+                fore = "toe" in low
+                if not fore and "heel" not in low:
+                    raise ValueError(
+                        f"contact site {nm!r} is neither a 'toe' nor a 'heel'; "
+                        f"`point_loads` splits the per-foot normal force fore/aft "
+                        f"and has no rule for it")
+                # Foot by geom-name overlap: 'left_toe' -> the geom whose name
+                # contains 'LEFT'. Explicit rather than positional, so reordering
+                # either table cannot silently swap the feet.
+                side = "LEFT" if low.startswith("left") else "RIGHT"
+                cand = [k for k, g in enumerate(foot_geoms) if side in g.upper()]
+                if len(cand) != 1:
+                    raise ValueError(
+                        f"contact site {nm!r} matched {len(cand)} foot geoms for "
+                        f"side {side!r}: {foot_geoms}")
+                self.point_slot[(cand[0], fore)] = j
+            if len(self.point_slot) != self.n_points:
+                raise ValueError(
+                    f"the (foot, toe/heel) split is not one-to-one: "
+                    f"{self.n_points} sites collapsed to {len(self.point_slot)} slots")
+            self.point_trust = ContactTrust(n_feet=self.n_points, dt=dt)
+
         # -- ground truth, for scoring ---------------------------------------
         self.base_bid = sid("PELVIS_LINK", mujoco.mjtObj.mjOBJ_BODY)
         self.base_site = sid("base_body", mujoco.mjtObj.mjOBJ_SITE)
@@ -253,6 +307,49 @@ class SimSensorReader:
                 if c.geom1 == gid or c.geom2 == gid:
                     mujoco.mj_contactForce(self.m, d, i, frc)
                     f[k] += abs(frc[0])
+        return np.clip(f / (0.5 * self.weight), 0.0, 1.0)
+
+    def point_loads(self, d: mujoco.MjData) -> np.ndarray:
+        r"""Normalised load per CONTACT POINT, ``(N,)``, heel/toe split fore-aft.
+
+        Only meaningful when the estimator was built with more contact points than
+        feet (`build_fused_estimator(contact_sites=...)`); `read` falls back to
+        `foot_loads` otherwise.
+
+        The split needs no change to the collision geometry, which is one box per
+        foot. MuJoCo reports each contact's world position, so a contact is
+        attributed to the toe or the heel by the sign of its position **in the foot
+        frame** relative to the sole-plate centre:
+
+            x_local = (ᵂR_F)ᵀ (c.pos − p_F) · x̂        toe if x_local > x_centre
+
+        `abs(frc[0])` is the normal component in the contact frame, the same
+        quantity `foot_loads` sums.
+
+        Normalisation is per point against the same ``0.5·m·g``, so a *fully*
+        loaded toe reads ~1.0 and a flat-footed stance reads ~0.5 at each point.
+        That is a real consequence worth knowing about: in flat stance each point
+        sits nearer the ``enter = 0.35`` threshold than a whole foot does, so the
+        Schmitt trigger has less margin and may chatter where the per-foot signal
+        would not. Watch `trusted` if a run looks like it is losing anchors.
+        """
+        f = np.zeros(self.n_points)
+        frc = np.zeros(6)
+        for i in range(d.ncon):
+            c = d.contact[i]
+            k = self.gid_to_foot.get(int(c.geom1), self.gid_to_foot.get(int(c.geom2)))
+            if k is None:
+                continue
+            bid = self.foot_bids[k]
+            R = d.xmat[bid].reshape(3, 3)
+            x_local = float((R.T @ (np.asarray(c.pos) - d.xpos[bid]))[0])
+            # `(foot, fore) -> contact slot` was resolved at build time from the
+            # site names, so the hot loop is a dict lookup and not a name match.
+            j = self.point_slot.get((k, x_local > self.sole_centre_x))
+            if j is None:
+                continue
+            mujoco.mj_contactForce(self.m, d, i, frc)
+            f[j] += abs(frc[0])
         return np.clip(f / (0.5 * self.weight), 0.0, 1.0)
 
     def read(self, d: mujoco.MjData):
@@ -281,18 +378,26 @@ class SimSensorReader:
             q_u = self.noise.corrupt_encoders(q_u)
             tau = self.noise.corrupt_torques(tau)
 
+        # `contact` feeds the joint KF's K stance anchors (one per foot);
+        # `contact_chol` feeds the InEKF's N contact points. They are the same
+        # thing only when N == K -- see `build_fused_estimator(contact_sites=...)`.
         trusted = self.trust.update(self.foot_loads(d))
+        if self.point_trust is None:
+            point_trusted = trusted
+        else:
+            point_trusted = self.point_trust.update(self.point_loads(d))
         # The InEKF has NO contact mask: contact condition rides ENTIRELY in
         # Sigma_C (`inEKF/filter.py`, the DECISION note). A swing foot therefore
         # needs a LARGE factor here, or the filter keeps believing it is planted.
-        chol = np.where(trusted[:, None, None] > 0.0, self.stance_chol, self.swing_chol)
+        chol = np.where(point_trusted[:, None, None] > 0.0,
+                        self.stance_chol, self.swing_chol)
         return FusedSensors(
             encoders=enc,
             gyros=gyros,
             accel_base=accel,
             qd_unfiltered=qd_u,
             contact=trusted,
-            contact_chol=chol * np.tile(np.eye(3), (len(self.foot_gids), 1, 1)),
+            contact_chol=chol * np.tile(np.eye(3), (len(point_trusted), 1, 1)),
             q_unfiltered=q_u,
             torques=tau,
         )
