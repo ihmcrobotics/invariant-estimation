@@ -136,6 +136,7 @@ from .gravity_update import (
     update_gravity_reference,
 )
 from .propagate import propagate
+from .reseed import LatchState, expand_per_foot, init_latch, reseed_step
 from .state import InEKFState
 
 # ---------------------------------------------------------------------------
@@ -234,6 +235,12 @@ class InEKFInputs(NamedTuple):
         docstring for why the network moved to ``contact_chol``.  A caller may
         still drive it — `experiments/replay_eval.py --socket meas` does, to
         score the old checkpoints — and the update consumes it unchanged.
+    contact_prob : Array, shape (K,), optional
+        Per-foot contact probability, read **only** when the filter was built with
+        touchdown re-seed enabled (`InvariantEKF.reseed`); `expand_per_foot` maps
+        it to the ``N`` contacts. Defaults to ``()`` — an empty pytree node, so on
+        every shipped path it contributes no leaf, costs nothing, and leaves
+        `InEKFInputs` serialising exactly as it did before the field existed.
     """
     omega: Array
     accel: Array
@@ -241,12 +248,18 @@ class InEKFInputs(NamedTuple):
     joint: JointFilterOutput
     contact_chol: Array
     contact_meas_chol: Array
+    contact_prob: Array = ()
 
 
 class InEKFCarry(NamedTuple):
-    """Scan carry: the filter state plus the gravity reference."""
+    """Scan carry: the filter state, the gravity reference, and the re-seed latch.
+
+    `latch` is ``None`` unless the filter was built with re-seed enabled — again an
+    empty pytree node, so a carry built the old way is structurally what it was.
+    """
     state: InEKFState
     gravity_ref: GravityRef
+    latch: "LatchState | None" = None
 
 
 class InEKFOutputs(NamedTuple):
@@ -261,6 +274,8 @@ class InEKFOutputs(NamedTuple):
     gravity_diagnostics: UpdateDiagnostics
     tilt_angle: Array                      # scalar
     quasi_static: Array                    # scalar float mask
+    reseed_fire: Array = ()                # (N,) 1.0 where a contact re-anchored
+    reseed_residual: Array = ()            # (N,3) how far the old anchor had drifted
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +326,7 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
     gravity_params = ekf.gravity_params
 
     def step(carry: InEKFCarry, inputs: InEKFInputs) -> tuple[InEKFCarry, InEKFOutputs]:
-        state, gravity_ref = carry
+        state, gravity_ref = carry.state, carry.gravity_ref
 
         # -- 1. propagate on the bias-corrected IMU (§3) --------------------
         # `contact_chol` is ContactNet's output on the deployment path; `digest`
@@ -334,6 +349,24 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
         # floor is applied: S = H P Hᵀ + N needs only N PSD (H P Hᵀ is already
         # SPD — see `kalman_gain`).
         Nc = reconstruct_cov(inputs.contact_meas_chol)
+
+        # -- 2b. touchdown re-seed (ablation; OFF unless `ekf.reseed` is set) ---
+        # Placed between propagate and the contact update — Java's call site — and
+        # BEFORE `innovation`, so the update this tick sees the re-anchored state.
+        # For a contact that just fired that means a zero residual and a zero
+        # rotation correction (the zero-release property), which is the point: a
+        # re-seed replaces the correction it would otherwise have provoked rather
+        # than adding to it.
+        #
+        # The FK covariance handed to the re-seed is the SAME `Np + Nc` the update
+        # uses. It has to be: the re-seed is placing the anchor with that
+        # measurement, so the anchor's new uncertainty is that measurement's.
+        latch, fire, reseed_residual = carry.latch, (), ()
+        if ekf.reseed is not None:
+            latch, state, fire, reseed_residual = reseed_step(
+                ekf.reseed, latch, state,
+                expand_per_foot(inputs.contact_prob, ekf.N), frames.y, Np + Nc,
+            )
 
         nu = innovation(state, frames.y)
 
@@ -389,8 +422,10 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
             gravity_diagnostics=gravity_diagnostics,
             tilt_angle=meas.tilt_angle,
             quasi_static=gate,
+            reseed_fire=fire,
+            reseed_residual=reseed_residual,
         )
-        return InEKFCarry(state=state, gravity_ref=gravity_ref), outputs
+        return InEKFCarry(state=state, gravity_ref=gravity_ref, latch=latch), outputs
 
     return step
 
@@ -399,9 +434,14 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
 # Trajectory driver
 # ---------------------------------------------------------------------------
 
-def init_carry(state: InEKFState) -> InEKFCarry:
-    """Fresh scan carry: the given state and an unseeded gravity reference."""
-    return InEKFCarry(state=state, gravity_ref=init_gravity_ref())
+def init_carry(state: InEKFState, *, reseed: bool = False) -> InEKFCarry:
+    """Fresh scan carry: the given state and an unseeded gravity reference.
+
+    `reseed=True` adds a disarmed `LatchState` — disarmed so the first touchdown
+    does not re-anchor anchors that `init_state` only just placed from the same FK.
+    """
+    return InEKFCarry(state=state, gravity_ref=init_gravity_ref(),
+                      latch=init_latch(state.N) if reseed else None)
 
 
 def run(

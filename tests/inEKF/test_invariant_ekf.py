@@ -261,12 +261,17 @@ def test_update_publishes_diagnostics():
     assert np.isnan(float(ekf_mod.initial_diagnostics().nis))
 
 
-def test_reseed_is_not_implemented():
-    """`reseedContact` is deliberately absent — deferred, not forgotten.
+def test_reseed_is_implemented_but_off_by_default():
+    """Replaces `test_reseed_is_not_implemented` (deferred 2026-07-21, landed 2026-07-30).
 
-    Guards the decision (Lucas, 2026-07-21: no measurable difference on the real
-    robot) against being silently half-implemented later. If reseed lands, this
-    test should be deleted along with the TODO in `ekf.py`.
+    The old test guarded the *absence* of the re-seed. What needs guarding now is its
+    **default-off**-ness: every result on record — runs 1-6, the replay tables, the closed-loop
+    numbers — was produced by a filter without it, and they stay comparable only while
+    `create()` leaves it out of the graph unless asked. The behaviour itself is covered by
+    `tests/inEKF/test_reseed.py`.
     """
-    assert not hasattr(ekf_mod, "reseed_contact")
-    assert "TODO(reseed)" in ekf_mod.__doc__
+    from invariant_estimation.inEKF import reseed as reseed_mod
+
+    assert ekf_mod.create(2).reseed is None, "the re-seed switched itself on"
+    enabled = ekf_mod.create(2, reseed=reseed_mod.default_reseed_params())
+    assert enabled.reseed == (0.5, 0.1, 100), "the Java constants moved"

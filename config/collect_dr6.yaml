@@ -1,0 +1,80 @@
+# config/collect_dr6.yaml -- `collect_dr5.yaml` with mu STRATIFIED onto a deterministic grid.
+#
+# One change from dr5, and it is the item both the 2026-07-28 report and `collect_dr5.yaml`'s own
+# header call "the cheapest untested improvement":
+#
+#   friction is drawn i.i.d. from a stream keyed on the seed alone, and `friction_range_by_terrain`
+#   only changes the RANGE, so the same underlying uniform is reused across terrains. 12 rollouts
+#   realise ~6 distinct mu, and on both dr4 and dr5 none of them is below 0.47. The slip band is at
+#   the bottom of the range and was never sampled.
+#
+# Measured slip fractions (8 s walks, pushes + command resampling on): 2.9% at mu = 1.0, 8.5% at
+# 0.40, 26-44% at 0.20. Measured survivability: `hard_stepping` FALLS at 0.20; `stepping_stones`
+# walks at 0.30; `flat` and `waves` walk at 0.20. The grids below put the low end only where the
+# robot survives it and floor the others -- a fall costs a whole rollout.
+#
+# Expected mu histogram over the 12 rollouts: 0.20 x2, 0.30 x3, 0.35 x1, 0.40 x1, 0.45 x2,
+# 0.55 x1, 0.60 x1, 0.80 x1 -- 8 distinct values, 6 of the 12 rollouts in the 0.20-0.35 band that
+# dr4/dr5 never reached at all.
+#
+# The command distribution, pushes and slip recording are IDENTICAL to dr5, and the uniform
+# friction draw is still consumed (see `DomainRandomization.friction_value`), so the push and
+# command streams are bit-identical to a dr5 run with the same seed. The two sets therefore differ
+# in friction and nothing else, which is what makes a head-to-head attributable.
+#
+#     uv run python -m invariant_estimation.sim.collect --toe-heel --dr config/collect_dr6.yaml
+
+run:
+  terrains: [flat, waves, stepping_stones, hard_stepping]
+  seeds: [0, 1, 2]
+  seconds: 60.0
+  settle_s: 2.0
+  chunk_ticks: 10000
+  out_dir: data/dr6
+
+dr:
+  # Same seed as dr5 on purpose: with the friction draw overridden by the grid, an identical seed
+  # makes the push and command schedules identical too, so dr6 minus dr5 is exactly the friction
+  # change.
+  seed: 20260730
+
+  friction:
+    enabled: true
+    # Still read for the (now discarded) draw, and used for any terrain without a grid.
+    range: [0.30, 1.20]
+    range_by_terrain:
+      flat:  [0.20, 1.20]
+      waves: [0.20, 1.20]
+    # One mu per seed, per terrain. Seed s of terrain t gets `grid[t][s % len(grid[t])]`.
+    grid_by_terrain:
+      flat:            [0.20, 0.30, 0.45]
+      waves:           [0.20, 0.35, 0.55]
+      stepping_stones: [0.30, 0.40, 0.60]
+      hard_stepping:   [0.30, 0.45, 0.80]
+
+  push:
+    enabled: true
+    force_n: [50.0, 400.0]
+    duration_s: [0.10, 0.20]
+    interval_s: [1.0, 3.0]
+    vertical_scale: 0.0
+
+  command:
+    enabled: true
+    resample_s: [2.0, 4.0]
+    mode: hollow
+    vx_mag:  [0.30, 0.90]
+    vy_mag:  [0.28, 0.50]
+    yaw_mag: [0.60, 1.50]
+    vx_zero_prob:  0.15
+    vy_zero_prob:  0.35
+    yaw_zero_prob: 0.35
+    stand_prob: 0.10
+    base_height: null
+    vx: [-0.5, 0.8]
+    vy: [-0.35, 0.35]
+    yaw_rate: [-0.8, 0.8]
+
+  slip:
+    record: true
+    normal_force_min_n: 5.0

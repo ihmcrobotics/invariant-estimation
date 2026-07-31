@@ -175,6 +175,25 @@ class DomainRandomization:
 
     friction: bool = False
     friction_range: tuple[float, float] = (0.3, 1.2)
+    friction_grid: tuple = ()
+    friction_grid_by_terrain: dict = dataclasses.field(default_factory=dict)
+    r"""Deterministic mu STRATIFICATION: rollout `seed` of `terrain` gets `grid[seed % len(grid)]`.
+
+    **Why this exists, measured.** `friction_range` draws mu i.i.d. per rollout from a stream keyed
+    on the seed alone, and `friction_for` only changes the *range* per terrain -- so the same
+    underlying uniform is reused and 12 rollouts realise only ~**6 distinct mu**, none below 0.47 on
+    `data/dr4` or `data/dr5`. The slip band is at the bottom of the range and was never reached:
+    slip fraction goes 2.9% at mu=1.0 -> 8.5% at 0.40 -> 26-44% at 0.20. A dataset meant to teach a
+    network about slip that contains almost none is the single cheapest thing to fix, and it is a
+    sampling defect rather than a range defect.
+
+    A grid also lets the low end be spent where the robot can survive it: measured over 8 s walks
+    with pushes and command resampling on, `hard_stepping` FALLS at 0.20 while `flat` and `waves`
+    walk at 0.20. Per-terrain grids put 0.20 on the terrains that tolerate it and floor the others.
+
+    The uniform draw is still consumed when a grid is active, so the push and command streams are
+    bit-identical to the same config without one -- only friction differs.
+    """
     friction_range_by_terrain: dict = dataclasses.field(default_factory=dict)
     """Sliding friction written to `m.geom_friction[:, 0]` (all geoms; MuJoCo mixes the two geoms
     of a contact by max, so setting every geom sets the contact). The policy's own training DR was
@@ -209,8 +228,80 @@ class DomainRandomization:
     `command_resample_s`. `base_height_range=None` means the policy's own `height_range`; an
     explicit range is CLIPPED to it (outside the band the policy never saw the command).
     Note the measured tracking deadband (`run_policy.WALK_MIN_*`): |vx|<0.30, |vy|<0.28,
-    |yaw|<0.60 leave the robot standing whatever the command says — the ranges are deliberately
-    wide enough to straddle it rather than snapped past it."""
+    |yaw|<0.60 leave the robot standing whatever the command says — the `uniform` ranges are
+    deliberately wide enough to straddle it rather than snapped past it. See `command_mode`."""
+
+    command_mode: str = "uniform"
+    vx_mag: tuple[float, float] = (0.30, 0.90)
+    vy_mag: tuple[float, float] = (0.28, 0.50)
+    yaw_mag: tuple[float, float] = (0.60, 1.50)
+    vx_zero_prob: float = 0.15
+    vy_zero_prob: float = 0.35
+    yaw_zero_prob: float = 0.35
+    r"""`uniform` (legacy) or `hollow` — how a walking command's three velocity axes are drawn.
+
+    **Why `hollow` exists.** `uniform` straddles the deadband, and measured on `data/dr4` that
+    means most of the lateral and yaw command is a draw the policy ignores: of 744 k walking ticks,
+    62% clear `WALK_MIN_VX` but only **19%** clear `WALK_MIN_VY` and **13%** `WALK_MIN_YAW`. The
+    dataset is therefore forward-dominated however wide the nominal ranges look, which matters for
+    the `l2_velocity` objective specifically:
+
+    .. math::
+        \|\hat R^\top \hat v - R^\top v\| \;\approx\; \|\delta\phi \times b\|,
+        \qquad b = R^\top v
+
+    The cross product annihilates the component of :math:`\delta\phi` **along the body velocity**,
+    so with :math:`b \approx (0.4, 0, 0)` the loss is blind to roll error and weights pitch/yaw by
+    only 0.4 m/s. Spanning `b` over the horizontal plane is what puts all three rotational axes in
+    the gradient.
+
+    **What `hollow` does.** Each axis is *either exactly zero* (with probability `*_zero_prob`) *or*
+    a sign-balanced magnitude drawn from `*_mag`, whose lower end is the axis's deadband. So no draw
+    lands in the dead zone: a command is either honestly zero or one the policy tracks. The upper
+    ends are the policy's own trained band (`AlexCommandsCfg`: vx +-0.9, vy +-0.5, yaw +-1.5), so
+    nothing here extrapolates — `dr_envelope` measured no falls out to vy +-1.0 / yaw +-1.8, but
+    that headroom is deliberately left unspent.
+
+    `uniform` reproduces every pre-`hollow` rollout bit-for-bit, RNG draw order included."""
+
+    slope_friction: bool = False
+    slope_deg: float = 10.0
+    slope_mu_range: tuple[float, float] = (0.15, 0.40)
+    slope_terrains: tuple = ()
+    r"""Make the **ramps slippery while the flats stay normal**, by overriding sliding friction
+    per CONTACT on tilted surfaces.
+
+    **Why this is not the same lever as `friction`.** `friction` sets one `mu` on every geom, so
+    both feet always stand on the same surface and contact quality is perfectly correlated across
+    feet. `data/dr6` raised slip that way to 19% pooled and the retrain (run 8) did not help. A
+    per-contact `Sigma_C` has nothing to learn from a signal that is identical on both feet at
+    every instant. Tilt-dependent friction instead puts one foot on firm ground and the other on a
+    slope **at the same tick**, which is the contrast the network's output space exists to express
+    and which no global `mu` can produce.
+
+    **Why a slope rule and not a painted map.** The terrain is an hfield, i.e. ONE MuJoCo geom with
+    ONE friction value, so regions cannot be painted. But `terrain.stepping_stones` is a `kron` of
+    flat-topped blocks at random heights, so the "ramps" are exactly the steep triangles MuJoCo
+    generates between adjacent stones — and those are precisely the contacts whose surface normal
+    is tilted. Measured from the rasterisation (hfield cell `HSCALE` = 0.1 m):
+
+    ==================  ==================  =========================
+    terrain             peak surface slope  at `slope_deg = 10`
+    ==================  ==================  =========================
+    flat                0 deg               never slippery
+    waves               ~4.5 deg            never slippery
+    stepping_stones     ~16.7 deg (hi 0.03) stone EDGES slippery
+    hard_stepping       ~35 deg   (hi 0.07) stone EDGES slippery
+    ==================  ==================  =========================
+
+    So `flat` and `waves` are untouched by construction and the two stone terrains gain a
+    within-rollout, within-gait friction contrast. `slope_mu_range` is drawn per rollout.
+
+    Implemented by splitting `mj_step` into `mj_step1` / `mj_step2` and rewriting
+    `d.contact[i].friction` in between — friction cannot be set before collision because the
+    contact normal is not known until then. `integrator="implicitfast"` supports the split
+    (RK4 would not). With `slope_friction=False` the plain `mj_step` call is used and the
+    trajectory is bit-identical to every pre-existing rollout."""
 
     slip: bool = True
     slip_normal_force_min_n: float = 5.0
@@ -228,13 +319,20 @@ class DomainRandomization:
             out["seed"] = int(d.pop("seed"))
         groups = {
             "friction": {"enabled": "friction", "range": "friction_range",
-                         "range_by_terrain": "friction_range_by_terrain"},
+                         "range_by_terrain": "friction_range_by_terrain",
+                         "grid": "friction_grid", "grid_by_terrain": "friction_grid_by_terrain"},
             "push": {"enabled": "push", "force_n": "push_force_n",
                      "duration_s": "push_duration_s", "interval_s": "push_interval_s",
                      "vertical_scale": "push_vertical_scale"},
             "command": {"enabled": "command", "resample_s": "command_resample_s",
                         "vx": "vx_range", "vy": "vy_range", "yaw_rate": "yaw_rate_range",
-                        "base_height": "base_height_range", "stand_prob": "stand_prob"},
+                        "base_height": "base_height_range", "stand_prob": "stand_prob",
+                        "mode": "command_mode",
+                        "vx_mag": "vx_mag", "vy_mag": "vy_mag", "yaw_mag": "yaw_mag",
+                        "vx_zero_prob": "vx_zero_prob", "vy_zero_prob": "vy_zero_prob",
+                        "yaw_zero_prob": "yaw_zero_prob"},
+            "slope_friction": {"enabled": "slope_friction", "slope_deg": "slope_deg",
+                               "mu_range": "slope_mu_range", "terrains": "slope_terrains"},
             "slip": {"record": "slip", "normal_force_min_n": "slip_normal_force_min_n"},
         }
         for g, keys in groups.items():
@@ -243,15 +341,34 @@ class DomainRandomization:
                 if k not in keys:
                     raise KeyError(f"collect_dr: unknown key '{g}.{k}'; have {sorted(keys)}")
                 fld = keys[k]
-                if fld == "friction_range_by_terrain":
+                if fld in ("friction_range_by_terrain", "friction_grid_by_terrain"):
                     bad = [t for t in (v or {}) if t not in tr.TERRAINS]
                     if bad:
-                        raise KeyError(f"collect_dr: friction.range_by_terrain names unknown "
+                        raise KeyError(f"collect_dr: friction.{k} names unknown "
                                        f"terrain(s) {bad}; have {list(tr.TERRAINS)}")
-                    out[fld] = {str(t): pair(r) for t, r in (v or {}).items()}
-                elif fld in ("friction", "push", "command", "slip"):
+                    # A range is exactly two numbers; a grid is a list of any length, one
+                    # mu per seed. Sharing the `pair` coercion would silently truncate a
+                    # three-value grid to its first two.
+                    conv = pair if fld.endswith("range_by_terrain") else (
+                        lambda r: tuple(float(x) for x in r))
+                    out[fld] = {str(t): conv(r) for t, r in (v or {}).items()}
+                elif fld == "friction_grid":
+                    out[fld] = tuple(float(x) for x in (v or ()))
+                elif fld in ("friction", "push", "command", "slip", "slope_friction"):
                     out[fld] = bool(v)
-                elif fld in ("push_vertical_scale", "stand_prob", "slip_normal_force_min_n"):
+                elif fld == "slope_terrains":
+                    bad = [t for t in (v or []) if t not in tr.TERRAINS]
+                    if bad:
+                        raise KeyError(f"collect_dr: slope_friction.terrains names unknown "
+                                       f"terrain(s) {bad}; have {list(tr.TERRAINS)}")
+                    out[fld] = tuple(str(t) for t in (v or []))
+                elif fld == "command_mode":
+                    if str(v) not in ("uniform", "hollow"):
+                        raise ValueError(f"collect_dr: command.mode must be 'uniform' or "
+                                         f"'hollow', got {v!r}")
+                    out[fld] = str(v)
+                elif fld in ("push_vertical_scale", "stand_prob", "slip_normal_force_min_n",
+                             "vx_zero_prob", "vy_zero_prob", "yaw_zero_prob", "slope_deg"):
                     out[fld] = float(v)
                 else:
                     out[fld] = pair(v)
@@ -270,6 +387,20 @@ class DomainRandomization:
         """The sampling range for `terrain` — the per-terrain override if it has one."""
         return tuple(self.friction_range_by_terrain.get(terrain, self.friction_range))
 
+    def friction_grid_for(self, terrain: str) -> tuple:
+        """The mu grid for `terrain`, or the global one, or `()` for "sample instead"."""
+        return tuple(self.friction_grid_by_terrain.get(terrain, self.friction_grid))
+
+    def friction_value(self, terrain: str, seed: int, rng) -> float:
+        """The mu this rollout actually gets — grid if there is one, else the draw.
+
+        The draw is consumed either way, so turning a grid on changes friction and
+        nothing else about the rollout (see `friction_grid`).
+        """
+        sampled = float(rng.uniform(*self.friction_for(terrain)))
+        grid = self.friction_grid_for(terrain)
+        return float(grid[int(seed) % len(grid)]) if grid else sampled
+
     def rng(self, seed: int) -> np.random.Generator:
         return np.random.default_rng(int(self.seed) + 7919 * int(seed))
 
@@ -277,6 +408,8 @@ class DomainRandomization:
         """Fastest horizontal command this config can issue — for the on-field pre-flight."""
         if not self.command:
             return abs(vx)
+        if self.command_mode == "hollow":
+            return float(np.hypot(self.vx_mag[1], self.vy_mag[1]))
         return float(np.hypot(max(abs(v) for v in self.vx_range),
                               max(abs(v) for v in self.vy_range)))
 
@@ -341,11 +474,29 @@ def _command_schedule(dr: DomainRandomization, rng: np.random.Generator, *,
         h = float(rng.uniform(lo, hi))
         if float(rng.random()) < dr.stand_prob:
             out[k] = [0.0, 0.0, 0.0, 1.0, h]
+        elif dr.command_mode == "hollow":
+            out[k] = [_hollow(rng, dr.vx_zero_prob, dr.vx_mag),
+                      _hollow(rng, dr.vy_zero_prob, dr.vy_mag),
+                      _hollow(rng, dr.yaw_zero_prob, dr.yaw_mag), 0.0, h]
         else:
             out[k] = [float(rng.uniform(*dr.vx_range)), float(rng.uniform(*dr.vy_range)),
                       float(rng.uniform(*dr.yaw_rate_range)), 0.0, h]
         k += max(1, int(round(float(rng.uniform(*dr.command_resample_s)) / control_dt)))
     return out
+
+
+def _hollow(rng: np.random.Generator, zero_prob: float, mag: tuple[float, float]) -> float:
+    """Exactly `0.0` with probability `zero_prob`, else `+-U(*mag)` with a balanced sign.
+
+    Exactly zero, not "small": a command of 0.1 m/s and a command of 0.0 produce the *same*
+    standing robot (the policy's deadband), but only the second is honest about it. Three draws
+    per axis — zero test, magnitude, sign — in that fixed order, so a change to one axis's
+    parameters does not shift another axis's stream.
+    """
+    if float(rng.random()) < zero_prob:
+        return 0.0
+    m = float(rng.uniform(*mag))
+    return m if rng.random() < 0.5 else -m
 
 
 def slip_fraction(slip_sat: np.ndarray, contact_fn: np.ndarray, *,
@@ -436,7 +587,8 @@ class _RecordingLoop(rp.Loop):
 
     def __init__(self, m, policy, maps, reader: SimSensorReader, *,
                  push: np.ndarray | None = None, slip_fn_min: float | None = None,
-                 record_cmd: bool = False):
+                 record_cmd: bool = False, ramp_mu: float | None = None,
+                 ramp_cos: float = 1.0):
         super().__init__(m, policy, maps)
         self.reader = reader
         self.sensors: list = []
@@ -449,6 +601,11 @@ class _RecordingLoop(rp.Loop):
         self.push = push                    # (T, 3) N on the pelvis, indexed by physics tick
         self.slip_fn_min = slip_fn_min      # None = do not compute friction-cone saturation
         self.record_cmd = bool(record_cmd)
+        # Tilt-dependent friction. `None` keeps the plain `mj_step` path, bit-identical to every
+        # rollout collected before this existed.
+        self.ramp_mu = ramp_mu
+        self.ramp_cos = float(ramp_cos)
+        self.ramp_contacts = 0          # running count, for the metadata sanity check
         self.tick = 0
         self.slip_sat: list = []
         self.contact_fn: list = []
@@ -492,6 +649,29 @@ class _RecordingLoop(rp.Loop):
             fn_tot[slot] += fn
         return sat, fn_tot
 
+    def _make_ramps_slippery(self):
+        """Override sliding friction on contacts whose surface is tilted past the threshold.
+
+        `contact.frame[0:3]` is the contact normal in world, so `|frame[2]|` is its z-component and
+        `frame[2] < cos(slope)` means "this surface is a ramp". Only the two SLIDING coefficients
+        are touched; torsional/rolling are left alone, and the normal-direction behaviour is
+        unchanged. `_read_slip` already reads `contact.friction[0]` -- the value MuJoCo actually
+        enforced -- rather than the sampled one, so the recorded cone saturation stays correct
+        under this override with no change (see its docstring).
+        """
+        d = self.d
+        for i in range(d.ncon):
+            c = d.contact[i]
+            # FEET ONLY. An earlier version overrode every contact and would have altered
+            # self-collisions (arm against torso, knee against knee) whose normals are tilted for
+            # reasons that have nothing to do with terrain — caught by
+            # `test_only_sloped_terrain_produces_ramp_contacts` firing on `flat`.
+            if int(c.geom1) not in self._foot_slot and int(c.geom2) not in self._foot_slot:
+                continue
+            if abs(c.frame[2]) < self.ramp_cos:
+                c.friction[0] = c.friction[1] = self.ramp_mu
+                self.ramp_contacts += 1
+
     def control_tick(self):
         t0 = time.perf_counter()
         self.cmd[4] = self._height()
@@ -505,7 +685,14 @@ class _RecordingLoop(rp.Loop):
                 # Written EVERY tick, so the zero rows of the trace also do the clearing; a push
                 # that is set once and never cleared runs for the rest of the rollout.
                 self.d.xfrc_applied[self.reader.base_bid, :3] = self.push[self.tick]
-            mujoco.mj_step(self.m, self.d)
+            if self.ramp_mu is None:
+                mujoco.mj_step(self.m, self.d)
+            else:
+                # Friction cannot be set before collision -- the contact normal does not exist
+                # until then -- so the step is split and the contacts rewritten in between.
+                mujoco.mj_step1(self.m, self.d)
+                self._make_ramps_slippery()
+                mujoco.mj_step2(self.m, self.d)
             t1 = time.perf_counter()
             self.sim_s += t1 - t0
             # One read per physics tick, in order: `SimSensorReader` owns the contact-trust state
@@ -631,15 +818,19 @@ def collect_rollout(
     # from its own metadata: `meta["friction_mu"]`, `meta["push_schedule"]` and
     # `meta["cmd_schedule"]` are the complete description of what was done to the robot.
     rng = None if dr is None else dr.rng(seed)
-    mu = None
+    mu = ramp_mu = None
     push_trace = cmd_events = None
     push_events: list = []
     if dr is not None:
         if dr.friction:
-            mu = float(rng.uniform(*dr.friction_for(terrain_name)))
+            mu = dr.friction_value(terrain_name, seed, rng)
             # Every geom, not just the floor: MuJoCo mixes a contact pair's sliding friction by
             # `max` unless a priority is set, so overriding one side alone does nothing.
             m.geom_friction[:, 0] = mu
+        if dr.slope_friction and (not dr.slope_terrains or terrain_name in dr.slope_terrains):
+            # Drawn from the SAME stream and immediately after the flat friction, so a rollout is
+            # still replayable from its own metadata.
+            ramp_mu = float(rng.uniform(*dr.slope_mu_range))
         push_events = _push_schedule(dr, rng, settle_s, settle_s + seconds)
         push_trace = _push_trace(push_events, T, rp.DT)
         cmd_events = _command_schedule(
@@ -651,6 +842,8 @@ def collect_rollout(
                              stance_chol=stance_chol, swing_chol=swing_chol)
     loop = _RecordingLoop(m, c.policy, rp.make_maps(m, c.policy), reader,
                           push=push_trace, record_cmd=dr is not None,
+                          ramp_mu=ramp_mu,
+                          ramp_cos=(np.cos(np.radians(dr.slope_deg)) if dr is not None else 1.0),
                           slip_fn_min=(float(dr.slip_normal_force_min_n) if dr is not None
                                        else 5.0) if want_slip else None)
 
@@ -762,6 +955,13 @@ def collect_rollout(
         # the two dataset generations apart without guessing from which keys exist.
         "dr": None if dr is None else dr.to_meta(),
         "friction_mu": mu,
+        # `ramp_mu` is the sliding friction applied on contacts steeper than `slope_deg`;
+        # `ramp_contact_samples` is how many (tick, contact) pairs actually got it. A terrain with
+        # no ramps reports 0, which is the check that the feature did what it claims on THIS
+        # rollout rather than silently doing nothing.
+        "ramp_mu": ramp_mu,
+        "slope_deg": (None if dr is None or not dr.slope_friction else float(dr.slope_deg)),
+        "ramp_contact_samples": int(loop.ramp_contacts),
         "push_schedule": push_events,               # [[t0, t1, fx, fy, fz], ...] seconds / N
         "cmd_schedule": ([] if cmd_events is None else
                          [[k * CONTROL_DT] + list(v) for k, v in sorted(cmd_events.items())]),
@@ -776,7 +976,8 @@ def collect_rollout(
     if verbose:
         sim_s = seconds + settle_s
         print(f"    travelled={travelled:.1f}m  tilt_max={tilt.max():.1f}deg  "
-              + (f"slip={100 * meta['slip_fraction']:.1f}% "
+              + (f"ramps={loop.ramp_contacts} " if ramp_mu is not None else "")
+            + (f"slip={100 * meta['slip_fraction']:.1f}% "
                  f"(cone p50={meta['slip_sat_p50']:.2f} p99={meta['slip_sat_p99']:.2f})  "
                  if want_slip else "")
               + f"wall: sim={loop.sim_s:.1f}s read={loop.read_s:.1f}s fused={fused_s:.1f}s "

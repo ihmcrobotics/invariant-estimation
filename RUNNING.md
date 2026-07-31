@@ -444,12 +444,78 @@ attitude, gyro, velocity, position drift, joint state) over the whole run and ov
 | `--contact-meas-var` | flight's `1e-4` contact measurement-noise floor (port default 0) |
 | `--contactnet CKPT.npz` | attach a trained ContactNet as the contact-noise provider (off = the analytic filter). The run prints `ContactNet: ATTACHED ckpt=… norm=…` at startup so a log is never ambiguous about which arm it is |
 | `--contactnet-norm N.npz` | the normalization constants, which **must** be the ones the checkpoint was trained under: run 4 → `data/dr/norm_constants.npz`, run 2 → `data/norm_constants.npz`. A mismatch shifts the network's input distribution and **nothing raises** — the run just quietly measures something else |
+| `--early-release FRAC` | **the anchor early-release fix** (2026-07-31). Loosen a contact's `Σ_C` when its foot's load falls to `FRAC` of that stance's post-impact peak, instead of waiting for `ContactTrust` to let go. Cuts the 30 s vertical sink **2.24x** (−56.7 → −25.3 cm) and improves tilt and velocity with it. **OFF by default** — every number recorded before this date was produced without it |
+| `--early-release-source foot\|point` | which load drives it. **`foot` is the one that works** (per-contact does nothing: at N=4 the toe's own peak is late, so its ratio test only fires at the last tick). Default `point`, for parity with the offline arm |
+| `--early-release-off-dwell TICKS` | unloaded ticks before a stance is considered over. **Use 20.** At 0 the per-foot load's 1–5-tick mid-stance dropouts fragment a stance, and each fragment resets the peak reference and the latch: a 30 s walk then reports 306 "liftoffs" on two feet against a real cadence of ~2 steps/s |
+| `--early-release-blank TICKS` | ticks of stance excluded from the peak reference (default 150). The touchdown impact is 2–11x the stance median; a peak that includes it releases 70–86% of stance, which is *worse* than doing nothing |
+| `--early-release-mode`, `--early-release-rate`, `--early-release-lead` | alternative predictors (previous stance's peak, a falling-rate test, a stance clock). All measured; none beats the level test once `off_dwell` is set — see PORT_NOTES |
 | `--video walk.mp4` | record the run offscreen to H.264 (implies `--headless`, `--video-fps` / `--video-size` tune it) |
 | `--ghost [mode]` | draw a translucent robot at the estimated state: `full` (default) or `attitude`. Viewer only |
 | `--ghost-offset M` | displace the ghost sideways for side-by-side viewing instead of overlaid |
 | `--realtime` | run the estimator on its own thread. Viewer only; the estimate goes slightly stale |
 | `--max-backlog-ticks` | how far the estimator may fall behind before the sim thread waits (default 2). Samples are never dropped |
 | `--wasd` | use the standalone WASD window instead of the passive viewer |
+
+### The best-known configuration, and the videos it produced
+
+```bash
+# forward walk -- the headline number
+uv run python run_estimator.py --policy baseline --headless --ticks 1500 --vx 0.6 --imu-noise \
+    --toe-heel --early-release 0.5 --early-release-source foot --early-release-off-dwell 20 \
+    --ghost --video artifacts/video/best_vx06.mp4 --video-fps 25 --out best_vx06.npz
+# turning walk -- the harder case
+uv run python run_estimator.py --policy baseline --headless --ticks 1500 --vx 0.4 --yaw 0.8 \
+    --imu-noise --toe-heel --early-release 0.5 --early-release-source foot \
+    --early-release-off-dwell 20 --ghost --video artifacts/video/best_yaw08.mp4
+# one table from any set of --out histories: dz, yaw, horizontal drift
+uv run python -m experiments.summarise_runs artifacts/video/*.npz
+```
+
+| | analytic N=4 | + early release |
+|---|---|---|
+| final `dz`, `vx = 0.6` | −56.7 cm | **−25.3 cm** |
+| final `dz`, `vx 0.4 / yaw 0.8` | −39.1 cm | **−16.1 cm** |
+| tilt tail | 0.24° | **0.15°** |
+| velocity rms | 0.0347 m/s | **0.0294 m/s** |
+| yaw tail (turning) | 3.41° | 3.00° (unchanged) |
+| horizontal drift | 0.20 m / 18.8 m | 0.16 m / 18.6 m |
+
+Global x, y and yaw are **unobservable** in a proprioceptive InEKF — no `H` row sees them — so
+those drift for as long as it runs. A schedule change reduces the rate, never the fact.
+
+### The analysis scripts added on 2026-07-31
+
+```bash
+# Is slip predictable from the 24 feature channels at all?  (+ the phase-vs-slip R^2 matrix,
+# and a per-channel-family ablation.)  Needs scikit-learn, which is NOT a project dependency.
+uv run --with scikit-learn python -m experiments.slip_probe --data data/dr5 \
+    --checkpoint artifacts/contactnet_run7.npz --group-ablation
+# The v_bc noise floor, and the CoCo-InEKF Figure-3 analogue (learned std vs contact speed).
+uv run python -m experiments.contact_velocity --data data/dr5 \
+    --checkpoint artifacts/contactnet_run7.npz
+# Horizontal drift vs slip, between rollouts and within them.
+uv run python -m experiments.slip_attribution --data data/dr5
+# Serial closed-loop sweeps (one run_estimator at a time, own TMPDIR each -- never run two).
+./experiments/early_release_sweep.sh artifacts/sweep "--vx 0.6"
+```
+
+### Collecting a slip-heavy dataset
+
+`config/collect_dr6.yaml` stratifies `mu` on a deterministic per-terrain grid instead of drawing
+it i.i.d. (which realised only ~6 distinct values, none below 0.45, on dr4 and dr5).
+
+```bash
+uv run python -m invariant_estimation.sim.collect --toe-heel --dr config/collect_dr6.yaml
+./artifacts/run8_pipeline.sh          # collect -> cache -> norm -> P0 -> gates -> train -> replay
+```
+
+**`mu = 0.20` does not survive a 60 s rollout** even on flat: 3 of 12 fell and were dropped by
+the collector's tilt bound. The 8 s feasibility measurement the grid was built on was optimistic;
+floor flat/waves at 0.25–0.30.
+
+**`alpha_sweep` needs `--toe-heel` at N=4** or it builds an N=2 filter against an N=4 `P0` and
+dies with `dot_general … got (15,) and (21,)`. Both `run7_pipeline.sh` and `run8_pipeline.sh`
+omit it; the gate must be re-run by hand until they are fixed.
 
 ### ContactNet in the closed loop
 

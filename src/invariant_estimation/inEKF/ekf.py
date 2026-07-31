@@ -26,14 +26,12 @@ new state.  Java's introspection getters (`wasLastUpdateApplied`,
 `getLastConditionProxy`) become the returned `UpdateDiagnostics` pytree rather
 than fields mutated on the side (CLAUDE.md §4).
 
-    # TODO(reseed): touchdown re-seed.  `InvariantEKF.reseedContact(i, y, N)`
-    # re-anchors an existing contact slot by a covariance congruence
-    # (P_dd = P_pp + R N Rᵀ, P_θd = P_θp) under a fire-once `TouchdownReseedLatch`
-    # (trigger 0.5, rearm 0.1, dwell 100 ticks).  Deliberately NOT implemented:
-    # Lucas measured no meaningful difference on the real robot (2026-07-21), so
-    # `InvariantEKFReseedTest` and `TouchdownReseedLatchTest` are unported.
-    # Parameters are parked under `reseed:` in config/filter_cfg.yaml, and the
-    # call site is here — between `predict` and `update` in `step`.
+    # Touchdown re-seed: implemented 2026-07-30 in `inEKF/reseed.py` (congruence
+    # + `TouchdownReseedLatch`), ported tests in `tests/inEKF/test_reseed.py`.
+    # OFF by default (`InvariantEKF.reseed is None`), which keeps every shipped
+    # path and every existing result bit-identical; it is wired as an ablation
+    # arm in `inEKF/filter.make_step`, between `propagate` and the contact
+    # update, exactly where this note used to say the call site was.
 """
 from typing import NamedTuple, Sequence
 
@@ -66,11 +64,17 @@ class InvariantEKF(NamedTuple):
         Per-contact **body-frame** process covariances used by the propagation.
     gravity_params : GravityParams
         Gravity-leveling configuration.
+    reseed : ReseedParams | None
+        Touchdown re-seed configuration, or ``None`` (the default and every
+        shipped path) to leave the machinery out of the traced graph entirely.
+        See `inEKF/reseed.py`; enabling it also requires driving
+        `InEKFInputs.contact_prob`.
     """
     N: int
     params: InEKFParams
     sigma_c: Array
     gravity_params: GravityParams
+    reseed: "ReseedParams | None" = None
 
     @property
     def number_of_contacts(self) -> int:
@@ -95,6 +99,7 @@ def create(
     contact_var: float | None = None,
     dt: float | None = None,
     gravity_params: GravityParams | None = None,
+    reseed: "ReseedParams | None" = None,
 ) -> InvariantEKF:
     """Java `InvariantEKF.create(numberOfContacts, gyroVar, accelVar, contactVar)`.
 
@@ -118,6 +123,7 @@ def create(
         sigma_c=sigma_c,
         gravity_params=default_gravity_params() if gravity_params is None
         else gravity_params,
+        reseed=reseed,
     )
 
 

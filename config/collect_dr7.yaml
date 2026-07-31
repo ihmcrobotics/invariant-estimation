@@ -1,0 +1,127 @@
+# config/collect_dr5.yaml -- `collect_dr.yaml` with a DEADBAND-AWARE command distribution.
+#
+# Identical to `collect_dr.yaml` in friction, pushes and slip. The one change is `command.mode:
+# hollow`, and it exists because of a measurement on the set that config produced (`data/dr4`,
+# 744 000 walking ticks):
+#
+#   axis   commanded range    mean |cmd|   frac above the policy's tracking deadband
+#   vx     [-0.48, +0.77]       0.351        62%   (WALK_MIN_VX  = 0.30)
+#   vy     [-0.33, +0.33]       0.182        19%   (WALK_MIN_VY  = 0.28)
+#   yaw    [-0.76, +0.71]       0.356        13%   (WALK_MIN_YAW = 0.60)
+#
+# `vy: [-0.35, 0.35]` and `yaw_rate: [-0.8, 0.8]` barely clear the deadbands, so four fifths of the
+# lateral command and seven eighths of the yaw command are draws the policy IGNORES. The set is
+# forward-dominated no matter how wide the nominal ranges read.
+#
+# WHY THAT MATTERS FOR THE OBJECTIVE, not just for realism. `l2_velocity` compares body-frame
+# velocities, so an attitude error enters as
+#
+#     || R_est^T v_est - R_true^T v_true ||  ~=  || dphi x b ||,    b = R^T v
+#
+# and the cross product annihilates the component of `dphi` ALONG the body velocity. With
+# b ~= (0.4, 0, 0) the loss cannot see roll error at all and weights pitch/yaw by only 0.4 m/s.
+# Spanning `b` over the horizontal plane is what puts all three rotational axes into the gradient.
+# This config is the test of whether that alone is enough -- the standing question being whether
+# `l2_velocity` can hold attitude, or whether `beta_nll`'s logdet term is required.
+#
+# The other half of the blindness is NOT addressed here and should not be claimed as addressed: a
+# training window is L=128, H=50 -> 0.392 s, seeded from truth at its start, so a 20 s closed-loop
+# yaw drift is very nearly constant inside it. Command diversity fixes axis coverage; it does not
+# fix horizon.
+#
+#     uv run python -m invariant_estimation.sim.collect --toe-heel --dr config/collect_dr5.yaml
+
+run:
+  terrains: [flat, waves, stepping_stones, hard_stepping]
+  seeds: [0, 1, 2]
+  seconds: 60.0
+  settle_s: 2.0
+  chunk_ticks: 10000
+  out_dir: data/dr7
+
+dr:
+  # A DIFFERENT base seed from collect_dr.yaml's 20260728. Same seed would redraw the same friction
+  # values (the stream is keyed on seed and range), and this set is meant to be an independent
+  # sample, not the same 6 mu values with new commands.
+  seed: 20260731
+
+  friction:
+    # Unchanged from collect_dr.yaml. NOTE the known limitation recorded there: 12 i.i.d. draws
+    # realise only ~6 distinct mu, none below 0.47, so the 0.20-0.30 high-slip end is never reached.
+    # Stratifying mu remains the cheapest untested improvement; deliberately NOT done here, so that
+    # this set differs from `data/dr4` in the command distribution and nothing else.
+    enabled: true
+    range: [0.30, 1.20]
+    range_by_terrain:
+      flat:  [0.20, 1.20]
+      waves: [0.20, 1.20]
+
+  push:
+    enabled: true
+    force_n: [50.0, 400.0]
+    duration_s: [0.10, 0.20]
+    interval_s: [1.0, 3.0]
+    vertical_scale: 0.0
+
+  command:
+    enabled: true
+    resample_s: [2.0, 4.0]
+    mode: hollow
+
+    # Each axis is EITHER exactly zero (its `*_zero_prob`) OR a sign-balanced magnitude from its
+    # `*_mag`, whose lower end is that axis's measured deadband and whose upper end is the policy's
+    # own trained band (`AlexCommandsCfg`: vx +-0.9, vy +-0.5, yaw +-1.5). So every draw is either
+    # honestly zero or one the policy tracks, and nothing extrapolates past training.
+    vx_mag:  [0.30, 0.90]
+    vy_mag:  [0.28, 0.50]
+    yaw_mag: [0.60, 1.50]
+    vx_zero_prob:  0.15
+    vy_zero_prob:  0.35
+    yaw_zero_prob: 0.35
+
+    # 0.10, down from 0.15. The dr4 post-mortem found 29.2% of ticks below 0.2 m/s (against 3.7%
+    # on the original set), almost all of it standing, and that low-speed mass (a) contributes
+    # little gradient signal about contact quality and (b) is what made `alpha_sweep` reject the
+    # set at B=8. Trimmed, not removed: standing-under-load is real data.
+    stand_prob: 0.10
+
+    base_height: null
+
+    # The legacy `uniform` ranges are left here, unread in `hollow` mode, so that flipping
+    # `mode: uniform` reproduces collect_dr.yaml's distribution without hunting for the numbers.
+    vx: [-0.5, 0.8]
+    vy: [-0.35, 0.35]
+    yaw_rate: [-0.8, 0.8]
+
+  slope_friction:
+    # SLIPPERY RAMPS, NORMAL FLATS. The point is not more slip -- data/dr6 already raised pooled
+    # slip to 19% by lowering mu globally, and run 8 did not improve. A global mu keeps contact
+    # quality PERFECTLY CORRELATED ACROSS FEET, and a per-contact Sigma_C has nothing to learn from
+    # a signal identical on both feet at every tick. This puts one foot on firm stone and the other
+    # on a slippery edge AT THE SAME TICK.
+    #
+    # Restricted to the two stone terrains BY NAME, not by relying on the tilt threshold to
+    # separate them. Measured with the policy walking (foot contacts only, tilt of the contact
+    # normal from vertical):
+    #   terrain          p50     p90    frac >10deg
+    #   flat            0.06    0.53      2.5%
+    #   waves           4.02    4.53      1.6%
+    #   stepping_stones 0.10    4.37      2.8%
+    #   hard_stepping   0.09    5.33      7.2%
+    # Every terrain has a few near-90deg foot contacts -- those are foot SIDE/EDGE strikes, not
+    # ramps -- so a threshold alone would make flat ground slippery 2.5% of the time. Naming the
+    # terrains keeps flat and waves untouched by construction, which is what makes this an
+    # experiment about ramps rather than another global mu change.
+    #
+    # Note the exposure: the robot lands on the flat TOPS of the stones most of the time, so ramp
+    # contacts are a 3-7% minority. That is the intended shape -- a distinctive, occasional event
+    # the network can learn to recognise -- but it is a minority, and the result must be read
+    # knowing that.
+    enabled: true
+    slope_deg: 10.0
+    mu_range: [0.15, 0.40]
+    terrains: [stepping_stones, hard_stepping]
+
+  slip:
+    record: true
+    normal_force_min_n: 5.0

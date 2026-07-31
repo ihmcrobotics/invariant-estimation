@@ -112,18 +112,41 @@ fails if it is removed.
 
 ---
 
-## 3. Touchdown re-seed is not implemented
+## 3. Touchdown re-seed IS implemented, and is off by default
 
-**Decided:** 2026-07-21 (Lucas). **Code:** `inEKF/ekf.py` (`TODO(reseed)`).
-**Guarded by:** `tests/inEKF/test_invariant_ekf.py::test_reseed_is_not_implemented`.
+**Decided:** 2026-07-21 (Lucas) to defer; **implemented 2026-07-30** as an ablation
+arm. **Code:** `inEKF/reseed.py`, wired in `inEKF/filter.make_step`.
+**Guarded by:** `tests/inEKF/test_reseed.py` (16) and
+`tests/inEKF/test_invariant_ekf.py::test_reseed_is_implemented_but_off_by_default`.
 
-`reseedContact` re-anchors a contact slot by a covariance congruence
-(`P_dd = P_pp + R N Rᵀ`, `P_θd = P_θp`) under a fire-once latch. Not ported —
-measured no meaningful difference on the real robot.
+`reseed_contacts` re-anchors a contact slot by a covariance congruence
+(`P_dd = P_pp + R N Rᵀ`, `P_θd = P_θp`) under a fire-once `TouchdownReseedLatch`
+(0.5 / 0.1 / 100 ticks). Both Java test classes are now ported, including the
+zero-release property and the 200k-tick chatter property.
 
-**Cost:** stale-anchor drift on long stances is not corrected, and covariance can
-grow more than necessary across a stance. Parameters are parked under `reseed:`
-in `config/filter_cfg.yaml` with `enabled: false`; the call site is marked.
+**Default `None`**, so it is absent from the traced graph unless asked for: runs
+1-6 and every replay and closed-loop number on record were produced without it,
+and they stay comparable only while that is true. Enable with
+`build_fused_estimator(reseed=True)` or `run_estimator.py --reseed`.
+
+**Why the original deferral was right, now with a sim measurement behind it.**
+Lucas measured no meaningful difference on hardware. The port reproduces that, and
+the mechanism is now visible: over 10 s of `data/dr5/flat_seed000`, the
+pre-re-seed anchor discrepancy at the ticks the latch fires is **0.4 mm mean,
+1.2 mm max**. There is almost nothing to re-anchor, because **this InEKF never
+releases a contact** — it runs the FK update on all `N` contacts every tick with
+no per-foot gate (the DECISION note in `inEKF/filter.py`: contact condition rides
+entirely in the process `Σ_C`), so the inflated swing-phase `Σ_C` lets each anchor
+track its own foot continuously. The stale-anchor problem a re-seed exists to fix
+is already handled by the process-noise mechanism.
+
+**Corollary worth keeping:** a re-seed would matter much more in a filter that
+*did* gate the contact update per foot. If that ever changes, revisit this.
+
+**What it cannot do, in any variant:** make global `x`, `y` or yaw observable.
+Those are unobservable in a proprioceptive InEKF — `P0`'s
+`diag(R) = [7.1e-5, 7.1e-5, 1.0]` is the filter saying so correctly — and a
+re-seed changes only the *rate* at which they drift.
 
 ---
 

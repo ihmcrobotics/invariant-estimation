@@ -162,6 +162,93 @@ def retighten(s: np.ndarray, stance_value: float) -> np.ndarray:
     return np.where(stance_mask(s), stance_value, s)
 
 
+IMPACT_BLANK_TICKS = 150
+"""Ticks of stance excluded from the peak reference in `causal_early_release`.
+
+**Measured, and the reason the first version of arm E failed.** Touchdown is an impact: on
+`data/dr5/flat_seed000` the per-stance peak normal force is **2.0-10.8x the stance median**, and it
+occurs 1-16% into the stance. A running peak therefore locks onto the impact spike, `frac * peak`
+sits above where the foot spends the rest of its stance, and the latch fires almost immediately --
+70-86% of stance released against the ~10-20% intended. That is not early release, it is arm I
+(constant loose), and it scored monotonically WORSE than the baseline: slope `e_pz` -0.0149 ->
+-0.0239 / -0.0319 / -0.0487 at frac 0.3 / 0.5 / 0.7, with `vel_rms` climbing 0.059 -> 0.35.
+
+150 ticks (150 ms) clears the transient on every episode measured while leaving the bulk of a
+~514-tick stance to set the reference.
+"""
+
+
+def causal_early_release(s: np.ndarray, fn: np.ndarray, frac: float,
+                         blank: int = IMPACT_BLANK_TICKS) -> np.ndarray:
+    r"""Arm E — release the anchor when load falls to ``frac`` of its running stance peak.
+
+    The causal counterpart of `loosen_early`, which is arm B's oracle. Arm B reads liftoff from the
+    future; this reads only the past, so it is implementable on hardware (the signal is normal
+    force, exactly what `ContactTrust` already consumes).
+
+    **Why a fraction of the peak and not a threshold on the level.** A level threshold fires when
+    the load has *already gone*; it can be made lower but never earlier, so it is structurally late
+    (`docs/theory/anchor_release_timing.md`). The ratio to the stance peak instead tracks where the
+    foot is on its own unloading ramp, which starts well before the load reaches any small absolute
+    value. ``frac`` is the one knob: 0 recovers the baseline (release only at zero load), larger
+    values release progressively earlier on the ramp.
+
+    Two design choices that mirror arm B's:
+
+    * **Only ever loosens.** The result is ``max`` with the heuristic, so this can move liftoff
+      earlier but can never move *touchdown* earlier -- tightening the anchor before the foot is
+      down would be a second change in the opposite direction and make the arm uninterpretable.
+    * **Latched within a stance.** Ground reaction force is double-humped, so a mid-stance dip
+      below ``frac * peak`` would otherwise release and then re-tighten, chattering. Once a foot is
+      judged to be on its way out it stays out until the next touchdown -- the same fire-once logic
+      `inEKF/reseed.py`'s latch uses, and for the same reason.
+
+    Parameters
+    ----------
+    s : (T, N_c)
+        The heuristic chol scalars, per contact.
+    fn : (T, N_c)
+        Per-contact normal force (``truth.contact_fn``, expanded foot -> contact).
+    frac : float
+        Release when ``fn < frac * running_peak`` within the current stance.
+
+    Returns
+    -------
+    (T, N_c) chol scalars, loose wherever the heuristic OR this predictor says so.
+    """
+    stance = stance_mask(s)
+    swing_val = float(s[~stance].max()) if (~stance).any() else float(s.max())
+    released = np.zeros_like(fn, dtype=bool)
+
+    for c in range(fn.shape[1]):
+        f = fn[:, c]
+        loaded = f > 0.0
+        # Contact episodes = maximal runs of `loaded`. Within each, the running peak is a
+        # prefix maximum and the latch is a prefix OR -- both vectorised, no per-tick loop.
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], loaded.view(np.int8), [0]])))
+        for lo, hi in zip(edges[::2], edges[1::2]):
+            seg = f[lo:hi]
+            idx = np.arange(len(seg))
+            # Running peak over the POST-IMPACT load only (see `IMPACT_BLANK_TICKS`). Still
+            # causal: the blanking window looks backwards from the current tick, never forwards.
+            ref = np.maximum(np.maximum.accumulate(np.where(idx < blank, 0.0, seg)), 1e-9)
+            rel = (idx >= blank) & (seg < frac * ref)
+            released[lo:hi, c] = np.maximum.accumulate(rel)      # latch: stays released
+        released[~loaded, c] = True          # no load at all: unambiguously not planted
+
+    return np.where(released, swing_val, s)
+
+
+def expand_feet(a: np.ndarray, n_c: int) -> np.ndarray:
+    """Per-foot ``(T, K)`` -> per-contact ``(T, N_c)``, foot-major (heel, toe) per foot."""
+    K = a.shape[1]
+    if n_c == K:
+        return a
+    if n_c % K:
+        raise ValueError(f"cannot map {K} feet onto {n_c} contacts")
+    return np.repeat(a, n_c // K, axis=1)
+
+
 # ---------------------------------------------------------------------------
 # Section 6: the P_dd / P_pp asymmetry, and the innovation dose
 # ---------------------------------------------------------------------------
@@ -278,7 +365,8 @@ def with_floor(fused, floor: float):
             params=fused.ekf.params._replace(contact_floor=floor)))
 
 
-def build_arms(spec: str, s_heur: np.ndarray, shifts, stances, floors) -> list[tuple]:
+def build_arms(spec: str, s_heur: np.ndarray, shifts, stances, floors,
+               fn: np.ndarray | None = None, early_fracs=()) -> list[tuple]:
     """``[(label, socket, chol, floor), ...]`` for the requested arm letters.
 
     ``floor=None`` means "leave the estimator alone"; only arm F sets it.
@@ -295,6 +383,13 @@ def build_arms(spec: str, s_heur: np.ndarray, shifts, stances, floors) -> list[t
         for v in stances:
             arms.append((f"C  stance {v:.0e}", "process",
                          as_chol(retighten(s_heur, v)), None))
+    if "E" in want:
+        if fn is None:
+            raise SystemExit("arm E needs `truth.contact_fn`; the dataset was collected "
+                             "without slip instrumentation (`dr.slip.record`)")
+        for v in early_fracs:
+            arms.append((f"E  causal frac {v:.2f}", "process",
+                         as_chol(causal_early_release(s_heur, fn, v)), None))
     if "I" in want:
         # What the RUN ACTUALLY STARTS FROM. `network.init` zeroes the output
         # head, so iteration 0 emits a constant `sigma_0 * I` for every foot at
@@ -328,9 +423,17 @@ def main() -> None:
                      "use p0_process_dr.npz once the network drives contact_chol")
     ap.add_argument("--checkpoint", default=str(REPO / "artifacts/contactnet_run4.npz"),
                     help="arms D and N")
+    # Third tool to need this (after `replay_eval` and `alpha_sweep`): an N=4 dataset stores
+    # (T, 4, 3, 3) contact arrays and the N=2 default dies inside the first propagation with
+    # `dot_general ... got (15,) and (21,)`.
+    ap.add_argument("--toe-heel", dest="toe_heel", action="store_true",
+                    help="N=4 (heel+toe per foot); must match how the dataset was collected")
     ap.add_argument("--arms", default="A,B,C,D")
     ap.add_argument("--shifts", default="0,10,25,50,100")
     ap.add_argument("--stances", default="1e-4,1e-3,1e-2")
+    ap.add_argument("--early-fracs", default="0.3,0.5,0.7,0.9",
+                    help="arm E: release when load falls below this fraction of its running "
+                         "stance peak. Causal; arm B at the same lead is its ceiling.")
     ap.add_argument("--floors", default="1e-4,1e-5,1e-6",
                     help="arm F: InEKFParams.contact_floor sweep")
     ap.add_argument("--ticks", type=int, default=20_000)
@@ -344,11 +447,15 @@ def main() -> None:
     shifts = [int(x) for x in args.shifts.split(",")]
     stances = [float(x) for x in args.stances.split(",")]
     floors = [float(x) for x in args.floors.split(",")]
+    early_fracs = [float(x) for x in args.early_fracs.split(",") if x.strip()]
     _want = {c.strip().upper() for c in args.arms.split(",")}
     want_d, want_n = "D" in _want, "N" in _want
 
-    cfg = ContactNetConfig(F=24, sigma_0=1.0e-4)
-    fused = collect.build_collector(verbose=False).fused
+    n_c = 4 if args.toe_heel else 2
+    cfg = ContactNetConfig(F=24, sigma_0=1.0e-4, n_contacts=n_c)
+    fused = collect.build_collector(verbose=False, toe_heel=args.toe_heel).fused
+    if int(fused.n_contacts) != n_c:
+        raise SystemExit(f"estimator has {fused.n_contacts} contacts, expected {n_c}")
     data = Path(args.data)
     norm = normalize.load(str(Path(args.norm) if args.norm
                               else data / "norm_constants.npz"))
@@ -356,6 +463,17 @@ def main() -> None:
                             norm, cfg, cache_dir=Path(args.cache) if args.cache else data / "cache",
                             verbose=False)
     P0 = np.load(args.p0)["P0"]
+
+    # Arm E's input signal. `truth.contact_fn` is the summed per-foot normal force recorded at
+    # collection time -- a SENSOR quantity, the same class `ContactTrust` already consumes, not
+    # privileged ground truth about liftoff. Absent on datasets collected without slip
+    # instrumentation, in which case arm E refuses rather than silently degrading.
+    fn_all: dict[str, np.ndarray] = {}
+    for p in dataset.rollout_paths(data)[:args.rollouts]:
+        with np.load(p, allow_pickle=False) as z:
+            if "truth.contact_fn" in z.files:
+                meta = __import__("json").loads(str(np.load(p, allow_pickle=False)["meta"]))
+                fn_all[f"{meta['terrain']}/seed{meta['seed']}"] = np.asarray(z["truth.contact_fn"])
 
     fwd = None
     if want_d or want_n:
@@ -380,7 +498,10 @@ def main() -> None:
             t0 = int(t0)
             sl = slice(t0, t0 + args.ticks)
             s_heur = chol_scale(np.asarray(prep.inputs.contact_chol[sl]))
-            arms = build_arms(args.arms, s_heur, shifts, stances, floors)
+            fn_c = (expand_feet(fn_all[prep.name][sl], s_heur.shape[1])
+                    if prep.name in fn_all else None)
+            arms = build_arms(args.arms, s_heur, shifts, stances, floors,
+                              fn=fn_c, early_fracs=early_fracs)
             if want_d or want_n:
                 flat = w[sl].reshape(args.ticks, w.shape[1], -1)
                 L_net = fwd(flat)

@@ -92,10 +92,18 @@ def main() -> None:
     ap.add_argument("--run1", action="store_true",
                     help="reproduce run 1: frozen process socket, truth-seeded segments")
     ap.add_argument("--seed", type=int, default=0)
+    # An N=4 dataset stores (T, 4, 3, 3) contact arrays and needs an N=4 estimator: without
+    # this the gate builds the N=2 default and dies inside the first propagation with
+    # `dot_general ... got (15,) and (21,)` -- i.e. it does not gate, it crashes. Same defect
+    # `replay_eval` carried until 2026-07-29; found here on the run-7 dataset.
+    ap.add_argument("--toe-heel", dest="toe_heel", action="store_true",
+                    help="gate an N=4 (heel+toe per foot) dataset; must match how it was collected")
     args = ap.parse_args()
 
+    n_c = 4 if args.toe_heel else 2
     cfg = ContactNetConfig(
         F=24, sigma_0=1.0e-4, B=args.B, remat=False,
+        n_contacts=n_c,
         freeze_contact_chol=args.run1,
     )
     label = "run-1 (frozen chol, truth-seeded)" if args.run1 else "run-2 (chained)"
@@ -103,7 +111,9 @@ def main() -> None:
     print(f"  B={cfg.B}  L={cfg.L}  freeze_contact_chol={cfg.freeze_contact_chol}  "
           f"chained={not args.run1}")
 
-    fused = collect.build_collector(verbose=False).fused
+    fused = collect.build_collector(verbose=False, toe_heel=args.toe_heel).fused
+    if int(fused.n_contacts) != n_c:
+        raise SystemExit(f"estimator has {fused.n_contacts} contacts, expected {n_c}")
     norm = normalize.load(args.norm)
     preps = dataset.prepare(dataset.rollout_paths(args.data)[:args.rollouts],
                             norm, cfg, cache_dir=args.cache, verbose=False)

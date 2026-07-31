@@ -259,6 +259,24 @@ def summarise(history, tail_frac=0.5):
     return out
 
 
+def print_release_leads(reader):
+    """The per-liftoff LEAD distribution, when `--early-release` is on.
+
+    The quantity `docs/theory/anchor_release_timing.md` says to test a release schedule on --
+    and specifically NOT its median. Arm B, the non-causal oracle, gives every liftoff ~100
+    ticks with a std of 23 and misses 0.7% of them; the load-threshold predictors measured
+    offline miss 31-50%, and the miss rate rather than the median is what decides the sink.
+    So the zero-lead fraction is printed first.
+    """
+    r = getattr(reader, "release", None)
+    if r is None or not r.leads:
+        return
+    a = np.asarray(r.leads, float)
+    print(f"    early release: {len(a)} liftoffs, ZERO-LEAD {100 * np.mean(a == 0):.1f}%, "
+          f"lead p10/p50/p90 = {np.percentile(a, 10):.0f}/{np.median(a):.0f}/"
+          f"{np.percentile(a, 90):.0f} ticks, mean {a.mean():.0f} std {a.std():.0f}")
+
+
 def print_summary(history):
     s = summarise(history)
     if not s:
@@ -359,7 +377,11 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
                         stance_chol=1.0e-4, swing_chol=1.0e1,
                         contact_fk_unfiltered=True, est_every=1, verbose=True,
                         contactnet=None, contactnet_norm=None, toe_heel=False,
-                        threaded=False, max_backlog_ticks=2):
+                        reseed=False, threaded=False, max_backlog_ticks=2,
+                        early_release=0.0, early_release_blank=150,
+                        early_release_mode="current", early_release_source="point",
+                        early_release_rate=0.0, early_release_lead=0,
+                        early_release_off_dwell=0):
     t0 = time.time()
     policy = rp.load_policy(policy_name)
     m = rp.build_sim_model(policy, with_visuals=with_visuals, with_imu_sensors=True)
@@ -369,9 +391,22 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
     dt = est_dt or rp.DT * est_every
     fused = me.build_alex_fused_estimator_from_urdf(
         urdf, dt=dt, contact_meas_var=contact_meas_var,
-        contact_fk_unfiltered=contact_fk_unfiltered, toe_heel=toe_heel)
+        contact_fk_unfiltered=contact_fk_unfiltered, toe_heel=toe_heel,
+        reseed=reseed)
     reader = SimSensorReader(m, fused, foot_geoms=rp.FOOT_GEOMS, dt=dt, noise=noise,
-                             stance_chol=stance_chol, swing_chol=swing_chol)
+                             stance_chol=stance_chol, swing_chol=swing_chol,
+                             early_release=early_release,
+                             early_release_blank=early_release_blank,
+                             early_release_mode=early_release_mode,
+                             early_release_source=early_release_source,
+                             early_release_rate=early_release_rate,
+                             early_release_lead=early_release_lead,
+                             early_release_off_dwell=early_release_off_dwell)
+    if verbose and reader.release is not None:
+        print(f"           EARLY RELEASE on: frac={early_release} "
+              f"blank={early_release_blank}tk mode={early_release_mode} "
+              f"source={early_release_source} rate={early_release_rate} "
+              f"clock_lead={early_release_lead}")
     if verbose:
         print(f"estimator: {fused.n_joints} filtered joints {list(fused.build.joint_names)}")
         print(f"           {fused.build.n_imus} IMUs {list(fused.build.imu_names)}, "
@@ -444,6 +479,7 @@ def run_headless(loop, ticks, cmd=None, out=None, every=25, video=None, video_fp
     if rec is not None:
         rec.close()
     s = print_summary(loop.history)
+    print_release_leads(loop.reader)
     if out:
         np.savez(out, **{k: np.array([h[k] for h in loop.history]) for k in loop.history[0]})
         print(f"  history -> {out}")
@@ -516,6 +552,43 @@ if __name__ == "__main__":
     # information about foot ORIENTATION, which is why run 5's yaw regressed.
     ap.add_argument("--toe-heel", action="store_true",
                     help="InEKF gets 4 contact points (heel+toe per foot), K stays 2")
+    ap.add_argument("--reseed", action="store_true",
+                    help="enable the touchdown re-seed (inEKF/reseed.py). OFF by default: every "
+                         "result on record was produced without it, so leaving it off keeps a run "
+                         "comparable with them. It re-anchors a contact slot on the first tick of "
+                         "each genuine strike, which reduces stale-anchor DRIFT -- it does not "
+                         "make global x/y/yaw observable, and nothing can.")
+    # The causal anticipatory anchor release (`sim/sensors.EarlyRelease`). OFF by default:
+    # every number on record was produced without it. See
+    # `docs/theory/anchor_release_timing.md` for why a level threshold cannot do this.
+    ap.add_argument("--early-release", type=float, default=0.0, metavar="FRAC",
+                    help="release the stance anchor when a contact's load falls to FRAC of "
+                         "its own post-impact stance peak (0 = off, the default). 0.5 is the "
+                         "offline-measured setting")
+    ap.add_argument("--early-release-blank", type=int, default=150, metavar="TICKS",
+                    help="ticks of stance excluded from the peak reference; the touchdown "
+                         "impact is 2-11x the stance median and a peak that includes it "
+                         "releases 70-86%% of stance")
+    ap.add_argument("--early-release-mode", choices=("current", "prev"), default="current",
+                    help="'current' uses this stance's running post-impact peak (= the "
+                         "offline arm E'); 'prev' uses the previous stance's peak, which is "
+                         "available from tick 0 and does not depend on this impact")
+    ap.add_argument("--early-release-source", choices=("point", "foot"), default="point",
+                    help="per-CONTACT load (finer, the live signal) or the whole foot's load "
+                         "repeated to its contacts (what the offline arm E' used)")
+    ap.add_argument("--early-release-rate", type=float, default=0.0, metavar="PER_S",
+                    help="also release when the load falls faster than this fraction of the "
+                         "peak per second (0 = the level test alone)")
+    ap.add_argument("--early-release-off-dwell", type=int, default=0, metavar="TICKS",
+                    help="consecutive UNLOADED ticks before a stance is considered over. 0 (the "
+                         "default) is what every recorded number used; the per-foot load reads "
+                         "zero for a tick or two mid-stance, which fragments a stance and resets "
+                         "the peak reference and the latch with it")
+    ap.add_argument("--early-release-lead", type=int, default=0, metavar="TICKS",
+                    help="ALSO release once the stance clock reaches (previous stance length "
+                         "- TICKS). The only member of the family that can reproduce arm B's "
+                         "FIXED lead: every load-threshold predictor misses 31-50%% of liftoffs, "
+                         "and so does a perfect contact-speed sensor. Assumes stride regularity")
     ap.add_argument("--contact-fk", choices=("measured", "pinned"), default="measured",
                     help="whether the InEKF's contact FK uses the MEASURED off-path joints "
                          "(the ankles) or pins them at qpos0 as the library default does")
@@ -579,8 +652,14 @@ if __name__ == "__main__":
         stance_chol=args.stance_chol, swing_chol=args.swing_chol,
         contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every,
         contactnet=args.contactnet, contactnet_norm=args.contactnet_norm,
-        toe_heel=args.toe_heel,
-        threaded=args.realtime, max_backlog_ticks=args.max_backlog_ticks)
+        toe_heel=args.toe_heel, reseed=args.reseed,
+        threaded=args.realtime, max_backlog_ticks=args.max_backlog_ticks,
+        early_release=args.early_release, early_release_blank=args.early_release_blank,
+        early_release_mode=args.early_release_mode,
+        early_release_source=args.early_release_source,
+        early_release_rate=args.early_release_rate,
+        early_release_lead=args.early_release_lead,
+        early_release_off_dwell=args.early_release_off_dwell)
     # The ghost needs somewhere to draw: a viewer's `user_scn`, or the offscreen
     # renderer behind `--video`. Plain `--headless` with no video has neither.
     if args.ghost != "off" and headless and not args.video:

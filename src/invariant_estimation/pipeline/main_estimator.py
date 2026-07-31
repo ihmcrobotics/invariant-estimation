@@ -72,6 +72,7 @@ from ..config import load_config
 from ..inEKF import ekf as inekf_mod
 from ..inEKF import filter as inf
 from ..inEKF.gravity_update import UP, GravityRef
+from ..inEKF.reseed import default_reseed_params
 from ..inEKF.state import InEKFState
 from ..jointKF import anchors as anch
 from ..jointKF import filter as jkf
@@ -455,6 +456,7 @@ def build_fused_estimator(
     accel_var: float | None = None,
     contact_var: float | None = None,
     contact_fk_unfiltered: bool = False,
+    reseed: bool = False,                    # touchdown re-seed ablation; see inEKF/reseed.py
 ) -> FusedEstimator:
     """Assemble the joint KF + InEKF into one fused estimator (plain Python, I7).
 
@@ -520,6 +522,10 @@ def build_fused_estimator(
     ekf = inekf_mod.create(
         number_of_contacts=N, gyro_var=gyro_var, accel_var=accel_var,
         contact_var=contact_var, dt=dt,
+        # `None` unless asked, so the re-seed is absent from the traced graph on
+        # every default path and no result on record shifts by enabling the flag
+        # elsewhere.
+        reseed=default_reseed_params() if reseed else None,
     )
 
     base_site = site_names.index(imu_sites[base_imu])
@@ -736,6 +742,7 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
     aux_encoder_var = (jnp.asarray(fused.aux_encoder_var, dtype=jnp.float64)
                        if fused.n_aux else None)
     aux_qd_var = fused.aux_qd_var
+    reseeding = fused.ekf.reseed is not None
 
     contactnet = fused.contactnet
 
@@ -778,6 +785,14 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
             sensors, bias, base_imu, R_mount, q_hat, qd_hat, sigma_q, sigma_qd,
             contact_meas_var, aux_encoder_var, aux_qd_var,
         )
+
+        # The touchdown latch needs this tick's contact probability, and it is the
+        # ONLY thing in the InEKF that reads it — the contact update itself still
+        # has no per-foot mask (see the DECISION note above; contact condition
+        # rides in the process Σ_C). Left empty when the re-seed is off, so the
+        # field contributes no leaf and the default path is unchanged.
+        if reseeding:
+            inekf_inputs = inekf_inputs._replace(contact_prob=sensors.contact)
 
         # ContactNet reads RAW sensors only — never `bias`, `q_hat` or any other
         # joint-KF output (CLAUDE.md §7: `Features` carries sensor history, no
@@ -920,10 +935,10 @@ def init_fused_carry(
         fused.ekf, rotation=R0, velocity=v0, position=p0, contacts=d0,
         covariance=covariance,
     )
-    inekf_carry = inf.init_carry(state0)
+    reseeding = fused.ekf.reseed is not None
+    inekf_carry = inf.init_carry(state0, reseed=reseeding)
     if seed_gravity:
-        inekf_carry = inf.InEKFCarry(
-            state=state0,
+        inekf_carry = inekf_carry._replace(
             gravity_ref=GravityRef(direction=R0.T @ UP, initialized=jnp.array(1.0)),
         )
 

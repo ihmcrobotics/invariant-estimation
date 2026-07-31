@@ -33,7 +33,8 @@ from typing import Sequence
 import mujoco
 import numpy as np
 
-__all__ = ["add_imu_sensors", "SimSensorReader", "ContactTrust", "IMUNoise"]
+__all__ = ["add_imu_sensors", "SimSensorReader", "ContactTrust", "EarlyRelease",
+           "IMUNoise"]
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +166,204 @@ class ContactTrust:
         return self.trusted.copy()
 
 
+@dataclass
+class EarlyRelease:
+    r"""Causal anchor early-release: loosen ``Sigma_C`` while the foot is still loaded.
+
+    **Why this exists.** `docs/theory/anchor_release_timing.md` derives the vertical
+    sink: at end of stance the foot begins to unload and roll while `ContactTrust`
+    still says "planted", so the contact residual ``nu_z`` turns positive while the
+    apportionment fraction ``f = (P_pp - P_pd)/(Sigma_rel + N)`` is still at its tight
+    stance value (~0.54) and the velocity gain is 2584x its swing value. Every liftoff
+    on every foot therefore delivers one rectified downward dose. **A threshold on load
+    LEVEL, however low, is structurally late** -- it can only fire once the load has
+    already gone. The anticipatory signal has to be the load's ratio to its own stance
+    peak, which starts falling well before any small absolute value is reached.
+
+    This is the live counterpart of `experiments.process_socket_ablation
+    .causal_early_release` (arm E'), whose non-causal ceiling is arm B
+    (``loosen_early``, which reads liftoff from the future and is not deployable).
+    Measured offline on `data/dr5` at N=4: baseline slope ``e_pz`` -0.01486 m/s, arm B
+    at 100 ticks of lead -0.00344 (4.3x), arm E' at ``frac = 0.5`` -0.01101 (1.35x).
+
+    Three design choices, each of which cost a failed arm to learn:
+
+    * **The impact spike is blanked** (`blank_ticks`). Touchdown peak normal force is
+      2.0-10.8x the stance median and lands 1-16% into the stance, so a running peak
+      taken from tick 0 locks onto the impact, ``frac * peak`` sits above where the foot
+      spends the rest of its stance, and the latch fires almost immediately -- 70-86% of
+      stance released. That is not early release, it is a constant-loose anchor, and it
+      scored monotonically WORSE than baseline. Still causal: the blanking window looks
+      backwards from the current tick, never forwards.
+    * **It only ever loosens.** The caller takes the max with the heuristic, so this can
+      move liftoff earlier but never move touchdown earlier -- tightening an anchor
+      before the foot is down is a second change in the opposite direction.
+    * **Latched within a stance.** Ground reaction force is double-humped; a mid-stance
+      dip below ``frac * peak`` would otherwise release and re-tighten, chattering. Once
+      a point is judged to be on its way out it stays out until the next touchdown --
+      the same fire-once logic `inEKF/reseed.py`'s latch uses, for the same reason.
+
+    ``peak_mode`` picks which stance sets the reference:
+
+    ``"current"``
+        the running post-blank peak of the stance in progress. Reproduces arm E'
+        exactly. Needs the blanking window, and cannot act during it.
+    ``"prev"``
+        the previous completed stance's peak for this point, so the reference is
+        available from tick 0 and does not depend on this stance's impact at all.
+        Falls back to ``"current"`` until a first stance has completed. The lead is
+        then set by a quantity that does not itself vary with the impact transient,
+        which is the lead-VARIANCE lever (arm E' at ``frac = 0.7`` had the better
+        median lead and the worse score).
+
+    ``rate_frac`` optionally ORs in a falling-rate test: release when the load is
+    dropping faster than ``rate_frac * peak`` per second. Zero disables it, which is
+    the default and the configuration every recorded number was produced under.
+
+    ``clock_lead`` ORs in a **stance clock**: release once this stance has run to
+    ``prev_len - lead_ticks``, where ``prev_len`` is the previous stance's length for
+    this point. This is the only member of the family that can reproduce arm B's
+    *fixed* lead, and the reason it is here is a measurement:
+
+        Arm B (non-causal oracle, 100 ticks) gives every liftoff a lead of ~100 ticks,
+        std 23, and misses **0.7%** of them. Every load-threshold predictor measured on
+        `data/dr5` -- level on the running peak, level on the previous stance's peak,
+        rate, at fractions 0.35 to 0.85 -- misses **31-50%** of liftoffs, and so does a
+        *perfect* contact-point-speed sensor at the same loose fraction (22% missed at a
+        0.02 m/s threshold). The lead arm B uses is not present in the load or in the
+        contact's motion at that instant; it is in the GAIT PLAN. A walking controller
+        has that and a load sensor does not.
+
+    ``clock_lead`` is therefore the causal predictor with the right *shape*, at the price
+    of assuming stride-to-stride regularity: it degrades exactly where the gait does, and
+    on a dataset containing standing (where a "stance" lasts thousands of ticks) it
+    releases far too early. Set ``frac = 0`` to use the clock alone.
+
+    All state is plain NumPy and lives outside the jitted step (I7 constrains the
+    filter, not the sensor harness).
+
+    All state is plain NumPy and lives outside the jitted step (I7 constrains the
+    filter, not the sensor harness).
+    """
+
+    n_points: int
+    dt: float
+    frac: float = 0.5
+    blank_ticks: int = 150
+    peak_mode: str = "current"
+    rate_frac: float = 0.0
+    clock_lead: int = 0
+    off_dwell: int = 0
+    """Consecutive UNLOADED ticks required to end a stance episode.
+
+    **Measured, closed loop at vx = 0.6:** with ``off_dwell = 0`` a 30 s walk reports **306
+    "liftoffs"** on two feet -- about 10/s against a real cadence near 2 steps/s. The per-foot
+    normal load momentarily reads zero mid-stance (MuJoCo re-solves the contact set every step and
+    a foot can have no qualifying contact for a tick or two), so a single stance fragments into
+    several episodes. Every fragment resets the peak reference AND clears the latch, which is
+    exactly the state this mechanism needs to keep.
+
+    A short off-dwell coalesces the fragments. It is asymmetric on purpose and in the same
+    direction as `ContactTrust`: entering a stance is immediate, leaving it must be sustained --
+    here because a spurious *end* is the expensive error, whereas `ContactTrust` debounces the
+    entry because a bouncing touchdown that anchors early poisons the bias gauge.
+
+    ``0`` is the default and reproduces every number recorded before this field existed.
+    """
+    k: np.ndarray = field(init=False)
+    peak: np.ndarray = field(init=False)
+    prev_peak: np.ndarray = field(init=False)
+    prev_len: np.ndarray = field(init=False)
+    released: np.ndarray = field(init=False)
+    lead_ticks: np.ndarray = field(init=False)
+    leads: list = field(init=False)
+    _on: np.ndarray = field(init=False)
+    _off: np.ndarray = field(init=False)
+    _last: np.ndarray = field(init=False)
+
+    def __post_init__(self):
+        if self.peak_mode not in ("current", "prev"):
+            raise ValueError(f"peak_mode must be 'current' or 'prev', got {self.peak_mode!r}")
+        if not 0.0 <= self.frac < 1.0:
+            raise ValueError(f"frac must be in [0, 1), got {self.frac}")
+        if self.frac == 0.0 and self.clock_lead <= 0 and self.rate_frac <= 0.0:
+            raise ValueError("every test is disabled (frac = rate_frac = clock_lead = 0); "
+                             "the OFF switch is `SimSensorReader(early_release=0.0)`")
+        n = self.n_points
+        self.k = np.zeros(n, dtype=int)
+        self.peak = np.zeros(n)
+        self.prev_peak = np.zeros(n)
+        self.prev_len = np.zeros(n, dtype=int)
+        # Unloaded is unambiguously not planted, so the initial state is released.
+        self.released = np.ones(n)
+        self.lead_ticks = np.zeros(n, dtype=int)
+        # One entry per completed stance: the LEAD, i.e. the length of the released run
+        # that ended at liftoff. Not "the first release tick in the stance" -- a release
+        # that fires and then re-tightens is worth nothing, because the anchor has to be
+        # loose AT the moment the liftoff residual arrives, and the two metrics disagree
+        # by 10-20 percentage points of miss rate on real data.
+        self.leads = []
+        self._on = np.zeros(n, dtype=bool)
+        self._off = np.full(n, self.off_dwell + 1, dtype=int)
+        self._last = np.zeros(n)
+
+    def update(self, load: np.ndarray) -> np.ndarray:
+        """Advance one tick on the per-point load; return the release mask (1 = loose).
+
+        `load` must be UNCLIPPED -- a peak reference taken from a signal clipped at 1.0
+        is not a peak, and at N=4 a fully-loaded toe reads ~1.0 (see `point_loads`).
+        """
+        f = np.asarray(load, float)
+        raw_on = f > 0.0
+        # Coalesce sub-`off_dwell` gaps in the load: a stance is still in progress until the
+        # load has been absent for `off_dwell` consecutive ticks (see the field docstring).
+        self._off = np.where(raw_on, 0, self._off + 1)
+        on = raw_on | (self._on & (self._off <= self.off_dwell))
+        fresh = on & ~self._on
+        # Read BEFORE `k` is advanced: at the first unloaded tick `self.k` still holds the
+        # last loaded index, so the stance length is `k + 1`.
+        ending = self._on & ~on
+        for c in np.flatnonzero(ending):
+            self.leads.append(int(self.lead_ticks[c]))
+        self.prev_len = np.where(ending, self.k + 1, self.prev_len)
+
+        # A new stance retires the old peak into `prev_peak` and restarts the counter.
+        self.prev_peak = np.where(fresh & (self.peak > 0.0), self.peak, self.prev_peak)
+        self.k = np.where(fresh, 0, np.where(on, self.k + 1, 0))
+        self.peak = np.where(fresh, 0.0, self.peak)
+        self.released = np.where(fresh, 0.0, self.released)
+
+        past = on & (self.k >= self.blank_ticks)
+        self.peak = np.where(past, np.maximum(self.peak, f), self.peak)
+
+        if self.peak_mode == "prev":
+            # Use the previous stance where there is one; otherwise the running peak,
+            # which is `"current"` behaviour and keeps the blanking guard.
+            have = self.prev_peak > 0.0
+            ref = np.where(have, self.prev_peak, self.peak)
+            armed = on & (have | past)
+        else:
+            ref, armed = self.peak, past
+        ref = np.maximum(ref, 1e-9)
+
+        rel = armed & (f < self.frac * ref)
+        if self.rate_frac > 0.0:
+            drop = (self._last - f) / self.dt
+            rel |= armed & (drop > self.rate_frac * ref)
+        if self.clock_lead > 0:
+            # The stance clock. Needs a completed stance for this point; until then the
+            # level test is the only thing armed.
+            rel |= on & (self.prev_len > 0) & (self.k >= self.prev_len - self.clock_lead)
+
+        self.released = np.where(on, np.maximum(self.released, rel.astype(float)), 1.0)
+        # Ticks this point has been released while still carrying load -- the LEAD, which
+        # is the quantity the theory note says matters, and it is per-liftoff rather than
+        # a median. Reads 0 in swing and at a fresh touchdown.
+        self.lead_ticks = np.where(on & (self.released > 0.0), self.lead_ticks + 1, 0)
+        self._on, self._last = on, f
+        return self.released.copy()
+
+
 def _contact_site_names(fused) -> tuple[str, ...]:
     """The estimator's InEKF contact-site names, in slot order.
 
@@ -200,12 +399,33 @@ class SimSensorReader:
         stance_chol: float = 1.0e-4,
         swing_chol: float = 1.0e1,
         sole_centre_x: float = 0.197 / 2.0 - 0.052,
+        early_release: float = 0.0,
+        early_release_blank: int = 150,
+        early_release_mode: str = "current",
+        early_release_source: str = "point",
+        early_release_rate: float = 0.0,
+        early_release_lead: int = 0,
+        early_release_off_dwell: int = 0,
     ):
         self.m = m
         self.fused = fused
         self.noise = noise
         self.stance_chol = stance_chol
         self.swing_chol = swing_chol
+        # `early_release = 0.0` is OFF, and OFF is the default deliberately: every number
+        # on record was produced without it, so leaving it off keeps a run comparable
+        # with them. See `EarlyRelease` for what it does and why.
+        self.early_release_frac = float(early_release)
+        self.early_release_blank = int(early_release_blank)
+        self.early_release_mode = str(early_release_mode)
+        self.early_release_rate = float(early_release_rate)
+        self.early_release_lead = int(early_release_lead)
+        self.early_release_off_dwell = int(early_release_off_dwell)
+        if early_release_source not in ("point", "foot"):
+            raise ValueError("early_release_source must be 'point' or 'foot', got "
+                             f"{early_release_source!r}")
+        self.early_release_source = early_release_source
+        self.release = None
 
         build = fused.build
         self.imu_names = tuple(build.imu_names)
@@ -291,14 +511,26 @@ class SimSensorReader:
                     f"{self.n_points} sites collapsed to {len(self.point_slot)} slots")
             self.point_trust = ContactTrust(n_feet=self.n_points, dt=dt)
 
+        if self.early_release_frac > 0.0 or self.early_release_lead > 0:
+            self.release = EarlyRelease(
+                n_points=self.n_points, dt=dt, frac=self.early_release_frac,
+                blank_ticks=self.early_release_blank, peak_mode=self.early_release_mode,
+                rate_frac=self.early_release_rate, clock_lead=self.early_release_lead,
+                off_dwell=self.early_release_off_dwell)
+
         # -- ground truth, for scoring ---------------------------------------
         self.base_bid = sid("PELVIS_LINK", mujoco.mjtObj.mjOBJ_BODY)
         self.base_site = sid("base_body", mujoco.mjtObj.mjOBJ_SITE)
 
     # -- pieces ------------------------------------------------------------
 
-    def foot_loads(self, d: mujoco.MjData) -> np.ndarray:
-        """Normalised per-foot normal load, `f_n / (0.5·m·g)`, clipped to [0, 1]."""
+    def foot_loads_raw(self, d: mujoco.MjData) -> np.ndarray:
+        """Normalised per-foot normal load, `f_n / (0.5·m·g)`, **unclipped**.
+
+        `EarlyRelease` needs the unclipped signal: its reference is the stance PEAK, and
+        a peak read off a signal clipped at 1.0 is not a peak. `foot_loads` clips, because
+        `ContactTrust` wants a probability.
+        """
         f = np.zeros(len(self.foot_gids))
         frc = np.zeros(6)
         for i in range(d.ncon):
@@ -307,10 +539,14 @@ class SimSensorReader:
                 if c.geom1 == gid or c.geom2 == gid:
                     mujoco.mj_contactForce(self.m, d, i, frc)
                     f[k] += abs(frc[0])
-        return np.clip(f / (0.5 * self.weight), 0.0, 1.0)
+        return f / (0.5 * self.weight)
 
-    def point_loads(self, d: mujoco.MjData) -> np.ndarray:
-        r"""Normalised load per CONTACT POINT, ``(N,)``, heel/toe split fore-aft.
+    def foot_loads(self, d: mujoco.MjData) -> np.ndarray:
+        """Normalised per-foot normal load, `f_n / (0.5·m·g)`, clipped to [0, 1]."""
+        return np.clip(self.foot_loads_raw(d), 0.0, 1.0)
+
+    def point_loads_raw(self, d: mujoco.MjData) -> np.ndarray:
+        r"""Normalised load per CONTACT POINT, ``(N,)``, heel/toe split fore-aft, unclipped.
 
         Only meaningful when the estimator was built with more contact points than
         feet (`build_fused_estimator(contact_sites=...)`); `read` falls back to
@@ -350,7 +586,11 @@ class SimSensorReader:
                 continue
             mujoco.mj_contactForce(self.m, d, i, frc)
             f[j] += abs(frc[0])
-        return np.clip(f / (0.5 * self.weight), 0.0, 1.0)
+        return f / (0.5 * self.weight)
+
+    def point_loads(self, d: mujoco.MjData) -> np.ndarray:
+        """`point_loads_raw` clipped to [0, 1] -- what `ContactTrust` consumes."""
+        return np.clip(self.point_loads_raw(d), 0.0, 1.0)
 
     def read(self, d: mujoco.MjData):
         """One `FusedSensors` (NumPy leaves) from the current `MjData`."""
@@ -381,16 +621,24 @@ class SimSensorReader:
         # `contact` feeds the joint KF's K stance anchors (one per foot);
         # `contact_chol` feeds the InEKF's N contact points. They are the same
         # thing only when N == K -- see `build_fused_estimator(contact_sites=...)`.
-        trusted = self.trust.update(self.foot_loads(d))
+        raw_foot = self.foot_loads_raw(d)
+        trusted = self.trust.update(np.clip(raw_foot, 0.0, 1.0))
         if self.point_trust is None:
-            point_trusted = trusted
+            point_trusted, raw_point = trusted, raw_foot
         else:
-            point_trusted = self.point_trust.update(self.point_loads(d))
+            raw_point = self.point_loads_raw(d)
+            point_trusted = self.point_trust.update(np.clip(raw_point, 0.0, 1.0))
         # The InEKF has NO contact mask: contact condition rides ENTIRELY in
         # Sigma_C (`inEKF/filter.py`, the DECISION note). A swing foot therefore
         # needs a LARGE factor here, or the filter keeps believing it is planted.
-        chol = np.where(point_trusted[:, None, None] > 0.0,
-                        self.stance_chol, self.swing_chol)
+        loose = point_trusted <= 0.0
+        if self.release is not None:
+            # ONLY ever loosens (`EarlyRelease`): OR with the heuristic's swing state, so
+            # this can move liftoff earlier and can never move touchdown earlier.
+            src = raw_point if self.early_release_source == "point" else \
+                np.repeat(raw_foot, self.n_points // len(raw_foot))
+            loose = loose | (self.release.update(src) > 0.0)
+        chol = np.where(loose[:, None, None], self.swing_chol, self.stance_chol)
         return FusedSensors(
             encoders=enc,
             gyros=gyros,

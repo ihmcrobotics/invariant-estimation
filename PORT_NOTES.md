@@ -4123,3 +4123,429 @@ options differ in what they keep catching. Ranked:
    present situation.
 
 Until then the suite is **780 passed, 1 failed** on this one test.
+
+---
+
+## The touchdown re-seed, implemented — and measured to be a null in THIS filter (2026-07-30)
+
+`inEKF/reseed.py` lands `reseedContact` and `TouchdownReseedLatch`, closing the
+last deferred item from `DESIGN_DECISIONS.md` §3. Both Java test classes are
+ported (`tests/inEKF/test_reseed.py`, 16 tests): the PSD property over 50 trials,
+the two exact congruence identities, zero release, the seven latch behaviours
+including the 200k-tick chatter property, and two port-specific oracles (the
+`fire = 0` identity congruence, and jaxpr equality across fire patterns for I7).
+
+**It is OFF by default** (`InvariantEKF.reseed is None`), so it is absent from the
+traced graph unless asked for and every number on record stays comparable.
+
+### The result: it does nothing here, and the mechanism is measured
+
+| | yaw tail | tilt tail | v err rms | p err rms | dz rate |
+|---|---|---|---|---|---|
+| N=4 analytic | 0.384° | 0.304° | 0.0293 | 0.3830 | −0.01540 m/s |
+| N=4 analytic + re-seed | 0.380° | 0.304° | 0.0293 | 0.3817 | −0.01533 m/s |
+
+30 s closed loop, `vx = 0.4`, `--imu-noise --noise-seed 0`, tail = last third.
+Every metric moves by under 1%.
+
+**Why**, and this is the part worth keeping: over 10 s of `data/dr5/flat_seed000`
+the pre-re-seed anchor discrepancy **at the ticks the latch fires** is
+
+    mean 0.4 mm    p50 0.2 mm    p90 0.9 mm    max 1.2 mm
+
+There is nothing to re-anchor. The cause is structural: **this InEKF never
+releases a contact.** It runs the FK update on all `N` contacts every tick with no
+per-foot gate — contact condition rides entirely in the process `Σ_C` (the
+DECISION note in `inEKF/filter.py`) — so the inflated swing-phase `Σ_C` lets each
+anchor track its own foot continuously and it is already within a millimetre of
+the new foothold by touchdown. The stale-anchor problem a re-seed exists to solve
+has already been solved by the process-noise mechanism.
+
+This independently reproduces the hardware finding behind the original 2026-07-21
+deferral, and upgrades it from "no measurable difference" to "no difference, for
+this reason".
+
+**Corollary:** the re-seed would matter in a filter that *did* gate its contact
+update per foot. If the gating decision is ever revisited, revisit this with it.
+
+**Do not read this as an observability result.** Global `x`, `y` and yaw are
+unobservable in a proprioceptive InEKF and remain so with the re-seed on — `P0`'s
+`diag(R) = [7.1e-5, 7.1e-5, 1.0]` is the filter reporting exactly that. A re-seed
+can only change the *rate* at which the unobservable directions drift, and here it
+does not measurably change even that. The latch itself is healthy: on recorded
+trust it fires 69 times per foot over 62 s, one per stride.
+
+### Adaptations from the Java suite
+
+* Java's `reseedContact(i, y, N)` mutates and returns a scalar residual norm. The
+  port is pure and re-seeds every slot at once under a float mask, so it returns
+  the per-contact residual **vector**; `norm(pre_residual[i])` is Java's value.
+* The introspection getters are already `UpdateDiagnostics`, so zero release reads
+  fields rather than calling `wasLastUpdateApplied()` etc.
+* `TouchdownReseedLatchTest.atMostOneFirePerSustainedLowEpisodeUnderRandomChatter`
+  is **vacuous on half its claim** and is ported anyway with that recorded: arming
+  needs 100 consecutive draws below 0.1, which i.i.d. `nextDouble()` never
+  produces, so the Java test only ever exercised "never fires without credit". A
+  second test (`test_one_fire_per_episode_on_a_gait_like_stream`) supplies episodes
+  that actually complete and checks the "at most one" half against the cycle count.
+* No explicit rising-edge test: arming requires `p < rearm` on the arming tick, so
+  any later fire is a rising crossing by construction. A stored `p_prev` could only
+  ever agree.
+
+---
+
+## `command.mode: hollow` — the command deadband was eating the dataset (2026-07-30)
+
+`data/dr4` looks command-randomised and is not, on two of three axes. Measured
+over its 744 000 walking ticks, against the policy's tracking deadband
+(`run_policy.WALK_MIN_*` = 0.30 / 0.28 / 0.60):
+
+| axis | range asked for | frac of ticks the policy actually tracks |
+|---|---|---|
+| vx | [−0.5, 0.8] | 62% |
+| vy | [−0.35, 0.35] | **19%** |
+| yaw | [−0.8, 0.8] | **13%** |
+
+`vy` and `yaw_rate` barely clear their deadbands, so four fifths of the lateral
+command and seven eighths of the yaw command are draws that leave the robot
+standing. The set is forward-dominated however wide the nominal ranges read.
+
+**Why it matters to the objective, not just to realism.** `l2_velocity` compares
+body-frame velocities, so an attitude error enters as
+
+    || R_est^T v_est − R_true^T v_true ||  ≈  || δφ × b ||,    b = R^T v
+
+and the cross product annihilates the component of `δφ` **along the body
+velocity**. With `b ≈ (0.4, 0, 0)` the loss is blind to roll error outright and
+weights pitch/yaw by only 0.4 m/s.
+
+`command.mode: hollow` (`config/collect_dr5.yaml`) draws each axis as *either
+exactly zero* or a sign-balanced magnitude whose floor **is** that axis's
+deadband and whose ceiling is the policy's trained band. Realised in `data/dr5`:
+
+| | dr4 (uniform) | dr5 (hollow) |
+|---|---|---|
+| lateral cmd tracked | 19.5% | **64.4%** |
+| yaw cmd tracked | 12.6% | **51.9%** |
+| achieved mean \|yaw rate\| | 0.382 | **0.627** rad/s |
+| achieved mean \|v_y\| | 0.187 | **0.264** m/s |
+| ticks below 0.2 m/s | 16.8% | **7.5%** |
+| tilt_max across rollouts | 5.2–8.0° | 6.6–9.6° |
+
+12/12 rollouts, zero falls. The dead-time trim also acts on the dr4 post-mortem's
+top recommendation (low-speed mass destabilises `alpha_sweep` at small B).
+
+**One thing that did NOT change, stated so it is not over-claimed.** The
+*direction* entropy of the body-velocity vector is 0.923 → 0.924 — `dr4` was
+already near-isotropic in heading, because pushes and terrain produce lateral
+motion even under a forward command. What `dr5` adds is **magnitude** on the
+lateral and yaw axes and less dead time, not new directions. The `δφ × b`
+argument above is about direction; by that measure the gain is smaller than the
+command-coverage table suggests, and the honest mechanism is the larger `|b|`
+weighting on all three rotational axes plus far more excited yaw.
+
+**The half this does NOT address.** A training window is `L=128, H=50` → 0.392 s,
+seeded from truth at its start. A 20 s closed-loop yaw drift is very nearly
+constant inside it, so the loss sees ~`0.4 · δψ` of it and cannot see the
+accumulation at all. Command diversity fixes *axis coverage*; it does not fix
+*horizon*. `beta_nll`'s `logdet` term is charged per update and is
+horizon-independent, which is why it remains the structural candidate.
+
+**Backward compatibility is a regression test, not a claim.**
+`tests/sim/test_collect_dr.py::test_uniform_mode_reproduces_the_shipped_datasets_exactly`
+replays each shipped rollout's own recorded `dr` config through today's sampler —
+in `collect_rollout`'s RNG order, friction draw included — and requires the
+realised `cmd_schedule` to match `data/dr/flat_seed000` and `data/dr4/flat_seed000`
+exactly. Runs 4-6 stay reproducible or that test fails.
+
+---
+
+## The anchor early release, live — and the load SOURCE is the whole result (2026-07-31)
+
+`docs/theory/anchor_release_timing.md` derives the vertical sink and states the fix as a *timing*
+problem: at end of stance the foot unloads and rolls while `ContactTrust` still says "planted", so
+`ν_z` turns positive while the apportionment `f` is still at its tight stance value and the
+velocity gain is 2584x its swing value. `sim/sensors.EarlyRelease` is the live, causal
+implementation — a per-point state machine that latches a release when the load falls to `frac` of
+its own post-impact stance peak. `run_estimator.py --early-release`, default OFF.
+
+### Per-FOOT, not per-contact. 1.81x versus nothing.
+
+Closed loop, 30 s at `vx = 0.6`, `--imu-noise`, seed 0, `--toe-heel`, no ContactNet:
+
+| arm | final `dz` [m] | tail mean | vel rms [m/s] | tilt tail [deg] |
+|---|---|---|---|---|
+| analytic baseline | −0.5673 | −0.4234 | 0.0347 | 0.2398 |
+| frac 0.5, per-**contact** load | −0.5856 | −0.4363 | 0.0348 | 0.2541 |
+| frac 0.3 / 0.7, per-contact | −0.5577 / −0.6061 | | | |
+| blank 75 / 250 | −0.5796 / −0.5666 | | | |
+| `peak_mode=prev`, per-contact | −0.5335 | −0.3954 | 0.0332 | |
+| **frac 0.5, per-FOOT load** | **−0.3127** | **−0.2342** | **0.0299** | **0.1601** |
+| frac 0.3 / 0.7, per-foot | −0.4929 / −0.3429 | | | |
+
+The offline arm E' used the per-foot total repeated to both contacts; the live port defaulted to
+the finer per-contact load and measured **nothing**. The mechanism: at N=4 the toe carries the
+load through the whole end of stance, so *its own* running peak is late and `frac·peak` is reached
+only at the last tick. The foot's total starts falling as soon as the foot unloads, and releasing
+on it loosens **both** of that foot's anchors together. Splitting the load per point splits the
+peak reference with it and destroys the anticipation. Both sources are kept behind
+`--early-release-source`.
+
+### Arm B is not a physical predictor, and no causal signal can reproduce it
+
+Measured on `data/dr5`, using the **trailing** lead (the released run that *ends* at liftoff — a
+release that fires and re-tightens is worth nothing, and the "first release tick" metric hides
+that by 10–20 percentage points):
+
+| arm | lead p50 [ticks] | std | zero-lead % | loose % of stance |
+|---|---|---|---|---|
+| B (non-causal oracle, 100) | 100 | 23 | **0.7** | 24.2 |
+| level f0.5 latch, current peak (arm E') | 3 | 202 | 41.8 | 19.0 |
+| level f0.7 latch, current peak | 21 | 236 | 31.4 | 32.3 |
+| **true contact speed > 0.02 m/s** (a *perfect* sensor) | 23 | 50 | **22.3** | 29.5 |
+
+The binding quantity is the **zero-lead fraction**, not the median. Every load-threshold predictor
+misses 31–50 % of liftoffs, and so does a perfect contact-motion sensor at the same loose
+fraction. Arm B's lead is not in the load or in the contact's motion at that instant — it is in
+the **gait plan**. So arm B is a covariance-conditioning schedule, not a predictor being
+approximated, and the theory note's "a threshold on load *level* is structurally late" is true but
+understated: rate, ratio-to-peak and tangential velocity are all late too.
+
+`--early-release-lead` implements the obvious consequence — a stance clock, `prev_len − lead` —
+and it **fails**: −5.39 m closed loop at lead 100, because stance duration varies enough that a
+short stance is released from tick 0. Recorded so it is not tried again in this form.
+
+### `EarlyRelease.off_dwell`, and a measurement worth keeping
+
+At `off_dwell = 0` a 30 s walk reports **306 "liftoffs"** on two feet against a real cadence near
+2 steps/s: the per-foot normal load momentarily reads zero mid-stance, so one stance fragments
+into several episodes and every fragment resets the peak reference *and* clears the latch.
+`off_dwell` requires N consecutive unloaded ticks to end a stance — asymmetric in the opposite
+direction to `ContactTrust`, which debounces the *entry*.
+
+Tests: `tests/sim/test_early_release.py`, 28 cases. The load-bearing one asserts **bit equality
+with `experiments.process_socket_ablation.causal_early_release`** over
+`frac × blank ∈ {0.3,0.5,0.7,0.85} × {0,50,150}` — a live port that merely behaved similarly would
+make every recorded arm-E' number uncomparable and nothing would raise. Nine mutants killed.
+
+---
+
+## `v_bc` is noise below 0.2 m/s — which is where slip lives (2026-07-31)
+
+`features.make_contact_channels` builds the contact-velocity channel as a **causal first
+difference of FK(q) at 1 kHz** on noisy encoders, deliberately (`features.py:335`: "not J q̇, which
+would reintroduce the joint-KF coupling this feature set exists to avoid"). Differentiating white
+encoder noise at 1 ms amplifies it by `√2/dt = 1414`.
+
+Measured (`experiments/contact_velocity.py`; the noise is estimated from the second difference,
+`σ_ε = std(d²p)/√6`, not assumed), median over the 12 `data/dr5` rollouts:
+
+| quantity | value |
+|---|---|
+| FK position noise `σ_p` | 1.44e-4 m |
+| effective FK gain `‖J‖_eff` | 0.720 m/rad |
+| **`v_bc` noise as built** | **0.204 m/s** |
+| `v_bc` noise as analytic `J_C q̇` (σ_q̇ = 5e-3 rad/s) | 0.0036 m/s |
+| ratio | **57x** |
+
+And the true world contact-point speed (`p_C = p_true + R_true·y_fk`, 20-tick secant, 6 rollouts):
+
+| regime | p50 | p90 |
+|---|---|---|
+| loaded (`contact_fn > 0`) | **0.0173** | 0.325 |
+| unloaded (swing) | 1.834 | 3.063 |
+
+**86.2 % of loaded ticks are below the noise floor; swing is 9x above it.** The channel therefore
+carries exactly one reliable bit — swinging or not — which is a stride-phase clock expressed as a
+feature. That closes the loop on the run-2-onwards finding that the learned `Σ_C` is a phase
+clock, and it is confirmed from the other side by the channel ablation: **dropping `v_bc`
+entirely costs 0.002 of slip-prediction R²** (0.359 → 0.356), while torque alone scores 0.320.
+
+The fix (an analytic `J_C(q) q̇`) is a CLAUDE.md §7 change but needs **no re-collection**:
+`truth.q_dot` (9 filtered joints) and `sensors.qd_unfiltered` (4 ankles, already corrupted) are
+both recorded, so a measured `q̇` can be reconstructed offline and the analytic `v_bc` built in the
+`cache` stage. `FusedSensors` carries no measured `q̇` for the filtered joints today — using the
+joint KF's `q̇̂` would break §7 — so a raw measured-velocity sensor field has to be added.
+
+---
+
+## `mu` was never stratified, and that is a sampling defect not a range defect (2026-07-31)
+
+`DomainRandomization.friction` draws `mu` i.i.d. from a stream keyed on the **seed alone**;
+`friction_range_by_terrain` changes only the *range*, so the same underlying uniform is reused
+across terrains. Measured on `dr5`: `mu ∈ {1.179, 1.089, 0.447, 1.181, 1.100, 0.522}` — **6
+distinct values over 12 rollouts, eight of them above 1.0, and nothing in the 0.20–0.35 band where
+slip is 26–44 %.** A dataset meant to teach a network about slip contains almost none.
+
+`friction_grid` / `friction_grid_by_terrain` put `mu` on a deterministic per-terrain grid indexed
+by seed. The uniform draw is **still consumed**, so the push and command schedules are unchanged
+and `dr6 − dr5` is exactly the friction change. `config/collect_dr6.yaml` spends the low end only
+where the robot survives it (`hard_stepping` FELL at 0.20, so it is floored at 0.30): 8 distinct
+`mu`, 5 of 12 rollouts at ≤0.35.
+
+`tests/sim/test_collect_dr.py` gains five cases, including one that asserts **the defect** against
+the shipped data (≤6 distinct `mu`, none below 0.44, and the replayed value equal to
+`flat_seed000`'s recorded `friction_mu` to 1e-12) so the fix cannot be silently reverted, and one
+that requires the push/command stream to be bit-identical with and without a grid.
+
+---
+
+## The slip gate: the features CAN carry slip, the network is not using them (2026-07-31)
+
+`experiments/slip_probe.py`. Predict `truth.slip_sat` on loaded ticks from the cached 24 channels
+(8 causal taps, 384 dims), held out **by rollout** — the honest split, because `mu` is constant
+within a rollout and a random split lets any probe memorise it.
+
+| dataset | by-rollout GBM | mu-free target `\|f_t\|/f_n` | control `contact_fn` |
+|---|---|---|---|
+| dr5 | **+0.359** | +0.392 | +0.035 |
+| dr4 | **+0.318** | +0.359 | +0.165 |
+
+Not zero, and not close to zero. Physically consistent: in stance `tau = J_Cᵀ f`, so `|f_t|/f_n`
+is recoverable from torque and configuration, while `mu` is a DR draw and is not — which is why
+the mu-free target scores *higher*.
+
+Against that, what the trained nets actually learned (R² of `log10 std` on slip vs on gait phase,
+both quantile-binned to 24 bins so the two are comparable):
+
+| net | axis | median std | R² on slip | R² on phase |
+|---|---|---|---|---|
+| run7 / dr5 | x / y / z | 4.9e-2 / 4.6e-2 / 1.1e-1 | 0.065 / 0.010 / 0.008 | **0.490** / 0.041 / 0.100 |
+| run6_w128 / dr4 | x / y / z | 7.4e-2 / 4.9e-2 / 1.5e-1 | 0.070 / 0.009 / 0.011 | **0.386** / 0.031 / 0.063 |
+
+**The information is in the features and the network is not using it.** Note also that run 4's
+434x horizontal/vertical anisotropy (`std_x = 3.85e-4` vs `std_z = 1.67e-1`) does **not** survive
+the move to the process socket: run 6 and run 7 sit at 2.1x and 2.2x.
+
+### The CoCo Figure-3 analogue, and the dynamic range
+
+`√tr(Σ_C)` against **true** contact-point speed: corr **+0.744** (run 7) and **+0.746** (run 6) —
+the same qualitative claim CoCo §V-A1 makes. But the regime split shows where it comes from:
+
+| net | planted (<0.05 m/s) | creeping (0.05–0.30) | swinging (>0.30) |
+|---|---|---|---|
+| run7 | 0.134 | 0.164 | 0.322 |
+| run6_w128 | 0.176 | 0.208 | 0.393 |
+
+**1.2x across the band where slip lives, and a total range of 2.4x where the analytic heuristic
+spans 1e5** (chol 1e-4 stance → 1e1 swing). The learned `Σ_C` is 1300x looser than the heuristic
+in stance and 31x tighter in swing — very nearly arm I, which was measured catastrophic. That is
+the mechanism behind run 7 sinking 2.6x worse than the analytic filter (−0.0347 vs −0.0134 m/s).
+
+### Horizontal drift is not our problem
+
+`experiments/slip_attribution.py`, read-only over the 12 `dr5` rollouts (`aux.est_p` is the
+estimator's own output during collection). Between rollouts `corr(slip fraction, drift rate) =
++0.508` (n = 12, and one low-`mu` rollout drifts −0.023 m while another drifts +0.172 m). **Within
+rollouts, over 276 windows of 2 s, `corr = +0.028`** — slip does not predict where the drift
+happens. And the magnitudes settle it: horizontal drift is **0.01–0.47 % of distance travelled**
+against a **−0.567 m** vertical error over 30 s closed loop.
+
+### The stance was fragmenting, and `off_dwell` is the rest of the result
+
+Adding a per-liftoff lead diagnostic to `run_estimator.py` exposed it in one line: a 30 s walk
+reported **306 "liftoffs" on two feet** against a real cadence near 2 steps/s. The per-foot normal
+load momentarily reads zero mid-stance, so one stance fragments into several episodes and every
+fragment resets the peak reference *and* clears the latch.
+
+| arm | final `dz` [m] | tilt tail [deg] | vel rms | liftoffs/30 s | zero-lead % | lead p50 ± std |
+|---|---|---|---|---|---|---|
+| analytic baseline | −0.5673 | 0.2398 | 0.0347 | — | — | — |
+| per-foot, `off_dwell = 0` | −0.3127 | 0.1601 | 0.0299 | 306 | — | — |
+| per-foot, `off_dwell = 5 / 20 / 50` | **−0.2529** | **0.1492** | **0.0294** | 130 / **116** / 116 | 10.8 / **0.0** / 0.0 | 142±45 / **159±11** / 189±11 |
+| + stance clock, lead 60 / 100 | −0.2556 / −0.2557 | — | — | 116 | 0.0 | 158±19 / 158±23 |
+
+**2.24x on the sink, and a lead of 159 ± 11 ticks with a 0.0 % miss rate** — arm B's profile,
+causally. `off_dwell ∈ {5,20,50}` give identical filter output (a 6–20-tick gap is a genuinely
+unloaded foot, so the heuristic's swing state already loosens `Σ_C` through the OR); what
+`≥ 5` fixes is the **1–5-tick dropouts, which happen while loaded**. `20` is preferred because it
+also makes the lead statistic read correctly. The turning walk (`vx 0.4, yaw 0.8`) goes −0.3909 →
+−0.1613, **2.42x**. Yaw (3.41° → 3.00°) and horizontal drift (0.04 m both) are unchanged, which is
+what the theory predicts: the schedule reapportions a *vertical* residual and nothing else.
+
+Once the fragmentation is fixed the stance clock is **redundant**, not harmful — the level test
+already fires 159 ticks before liftoff. Its earlier −5.39 m was entirely the fragmentation:
+with ~100-tick episodes, `prev_len − lead ≤ 0` for any lead ≥ 100, so it fired at `k = 0` and
+became arm I.
+
+### Correction to the above: the information is not absent, it is only badly presented
+
+"The features cannot represent contact motion" is the satisfying version and it does not survive
+checking. The window carries `p_bc` at 50 taps 8 ticks apart over 392 ms, and a **difference
+across taps is a linear function of the flattened window** — representable by the first dense
+layer. Measured noise of a `W`-tick secant of the recorded `p_bc` (same second-difference
+estimator):
+
+| W [ticks] | σ_v [m/s] | SNR vs the 0.0173 m/s median loaded contact speed |
+|---|---|---|
+| 1 (= `v_bc` as built) | 0.2037 | **0.08** |
+| 8 (one tap spacing) | 0.0255 | 0.68 |
+| 40 | 0.0051 | 3.40 |
+| **56** | **0.0036** | 4.76 |
+| 392 (whole window) | 0.0005 | 33.3 |
+| **analytic `J_C q̇`** | **0.0036** | **4.81** |
+
+A **56 ms secant of `p_bc` matches the analytic channel exactly.** So the correct claim is:
+
+* the **instantaneous** `v_bc` channel is worthless as given (SNR 0.08; deleting it costs 0.002 of
+  slip R²) — that stands;
+* the information is recoverable from `p_bc`, but only by trading temporal resolution for noise —
+  56 ms of smoothing against a 159-tick liftoff lead, so a third of the event is smeared;
+* and it must be discovered as a fine cancellation between two large *standardised* numbers
+  (`normalize.apply` scales each channel by its own std) through a BPTT gradient that only rewards
+  body-velocity error 128 ms downstream.
+
+The case for the analytic `J_C q̇` is therefore **"hand it the quantity at full bandwidth"**, not
+"the information is absent". Recorded because the strong version is the one that would have been
+repeated.
+
+---
+
+## Run 8 — a slip-stratified dataset does NOT teach the network about slip (2026-07-31)
+
+`data/dr6` (`config/collect_dr6.yaml`, mu on a per-terrain grid), trained with run 7's exact
+settings: `l2_velocity`, widths 128 64, B=32, L=128, 10 000 steps, `sigma_0 = 1e-1`.
+`artifacts/run8_pipeline.sh`, log in `artifacts/run8/`.
+
+**The dataset is what was asked for.** Pooled slip fraction **19.0 %**, per rollout 9.4–33.8 %,
+mu 0.30–0.80 over 8 distinct values. dr5 was 6.2–20.8 % per rollout with **eight of twelve
+rollouts above mu = 1.0**. Three rollouts were lost: `flat/seed0` and `waves/seed0` at mu = 0.20
+fell at 46 s and 52 s, `hard_stepping/seed0` at 0.30 fell at 25 s. **The 8 s feasibility
+measurement the grid was built on was optimistic — mu = 0.20 does not survive 60 s with 400 N
+pushes, even on flat.** Floor flat/waves at 0.25–0.30 next time.
+
+**Gates:** `alpha_sweep` at B=32 PASSES (interior optimum at α = 2.154e3, index 11 of 12, the same
+shape run 7 had). `phase_lock` data-side R² 0.119 against dr5's 0.168 and dr4's 0.144.
+
+### The result
+
+| | run 7 (dr5) | run 8 (dr6) |
+|---|---|---|
+| R² of `log10 std_{x,y,z}` on **slip** | 0.065 / 0.010 / 0.008 | 0.062 / 0.017 / 0.017 |
+| the same on **gait phase** | 0.490 / 0.041 / 0.100 | **0.509 / 0.105 / 0.271** |
+| Figure-3 corr(log10 √tr Σ, contact speed) | +0.744 | **+0.257** |
+| planted / creeping / swinging median √tr Σ | 0.134 / 0.164 / 0.322 | **0.288 / 0.241 / 0.308** |
+
+Slip R² did not move. Phase lock got **worse** on every axis. The contact-speed correlation
+collapsed and the regime medians went **non-monotone** — the covariance is now *lower* while the
+foot creeps (0.241) than while it is planted (0.288), and the total dynamic range is 1.28x against
+the heuristic's 1e5.
+
+Replay: in sample the classic L2 trade (`vel_rms` 0.0774 → 0.0540, `pos_rms` 0.132 → 0.175);
+**held out on `data/control4` it is worse at everything including `vel_rms` (0.0290 → 0.0390,
+1.35x)**, which is `replay_eval`'s own hard-coded failure verdict. Closed loop at `vx = 0.6`:
+`dz` −50.5 cm against the analytic −56.7 cm and run 7's −114.8 cm — 2.3x better than run 7, still
+worse than no network on tilt (0.38° vs 0.24°), and far behind the −25.3 cm the early-release
+schedule buys with no training at all.
+
+### Why, and what it retires
+
+**The data-side phase-lock number predicted this and should have been read earlier.** Recorded
+cone saturation has been ~0.12–0.17 R² on phase for *every* dataset — dr4, dr5 and dr6 alike. The
+slip variation was always there and always decorrelated from stride phase. What is phase-locked is
+the **network's output** (model-side 0.39–0.49). More slip in the data changes its *magnitude*,
+not its *visibility* to the network.
+
+This retires "more/harder contact data is the lever" for this architecture, and leaves the feature
+presentation (`v_bc`, above) as the ranked-first item. It does **not** retire the `mu`
+stratification itself, which is a real fix to a real sampling defect and should stay.

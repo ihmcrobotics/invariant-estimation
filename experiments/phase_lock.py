@@ -161,8 +161,18 @@ def model_side(paths: list[Path], checkpoint: str, cache_dir: Path,
         L = fwd(flat)
         S = np.asarray(jnp.einsum("...ij,...kj->...ik", L, L))
         sd = np.sqrt(np.diagonal(S, axis1=-2, axis2=-1))
+        ph = gait_phase(trust)[starts]
+        # `trust` is per FOOT (K), `sd` is per CONTACT (N). At N=4 (toe/heel) they differ and
+        # the two would be pooled against each other misaligned -- or crash on the ravel. The
+        # contact ordering is foot-major (`main_estimator.TOE_HEEL_SITES`: left heel, left toe,
+        # right heel, right toe), so contact 2f+s belongs to foot f and `repeat` is the correct
+        # expansion -- the same one `inEKF.reseed.expand_per_foot` does.
+        if sd.shape[1] != ph.shape[1]:
+            if sd.shape[1] % ph.shape[1]:
+                raise ValueError(f"cannot map {ph.shape[1]} feet onto {sd.shape[1]} contacts")
+            ph = np.repeat(ph, sd.shape[1] // ph.shape[1], axis=1)
         ys.append(np.log10(sd[..., 2]))
-        phs.append(gait_phase(trust)[starts])
+        phs.append(ph)
     if not ys:
         return float("nan")
     return r2_on_phase(np.concatenate(ys), np.concatenate(phs))
