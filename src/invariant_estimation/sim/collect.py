@@ -20,32 +20,28 @@ Three things here are load-bearing and each has a test in `tests/sim/test_collec
    stream whose samples come in runs of 20 identical values.
 2. **`inekf_inputs` is recorded, never rebuilt.** `FusedOutputs.inekf_inputs` carries
    `joint.sigma_q`, which comes off `jkf_carry.state.P` — `run_fused` keeps only the FINAL
-   carry, so a consumer cannot reconstruct it without duplicating `_boundary`. Recording it is
-   the whole reason the field exists.
+   carry, so a consumer cannot reconstruct it without duplicating `_boundary`.
 3. **The estimator runs OPEN LOOP on a ground-truth-driven sim.** The policy reads `MjData`
-   (plain `run_policy.Loop`); the filter never touches the gait. That is deliberate: the
-   training data must not depend on the filter that ContactNet is about to change, or every
-   retrain shifts its own dataset. `run_estimator.py` is the closed-loop counterpart.
+   (plain `run_policy.Loop`); the filter never touches the gait, or every retrain would shift
+   its own dataset. `run_estimator.py` is the closed-loop counterpart.
 
 Three facts that bite, all measured (see `bias_plateau`, `WARMUP_TICKS` and `__main__ --measure`):
 
 * The gyro-bias state needs a **warm-up**, and until it settles the joint KF's `Σ_q` — hence the
-  InEKF's contact `N = J Σ_q Jᵀ` — is a transient that never occurs on hardware, where the filter
-  has been running for minutes. Every rollout records `meta["warmup_ticks"]`; slice it off.
-  Nothing here silently discards data: the full stream is saved and the discard is metadata.
-* **Two of the eight bias states do not converge to the truth, and that is not this module's
-  bug — but it is what the warm-up number is measuring, so it is recorded here.** On a 62 s flat
-  rollout with a 0.042 rad/s injected bias, six IMUs land within 0.007–0.025 rad/s of their true
-  bias while `left_shin_imu` and `right_shin_imu` settle 0.21 rad/s off, which is 97% of the
-  whole-vector error and all of the slow tail after ~16 s. The BASE IMU — the only bias the InEKF
-  consumes (I1) — converges to 0.007 rad/s (0.4 deg/s), and `Σ_q` itself plateaus in 3.2 s, so
-  the collected data is usable; but a shin-bias state absorbing 5x the injected bias is a joint-KF
-  observability question worth someone's attention, not a settled one.
+  InEKF's contact `N = J Σ_q Jᵀ` — is a transient that never occurs on hardware. Every rollout
+  records `meta["warmup_ticks"]`; slice it off. Nothing is silently discarded: the full stream is
+  saved and the discard is metadata.
+* **Two of the eight bias states do not converge to the truth**, which is not this module's bug
+  but is what the warm-up number measures. On a 62 s flat rollout with a 0.042 rad/s injected
+  bias, six IMUs land within 0.007–0.025 rad/s of their true bias while `left_shin_imu` and
+  `right_shin_imu` settle 0.21 rad/s off — 97% of the whole-vector error and all of the slow tail
+  after ~16 s. The BASE IMU, the only bias the InEKF consumes (I1), converges to 0.007 rad/s
+  (0.4 deg/s), and `Σ_q` plateaus in 3.2 s, so the collected data is usable; a shin-bias state
+  absorbing 5x the injected bias is an open joint-KF observability question.
 * `contact_chol` in the saved inputs is the **sim's contact truth** (stance ⇒ small, swing ⇒
-  large, `SimSensorReader.stance_chol/swing_chol`). It is passed through the fused step untouched
-  and does not influence anything else that is recorded, but a training segment must overwrite it
-  with a constant or the network gets a free ground-truth contact flag
-  (`contactnet.rollout.Segment.inputs`, which says exactly this).
+  large, `SimSensorReader.stance_chol/swing_chol`). It is passed through untouched and influences
+  nothing else recorded, but a training segment must overwrite it with a constant or the network
+  gets a free ground-truth contact flag (`contactnet.rollout.Segment.inputs`).
 
     uv run python -m invariant_estimation.sim.collect --seconds 60 --seeds 0 1 2
     uv run python -m invariant_estimation.sim.collect --measure     # (A) warm-up, (B) throughput
@@ -104,20 +100,15 @@ FIELD_MARGIN = 2.0        # m of hfield that must remain unused at the end of a 
 MAX_TILT_DEG = 15.0
 
 
-# ---------------------------------------------------------------------------
-# Terrain / spawn randomisation
-# ---------------------------------------------------------------------------
-
 def terrain_field(name: str, seed: int = 0) -> np.ndarray:
     """The `(N, N)` elevation field for `name`, re-seeded for rollout `seed`.
 
-    `seed = 0` reproduces the `TERRAINS` registry entry exactly (so a collection run is
-    comparable with the Stage-1 walk that recorded the terrain-is-real numbers).
+    `seed = 0` reproduces the `TERRAINS` registry entry exactly, so a collection run is comparable
+    with the Stage-1 walk that recorded the terrain-is-real numbers.
 
     Only the stone terrains carry an RNG. `flat` has nothing to randomise and `waves` is a fixed
-    sinusoid, so for those two the per-rollout variation comes entirely from the **spawn pose**
-    (a different phase of the wave, a different heading) and the IMU-noise seed — which is worth
-    stating plainly rather than implying four independently-randomised terrain families.
+    sinusoid, so for those two the per-rollout variation comes entirely from the **spawn pose** and
+    the IMU-noise seed — these are not four independently-randomised terrain families.
     """
     if name not in tr.TERRAINS:
         raise KeyError(f"unknown terrain {name!r}; have {list(tr.TERRAINS)}")
@@ -133,19 +124,16 @@ def terrain_field(name: str, seed: int = 0) -> np.ndarray:
 def spawn_pose(seed: int, *, radius: float = SPAWN_RADIUS) -> tuple[float, float, float]:
     """`(x, y, yaw)` for rollout `seed`: a box about the field centre and a free heading.
 
-    The heading matters more than the position: the policy walks +x in its OWN frame, so a random
-    yaw is what makes two rollouts on the same (deterministic) `waves` field traverse different
-    ground rather than the same 24 m twice.
+    The heading matters more than the position — the policy walks +x in its OWN frame, so the
+    random yaw is what makes two rollouts on the same deterministic `waves` field traverse
+    different ground rather than the same 24 m twice.
     """
     r = np.random.default_rng(0xC0FFEE + int(seed))
     x, y = r.uniform(-radius, radius, 2)
     return float(x), float(y), float(r.uniform(-np.pi, np.pi))
 
 
-# ---------------------------------------------------------------------------
-# Domain randomisation (opt-in; `dr=None` reproduces every pre-existing rollout)
-# ---------------------------------------------------------------------------
-
+# Domain randomisation. `dr=None` reproduces every pre-existing rollout, bit for bit.
 DR_CONFIG_PATH = REPO_ROOT / "config" / "collect_dr.yaml"
 
 
@@ -153,12 +141,11 @@ DR_CONFIG_PATH = REPO_ROOT / "config" / "collect_dr.yaml"
 class DomainRandomization:
     """Per-rollout randomisation knobs. Built from `config/collect_dr.yaml`, never from a default.
 
-    Why this exists: the first 12-rollout dataset varied only terrain tilt, and came out
-    contact-wise near-identical (93-96 contact events, stance duty 0.630-0.642 across all 12).
-    A diagnostic then showed 79% of the learned contact covariance was explained by **gait phase
-    alone** — with one gait, "contact quality" and "stride phase" are the same variable, so a
-    stride-phase clock is the most a network can learn from it. The three knobs here each break
-    that identification in a different way:
+    Why: the first 12-rollout dataset varied only terrain tilt and came out contact-wise
+    near-identical (93-96 contact events, stance duty 0.630-0.642 across all 12), and 79% of the
+    learned contact covariance was then explained by **gait phase alone** — with one gait,
+    "contact quality" and "stride phase" are the same variable. The three knobs each break that
+    identification differently:
 
     * `friction` moves *where the contact sits in its cone* without moving the gait clock,
     * `push` perturbs the robot at instants drawn independently of stride phase,
@@ -179,13 +166,11 @@ class DomainRandomization:
     friction_grid_by_terrain: dict = dataclasses.field(default_factory=dict)
     r"""Deterministic mu STRATIFICATION: rollout `seed` of `terrain` gets `grid[seed % len(grid)]`.
 
-    **Why this exists, measured.** `friction_range` draws mu i.i.d. per rollout from a stream keyed
-    on the seed alone, and `friction_for` only changes the *range* per terrain -- so the same
-    underlying uniform is reused and 12 rollouts realise only ~**6 distinct mu**, none below 0.47 on
-    `data/dr4` or `data/dr5`. The slip band is at the bottom of the range and was never reached:
-    slip fraction goes 2.9% at mu=1.0 -> 8.5% at 0.40 -> 26-44% at 0.20. A dataset meant to teach a
-    network about slip that contains almost none is the single cheapest thing to fix, and it is a
-    sampling defect rather than a range defect.
+    **Why, measured.** `friction_range` draws mu i.i.d. per rollout from a stream keyed on the seed
+    alone and `friction_for` only changes the *range* per terrain, so the same underlying uniform
+    is reused and 12 rollouts realise only ~**6 distinct mu**, none below 0.47 on `data/dr4` or
+    `data/dr5`. The slip band is at the bottom of the range and was never reached: slip fraction
+    goes 2.9% at mu=1.0 -> 8.5% at 0.40 -> 26-44% at 0.20. A sampling defect, not a range defect.
 
     A grid also lets the low end be spent where the robot can survive it: measured over 8 s walks
     with pushes and command resampling on, `hard_stepping` FALLS at 0.20 while `flat` and `waves`
@@ -240,11 +225,10 @@ class DomainRandomization:
     yaw_zero_prob: float = 0.35
     r"""`uniform` (legacy) or `hollow` — how a walking command's three velocity axes are drawn.
 
-    **Why `hollow` exists.** `uniform` straddles the deadband, and measured on `data/dr4` that
-    means most of the lateral and yaw command is a draw the policy ignores: of 744 k walking ticks,
-    62% clear `WALK_MIN_VX` but only **19%** clear `WALK_MIN_VY` and **13%** `WALK_MIN_YAW`. The
-    dataset is therefore forward-dominated however wide the nominal ranges look, which matters for
-    the `l2_velocity` objective specifically:
+    **Why `hollow`.** `uniform` straddles the deadband, so measured on `data/dr4` most of the
+    lateral and yaw command is a draw the policy ignores: of 744 k walking ticks, 62% clear
+    `WALK_MIN_VX` but only **19%** clear `WALK_MIN_VY` and **13%** `WALK_MIN_YAW`. The dataset is
+    forward-dominated however wide the nominal ranges look, which matters for `l2_velocity`:
 
     .. math::
         \|\hat R^\top \hat v - R^\top v\| \;\approx\; \|\delta\phi \times b\|,
@@ -255,11 +239,10 @@ class DomainRandomization:
     only 0.4 m/s. Spanning `b` over the horizontal plane is what puts all three rotational axes in
     the gradient.
 
-    **What `hollow` does.** Each axis is *either exactly zero* (with probability `*_zero_prob`) *or*
-    a sign-balanced magnitude drawn from `*_mag`, whose lower end is the axis's deadband. So no draw
-    lands in the dead zone: a command is either honestly zero or one the policy tracks. The upper
-    ends are the policy's own trained band (`AlexCommandsCfg`: vx +-0.9, vy +-0.5, yaw +-1.5), so
-    nothing here extrapolates — `dr_envelope` measured no falls out to vy +-1.0 / yaw +-1.8, but
+    **What `hollow` does.** Each axis is *either exactly zero* (probability `*_zero_prob`) *or* a
+    sign-balanced magnitude from `*_mag`, whose lower end is the axis's deadband, so no draw lands
+    in the dead zone. The upper ends are the policy's own trained band (`AlexCommandsCfg`: vx
+    +-0.9, vy +-0.5, yaw +-1.5) — `dr_envelope` measured no falls out to vy +-1.0 / yaw +-1.8, but
     that headroom is deliberately left unspent.
 
     `uniform` reproduces every pre-`hollow` rollout bit-for-bit, RNG draw order included."""
@@ -271,19 +254,18 @@ class DomainRandomization:
     r"""Make the **ramps slippery while the flats stay normal**, by overriding sliding friction
     per CONTACT on tilted surfaces.
 
-    **Why this is not the same lever as `friction`.** `friction` sets one `mu` on every geom, so
-    both feet always stand on the same surface and contact quality is perfectly correlated across
-    feet. `data/dr6` raised slip that way to 19% pooled and the retrain (run 8) did not help. A
-    per-contact `Sigma_C` has nothing to learn from a signal that is identical on both feet at
-    every instant. Tilt-dependent friction instead puts one foot on firm ground and the other on a
-    slope **at the same tick**, which is the contrast the network's output space exists to express
-    and which no global `mu` can produce.
+    **Not the same lever as `friction`.** `friction` sets one `mu` on every geom, so both feet
+    always stand on the same surface and contact quality is perfectly correlated across feet;
+    `data/dr6` raised slip that way to 19% pooled and the retrain (run 8) did not help. A
+    per-contact `Sigma_C` has nothing to learn from a signal identical on both feet at every
+    instant. Tilt-dependent friction puts one foot on firm ground and the other on a slope **at
+    the same tick**, the contrast no global `mu` can produce.
 
-    **Why a slope rule and not a painted map.** The terrain is an hfield, i.e. ONE MuJoCo geom with
-    ONE friction value, so regions cannot be painted. But `terrain.stepping_stones` is a `kron` of
-    flat-topped blocks at random heights, so the "ramps" are exactly the steep triangles MuJoCo
-    generates between adjacent stones — and those are precisely the contacts whose surface normal
-    is tilted. Measured from the rasterisation (hfield cell `HSCALE` = 0.1 m):
+    **A slope rule, not a painted map.** The terrain is an hfield — ONE geom, ONE friction value —
+    so regions cannot be painted. But `terrain.stepping_stones` is a `kron` of flat-topped blocks,
+    so the "ramps" are exactly the steep triangles MuJoCo generates between adjacent stones, i.e.
+    the contacts whose surface normal is tilted. Measured from the rasterisation
+    (hfield cell `HSCALE` = 0.1 m):
 
     ==================  ==================  =========================
     terrain             peak surface slope  at `slope_deg = 10`
@@ -417,10 +399,9 @@ class DomainRandomization:
 def load_dr_config(path: Path | str | None = None) -> tuple[DomainRandomization, dict]:
     """Read `config/collect_dr.yaml` -> `(DomainRandomization, run_settings)`.
 
-    Deliberately a SEPARATE file from `filter_cfg.yaml` / `alex_*.yaml`: this one changes the
-    dataset, not the filter, and the pre-DR rollouts must stay reproducible from a repo where this
-    file does not exist at all. Reuses `config.load_config` only for its YAML-1.1 exponent trap
-    (`1.0e9` parses as a *string*), which bites here exactly as it does in the filter configs.
+    A SEPARATE file from `filter_cfg.yaml` / `alex_*.yaml`: this one changes the dataset, not the
+    filter, and the pre-DR rollouts must stay reproducible from a repo where it does not exist.
+    Reuses `config.load_config` only for its YAML-1.1 exponent trap (`1.0e9` parses as a *string*).
     """
     cfg = load_config(Path(path) if path is not None else DR_CONFIG_PATH)
     return DomainRandomization.from_dict(cfg.get("dr", {})), dict(cfg.get("run", {}) or {})
@@ -446,9 +427,8 @@ def _push_schedule(dr: DomainRandomization, rng: np.random.Generator,
 def _push_trace(events: Sequence[Sequence[float]], T: int, dt: float) -> np.ndarray:
     """Rasterise a push schedule onto the physics grid: `(T, 3)` N, index = physics tick.
 
-    Rasterising up front (rather than testing the schedule inside the loop) makes the applied
-    force a recorded array, so what the robot actually felt is in the `.npz` and not only
-    reconstructible from the schedule and a reader's assumptions about rounding.
+    Up front rather than inside the loop, so what the robot actually felt is a recorded array in
+    the `.npz` and not only reconstructible from the schedule plus assumptions about rounding.
     """
     f = np.zeros((T, 3), dtype=np.float64)
     for t0, t1, fx, fy, fz in events:
@@ -460,7 +440,21 @@ def _push_trace(events: Sequence[Sequence[float]], T: int, dt: float) -> np.ndar
 def _command_schedule(dr: DomainRandomization, rng: np.random.Generator, *,
                       walk_tick: int, total_ticks: int, control_dt: float,
                       height_range: tuple[float, float]) -> dict[int, list[float]]:
-    """`{control_tick: [vx, vy, yaw, standing, height]}`, first entry exactly at `walk_tick`."""
+    """`{control_tick: [vx, vy, yaw, standing, height]}`, first entry exactly at `walk_tick`.
+
+    Empty when `dr.command` is off, mirroring `_push_schedule`'s `if not dr.push` guard. That
+    guard was missing here until 2026-08-01, so `command: {enabled: false}` silently randomised
+    anyway — and `max_speed` (the only other reader of `dr.command`) meanwhile returned the
+    `abs(vx)` bound, so the off-field pre-flight was sized for a robot walking straight while the
+    robot was actually being sent up to `hypot(0.8, 0.35)` m/s in random directions.
+
+    No shipped dataset is affected: `collect_dr{,5,6,7}.yaml` all set `enabled: true`, and on that
+    path this function is unchanged, draw for draw. A disabled-command run does NOT consume the
+    command stream, so it is not draw-comparable to an enabled one — same trade `_push_schedule`
+    already makes, and the opposite of `friction_value`, which consumes its draw either way.
+    """
+    if not dr.command:
+        return {}
     lo, hi = height_range
     if dr.base_height_range is not None:
         lo = max(lo, dr.base_height_range[0])
@@ -511,10 +505,6 @@ def slip_fraction(slip_sat: np.ndarray, contact_fn: np.ndarray, *,
     return float((np.asarray(slip_sat)[loaded] >= threshold).sum() / n) if n else 0.0
 
 
-# ---------------------------------------------------------------------------
-# The collector (heavy, built once, reused across every rollout)
-# ---------------------------------------------------------------------------
-
 @dataclass
 class Collector:
     """Policy + fused estimator + compiled scan. Independent of the floor, so it is built once.
@@ -550,12 +540,12 @@ def build_collector(policy_name: str = "baseline", *, dt: float = rp.DT,
     `contact_fk_unfiltered=True` is NOT optional here: without it `FusedSensors.q_unfiltered` is
     empty, the contact FK stands on `qpos0` ankles, and ContactNet's `q_ankle_*`/`tau_ankle_*`
     channels (4 of its 24) do not exist. `contactnet.features.make_contact_channels` raises rather
-    than silently producing a narrower feature vector, which is the behaviour that catches it.
+    than silently producing a narrower feature vector.
 
     `contact_meas_var = 0.0` is deliberate and is the thing ContactNet replaces: it is the
-    isotropic floor `_boundary` folds into `Σ_q`, i.e. a hand-tuned stand-in for exactly the
-    quantity the network is being trained to predict. Collecting with it nonzero would train the
-    network against a target that already contains a constant version of itself.
+    isotropic floor `_boundary` folds into `Σ_q`, a hand-tuned stand-in for exactly the quantity
+    the network is trained to predict. Nonzero would train the network against a target that
+    already contains a constant version of itself.
     """
     t0 = time.time()
     policy = rp.load_policy(policy_name)
@@ -572,15 +562,11 @@ def build_collector(policy_name: str = "baseline", *, dt: float = rp.DT,
     return c
 
 
-# ---------------------------------------------------------------------------
-# The recording loop
-# ---------------------------------------------------------------------------
-
 class _RecordingLoop(rp.Loop):
     """`run_policy.Loop` that samples the sensors after EVERY `mj_step`.
 
     `control_tick` is reimplemented rather than wrapped because the base class has no hook inside
-    its decimation loop — the same accommodation `run_estimator.EstimatedLoop` makes, and the
+    its decimation loop (the same accommodation `run_estimator.EstimatedLoop` makes); the
     policy/actuator lines are a verbatim copy of `rp.Loop.control_tick`. The observation is built
     from `MjData`, i.e. ground truth: this loop does not close the estimator into the gait.
     """
@@ -596,8 +582,8 @@ class _RecordingLoop(rp.Loop):
         self.sim_s = 0.0        # wall time in mj_step + policy
         self.read_s = 0.0       # wall time in sensor extraction (collector overhead)
 
-        # -- opt-in extras. Each one is `None`/False by default and every use of it is guarded, so
-        # -- with all three off this class steps EXACTLY the sim it stepped before they existed.
+        # Opt-in extras. Each is `None`/False by default and every use of it is guarded, so with
+        # all three off this class steps EXACTLY the sim it stepped before they existed.
         self.push = push                    # (T, 3) N on the pelvis, indexed by physics tick
         self.slip_fn_min = slip_fn_min      # None = do not compute friction-cone saturation
         self.record_cmd = bool(record_cmd)
@@ -712,10 +698,6 @@ class _RecordingLoop(rp.Loop):
         self._ramp_t += rp.DECIMATION * rp.DT
 
 
-# ---------------------------------------------------------------------------
-# One rollout
-# ---------------------------------------------------------------------------
-
 class Rollout(NamedTuple):
     """One collected rollout, in NumPy, every leaf with a leading time axis of length `T`."""
 
@@ -756,13 +738,13 @@ def collect_rollout(
     `warmup_ticks` (metadata only, nothing is dropped) defaults to the measured joint-KF bias
     plateau; pass an explicit value to override.
 
-    `dr` (default `None`) turns on domain randomisation — friction, pelvis pushes, and a resampled
+    `dr` (default `None`) turns on domain randomisation — friction, pelvis pushes, a resampled
     velocity/height command, plus the slip instrumentation. **With `dr=None` this function is
     bit-for-bit what it was before domain randomisation existed**: no `geom_friction` write, no
     `xfrc_applied` write, no extra `mj_contactForce` call, the same constant `vx` command and the
-    same set of saved fields. That is load-bearing — the pre-DR 12-rollout dataset has to stay
-    reproducible. `record_slip=True` adds ONLY the friction-cone arrays (a read, never a write, so
-    the trajectory is still unchanged), which is how a DR-off slip baseline is measured.
+    same saved fields — the pre-DR 12-rollout dataset has to stay reproducible. `record_slip=True`
+    adds ONLY the friction-cone arrays (a read, never a write), which is how a DR-off slip
+    baseline is measured.
 
     Extra saved fields, each present only when its switch is on:
 
@@ -782,17 +764,13 @@ def collect_rollout(
     T = total_ticks * rp.DECIMATION
     want_slip = bool(record_slip or (dr is not None and dr.slip))
 
-    # -- pre-flight: can this rollout even fit on the field? ------------------
-    # The straight-line bound is exact for a FIXED forward command and hopelessly
-    # pessimistic once the yaw command is resampled: the path becomes a random
-    # walk, and measured combined-DR travel is 6.4 m net in 20 s against the
-    # 17.5 m this bound would charge. Applying it to a randomised rollout would
-    # cap `seconds` at ~31 s, and with a fixed 16 s joint-KF warm-up per rollout
-    # that throws away more usable trajectory than it protects.
-    #
-    # So randomised rollouts are policed by `_off_field` at runtime instead --
-    # strictly stronger, since it observes where the robot actually went rather
-    # than bounding where it could have. The static bound still guards the
+    # Pre-flight: can this rollout even fit on the field? The straight-line bound is exact for a
+    # FIXED forward command and hopelessly pessimistic once the yaw command is resampled -- the
+    # path becomes a random walk, and measured combined-DR travel is 6.4 m net in 20 s against the
+    # 17.5 m this bound would charge, which would cap `seconds` at ~31 s and (with a 16 s warm-up
+    # per rollout) throw away more usable trajectory than it protects. Randomised rollouts are
+    # therefore policed by the per-tick `safe_radius` check in the run loop below -- strictly
+    # stronger, since it observes where the robot actually went. The static bound still guards the
     # fixed-command path, where it is tight and free.
     safe_radius = tr.EXTENT / 2 - field_margin
     if dr is None:
@@ -803,7 +781,6 @@ def collect_rollout(
                 f"{reach:.1f}m, past the {tr.EXTENT / 2:.0f}m half-extent of the heightfield; "
                 "shorten the rollout or shrink the spawn box")
 
-    # -- model ---------------------------------------------------------------
     field = terrain_field(terrain_name, seed)
     floor = tr.HeightfieldFloor(field)
     m = rp.build_sim_model(c.policy, with_visuals=False, with_imu_sensors=True, floor=floor)
@@ -813,10 +790,9 @@ def collect_rollout(
     if not np.allclose(got, field, atol=1e-6):
         raise RuntimeError("hfield_data does not match the rasterised field")
 
-    # -- domain randomisation: sample it all BEFORE the run, record it, then run -----------------
-    # Sampling up front (rather than drawing inside the loop) is what makes a DR rollout replayable
-    # from its own metadata: `meta["friction_mu"]`, `meta["push_schedule"]` and
-    # `meta["cmd_schedule"]` are the complete description of what was done to the robot.
+    # Domain randomisation is sampled up front, not inside the loop, so `meta["friction_mu"]`,
+    # `meta["push_schedule"]` and `meta["cmd_schedule"]` are a complete replayable description of
+    # what was done to the robot.
     rng = None if dr is None else dr.rng(seed)
     mu = ramp_mu = None
     push_trace = cmd_events = None
@@ -847,7 +823,6 @@ def collect_rollout(
                           slip_fn_min=(float(dr.slip_normal_force_min_n) if dr is not None
                                        else 5.0) if want_slip else None)
 
-    # -- spawn ---------------------------------------------------------------
     x0, y0, yaw = spawn_pose(seed, radius=spawn_radius)
     loop.d.qpos[0:2] = (x0, y0)
     loop.d.qpos[2] += tr.spawn_lift(field)
@@ -865,7 +840,6 @@ def collect_rollout(
         q0_unfiltered=jnp.asarray(loop.d.qpos[reader.unf_qadr], dtype=jnp.float64),
     )
 
-    # -- run -----------------------------------------------------------------
     if verbose:
         print(f"  {terrain_name}/seed{seed}: relief={floor.relief * 100:.1f}cm  "
               f"spawn=({x0:+.1f},{y0:+.1f})m yaw={np.degrees(yaw):+.0f}deg  "
@@ -875,7 +849,10 @@ def collect_rollout(
                  f"{len(push_events)} pushes  {len(cmd_events)} commands"))
     for k in range(total_ticks):
         if k >= settle_ticks:
-            if cmd_events is None:
+            # `not cmd_events`, not `is None`: an empty dict means DR is on but the command
+            # channel is off, and that must fall back to the constant `vx` rather than leaving
+            # `loop.cmd` at whatever the previous tick held.
+            if not cmd_events:
                 loop.cmd[0:3] = (vx, 0.0, 0.0)
                 loop.cmd[3] = 0.0
             elif k in cmd_events:
@@ -888,10 +865,8 @@ def collect_rollout(
         loop.control_tick()
         if not np.all(np.isfinite(loop.d.qpos)):
             raise RuntimeError(f"{terrain_name}/seed{seed}: non-finite qpos at control tick {k}")
-        # Off-field is the one failure that stays perfectly finite: past the edge
-        # MuJoCo clamps the hfield and the robot walks onto an infinite extrusion
-        # of the boundary row, so every downstream check still passes on data that
-        # is physically meaningless. Fail loudly instead of recording it.
+        # Off-field is the one failure that stays perfectly finite (see the docstring); fail
+        # loudly instead of recording it.
         if float(np.hypot(*loop.d.qpos[0:2])) > safe_radius:
             raise RuntimeError(
                 f"{terrain_name}/seed{seed}: left the heightfield at control tick {k} "
@@ -908,12 +883,12 @@ def collect_rollout(
         truth["push_force"] = np.asarray(push_trace, dtype=np.float64)
         truth["cmd"] = np.asarray(loop.cmd_log, dtype=np.float64)
 
-    # -- did this rollout produce data at all? --------------------------------
+    # Did this rollout produce data at all?
     tilt = _check_rollout(truth, max_tilt_deg=max_tilt_deg,
                           limit=tr.EXTENT / 2 - field_margin,
                           label=f"{terrain_name}/seed{seed}")
 
-    # -- the estimator pass ---------------------------------------------------
+    # The estimator pass.
     t0 = time.perf_counter()
     inputs, aux, chunk_wall = _run_fused_chunked(c, carry, sensors, T)
     fused_s = time.perf_counter() - t0
@@ -996,10 +971,8 @@ def collect_rollout(
 def _check_rollout(truth: dict, *, max_tilt_deg: float, limit: float, label: str) -> np.ndarray:
     """Raise unless the robot stayed upright and on the field. Returns the tilt trace [deg].
 
-    Split out of `collect_rollout` because it is the part with teeth and the part that must be
-    testable against a FABRICATED trajectory: the pre-flight feasibility check upstream makes it
-    impossible to provoke the off-field branch from a real 1 s rollout, so without this seam that
-    branch would only ever be tested by reading it.
+    A seam, because the upstream pre-flight check makes the off-field branch impossible to provoke
+    from a real 1 s rollout: without it that branch could only be tested by reading it.
     """
     tilt = np.degrees(np.arccos(np.clip(np.asarray(truth["R"])[:, 2, 2], -1.0, 1.0)))
     if not np.all(np.isfinite(tilt)):
@@ -1022,20 +995,18 @@ def _check_rollout(truth: dict, *, max_tilt_deg: float, limit: float, label: str
 def _run_fused_chunked(c: Collector, carry, sensors: FusedSensors, T: int):
     """`run_fused` over the whole stream in fixed-length chunks, CARRYING the filter state.
 
-    The carry is the entire point: chunk `k+1` starts from chunk `k`'s final `(jkf_carry,
-    inekf_carry)`, so the result is bit-identical to one long scan (asserted by
-    `test_chunking_is_exact`).
+    Chunk `k+1` starts from chunk `k`'s final `(jkf_carry, inekf_carry)`, so the result is
+    bit-identical to one long scan (`test_chunking_is_exact`).
 
     **Measured, it was not needed at 62 s** — one unchunked 62 000-tick scan peaked at 4.4 GB
     (~18 kB/tick of `FusedOutputs`, of which ~2.7 kB is the `inekf_inputs` that survive) and took
-    186 s against the chunked 175 s, so the honest statement is that this bounds a cost that is
-    already affordable. It is kept because `lax.scan` materialises every output of the whole scan
-    at once, so the requirement grows linearly and unboundedly with rollout length, and because
-    per-chunk wall times are what separate the one-off compile from the steady-state rate in (B).
+    186 s against the chunked 175 s, so this bounds a cost that is already affordable. Kept
+    because `lax.scan` materialises every output at once, so the requirement grows linearly and
+    unboundedly with rollout length, and because per-chunk wall times separate the one-off compile
+    from the steady-state rate in (B).
 
-    The stream is padded to a multiple of `chunk_ticks` with a repeat of the last sample and the
-    padding trimmed off afterwards, so exactly ONE scan length is ever compiled, whatever `T` is.
-    The padded ticks advance a carry that is then thrown away.
+    The stream is padded to a multiple of `chunk_ticks` with a repeat of the last sample and
+    trimmed afterwards, so exactly ONE scan length is ever compiled whatever `T` is.
     """
     chunk = min(int(c.chunk_ticks), T)
     pad = (-T) % chunk
@@ -1107,18 +1078,12 @@ def _git_commit() -> str:
         return "unknown"
 
 
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
-
 def save_rollout(roll: Rollout, path: Path | str, *, compress: bool = True) -> Path:
     """Write one `.npz`. Keys are dotted paths (`inputs.joint.sigma_q`) plus `meta` (JSON).
 
     Compressed by default, which was NOT the expected answer: the bulk is `Σ_q`/`Σ_q̇`, dense
-    float64, and the prior was that zlib would buy little for real time. Measured, it halves the
-    file (4.5 -> 2.1 MB per 1000 ticks, i.e. 280 -> 130 MB for a 62 s rollout) for ~4 s of CPU
-    against the ~180 s the rollout itself costs. Lossless, so `load_rollout` still round-trips
-    bit-identically either way.
+    float64. Measured, it halves the file (4.5 -> 2.1 MB per 1000 ticks, i.e. 280 -> 130 MB for a
+    62 s rollout) for ~4 s of CPU against the ~180 s the rollout itself costs. Lossless.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1150,10 +1115,7 @@ def load_rollout(path: Path | str) -> Rollout:
                    meta=json.loads(str(z["meta"])))
 
 
-# ---------------------------------------------------------------------------
-# (A) Joint-KF warm-up
-# ---------------------------------------------------------------------------
-
+# (A) Joint-KF warm-up.
 # MEASURED, 2026-07-28, on 62 s walking rollouts over all four terrains (`__main__ --measure`),
 # 20-core CPU jaxlib, `imu_noise=True`:
 #
@@ -1220,10 +1182,7 @@ def bias_plateau(bias: np.ndarray, dt: float, *, window_s: float = 1.0,
                 err_at_plateau=float(err[min(plateau, T - 1)]), degenerate=False)
 
 
-# ---------------------------------------------------------------------------
-# (B) Throughput
-# ---------------------------------------------------------------------------
-
+# (B) Throughput.
 def fused_rate(meta: dict) -> tuple[float, float]:
     """`(steady_state, including_compile)` wall-seconds of `run_fused` per simulated second.
 
@@ -1237,22 +1196,18 @@ def fused_rate(meta: dict) -> tuple[float, float]:
     return steady, sum(w) / sim_s
 
 
-# ---------------------------------------------------------------------------
-# End-to-end channel sanity (the consumer, run over collected data)
-# ---------------------------------------------------------------------------
-
+# End-to-end channel sanity: the consumer, run over collected data.
 def channel_report(c: Collector, sensors: FusedSensors, *, rest: slice | None = None) -> dict:
     """Run `contactnet.features.make_contact_channels` over a collected stream and score it.
 
-    The point is end-to-end: a collector that produces correctly-shaped garbage passes every test
+    End-to-end, because a collector that produces correctly-shaped garbage passes every test
     inside this module. `p_bc_z` (foot below the pelvis, ~-0.9 m) and `base_accel_z` (+9.81 at
-    rest, specific force) are physical numbers with known values, so a permuted gather or a frame
-    error shows up as a number that is simply wrong.
+    rest, specific force) have known physical values, so a permuted gather or a frame error shows
+    up as a number that is simply wrong.
 
-    `rest` is the window the "at rest" numbers are averaged over and defaults to the LAST second
-    of the standing settle. Not the first: the robot is spawned lifted clear of the terrain
-    (`terrain.spawn_lift`) and spends the first few hundred ms falling onto it, which is why the
-    naive `slice(0, 500)` reports a 0.2 rad/s "resting" gyro.
+    `rest` defaults to the LAST second of the standing settle, not the first: the robot is spawned
+    lifted clear of the terrain (`terrain.spawn_lift`) and spends the first few hundred ms falling
+    onto it, which is why the naive `slice(0, 500)` reports a 0.2 rad/s "resting" gyro.
     """
     from ..contactnet.features import (channel_names, make_contact_channels,
                                        subchain_for)
@@ -1284,22 +1239,20 @@ def channel_report(c: Collector, sensors: FusedSensors, *, rest: slice | None = 
 def contact_channels_chunked(channels, sensors: FusedSensors, chunk: int = 2_000) -> np.ndarray:
     """`contactnet.features.make_contact_channels`, evaluated a chunk of ticks at a time.
 
-    **This is a workaround for a real scaling limit in the feature path, not a convenience.**
+    **A workaround for a real scaling limit in the feature path, not a convenience.**
     `make_contact_channels` does `jax.vmap(kinematics)(q_all)` over the whole leading axis, i.e.
-    `T` simultaneous full-body MJX FK evaluations. That is fine for a training window and is not
-    fine for a rollout: at T = 62 000 it grew to ~38 GB of RSS on this machine before it was
-    killed. Anything that runs the feature path over a whole collected rollout — a normalization
-    statistics pass, an export check, this report — needs the same treatment.
+    `T` simultaneous full-body MJX FK evaluations: fine for a training window, and at T = 62 000
+    it grew to ~38 GB of RSS on this machine before it was killed. Anything running the feature
+    path over a whole rollout — a normalization statistics pass, an export check, this report —
+    needs the same treatment.
 
-    The split is exact in structure, not merely close. The only cross-tick term is
-    ``v[k] = (p[k] - p[k-1]) / dt``, so each chunk is evaluated with ONE tick of lead-in and its
-    first row discarded. Without it every chunk boundary would silently carry ``v = 0`` — the kind
-    of artifact that trains fine and deploys wrong.
+    The only cross-tick term is ``v[k] = (p[k] - p[k-1]) / dt``, so each chunk is evaluated with
+    ONE tick of lead-in and its first row discarded. Without it every chunk boundary would
+    silently carry ``v = 0`` — the kind of artifact that trains fine and deploys wrong.
 
-    What is NOT reproduced is the last bit: XLA's batched FK depends on the vmap width, so ``p``
-    moves by up to 1 ulp of ~0.9 m and ``v = dp/dt`` amplifies that by 1/dt to ~2e-13. The 18
-    non-FK channels ARE bit-identical. `test_chunked_channels_match_one_pass` pins both halves of
-    that statement rather than papering over it with one loose tolerance.
+    NOT reproduced is the last bit: XLA's batched FK depends on the vmap width, so ``p`` moves by
+    up to 1 ulp of ~0.9 m and ``v = dp/dt`` amplifies that by 1/dt to ~2e-13. The 18 non-FK
+    channels ARE bit-identical, and `test_chunked_channels_match_one_pass` pins both halves.
     """
     T = sensors.encoders.shape[0]
     out = []
@@ -1318,18 +1271,14 @@ def _unfiltered_names(c: Collector) -> tuple[str, ...]:
                             np.asarray(c.fused.build.dof_anchor_unfiltered, dtype=int))
 
 
-# ---------------------------------------------------------------------------
-# Drivers
-# ---------------------------------------------------------------------------
-
 def collect_all(terrains: Sequence[str] | None = None, seeds: Sequence[int] = (0, 1, 2),
                 seconds: float = 60.0, *, out_dir: Path | str = DATA_DIR,
                 collector: Collector | None = None, keep: bool = False, **kw) -> list[dict]:
     """Every terrain x every seed. Returns one metadata dict per rollout.
 
-    A rollout that falls or leaves the field is REPORTED and skipped, not retried and not silently
-    replaced — a terrain whose seeds keep falling is a finding about the policy, and hiding it
-    behind a resample is how a dataset ends up quietly biased toward the easy seeds.
+    A rollout that falls or leaves the field is REPORTED and skipped, never retried — a terrain
+    whose seeds keep falling is a finding about the policy, and hiding it behind a resample is how
+    a dataset ends up quietly biased toward the easy seeds.
 
     `keep=False` drops each `Rollout` after saving; a full collection run does not fit in RAM.
     """

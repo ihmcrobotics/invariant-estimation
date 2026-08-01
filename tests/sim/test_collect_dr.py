@@ -249,6 +249,47 @@ def test_max_speed_follows_the_mode():
     assert C.DomainRandomization(command=False).max_speed(0.4) == pytest.approx(0.4)
 
 
+def test_disabling_the_command_channel_actually_disables_it():
+    """`command: {enabled: false}` must emit NO schedule, so the caller holds the constant `vx`.
+
+    This guard was missing until 2026-08-01: `_command_schedule` never read `dr.command` (only
+    `max_speed` did), so a config asking for a fixed-velocity walk got 21 randomised commands
+    over 60 s — including yaw up to 0.8 rad/s and a 15% standing probability. The symptom was a
+    "constant 0.4 m/s" control rollout that travelled 0.3 m net in 60 s, i.e. a near-closed loop.
+
+    Asserted three ways, because an empty dict is easy to produce for the wrong reason: the
+    disabled schedule is empty; the enabled one on the SAME seed is not (non-vacuity); and
+    `max_speed`, the other reader of the flag, agrees with the schedule about what gets issued.
+    """
+    off = C.DomainRandomization(command=False)
+    on = C.DomainRandomization(command=True)
+
+    assert _schedule(off) == {}
+    assert len(_schedule(on)) > 0, "non-vacuity: the enabled path must produce commands"
+
+    # The pre-flight bound and the sampler must not disagree about whether commands happen.
+    assert off.max_speed(0.4) == pytest.approx(0.4)
+    assert on.max_speed(0.4) > 0.4
+
+
+def test_a_disabled_command_channel_leaves_the_push_stream_alone():
+    """Pushes and commands are independent switches — turning one off must not move the other.
+
+    They share one `rng`, and the disabled command path skips its draws rather than consuming
+    them, so this pins the one ordering that matters: `_push_schedule` is drawn BEFORE any
+    command draw, and is therefore identical either way.
+    """
+    kw = dict(push=True, push_force_n=(50.0, 400.0), push_interval_s=(1.0, 3.0))
+    off = C.DomainRandomization(command=False, **kw)
+    on = C.DomainRandomization(command=True, **kw)
+
+    p_off = C._push_schedule(off, off.rng(0), 2.0, 20.0)
+    p_on = C._push_schedule(on, on.rng(0), 2.0, 20.0)
+
+    assert len(p_off) > 0, "non-vacuity: the fixture must actually schedule pushes"
+    assert np.allclose(np.asarray(p_off), np.asarray(p_on))
+
+
 # ---------------------------------------------------------------------------
 # 3. mu stratification (`friction.grid_by_terrain`)
 # ---------------------------------------------------------------------------

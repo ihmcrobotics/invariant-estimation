@@ -1,29 +1,22 @@
 """`EstimatorRuntime` — the fused estimator driven from a running MuJoCo sim.
 
-This is the estimator half of the closed loop and knows nothing about policies,
-viewers or command handling: it takes `FusedSensors` in and publishes an estimate
-out. `run_estimator.py` at the repo root joins it to `run_policy`'s sim loop.
+Knows nothing about policies, viewers or command handling: `FusedSensors` in, an estimate out.
+`run_estimator.py` at the repo root joins it to `run_policy`'s sim loop.
 
-Rate and phase
---------------
-The estimator runs at the PHYSICS rate (one step per `mj_step`), the policy at
-the control rate. One control tick is therefore
+**Rate and phase.** The estimator runs at the PHYSICS rate, the policy at the control rate:
 
     [advance the estimator over the substeps that just happened]
     -> [build obs from the fresh estimate] -> [policy] -> [DECIMATION * mj_step]
 
-so the estimate the policy reads is current, not one control period stale. The
-substeps are advanced in ONE jitted `lax.scan` call rather than N Python-level
-calls: same arithmetic, one dispatch (and the same constant graph, I7).
+so the estimate the policy reads is current, not one control period stale. The substeps go
+through ONE jitted `lax.scan` rather than N Python-level calls: one dispatch, one graph (I7).
 
-What the policy actually consumes
----------------------------------
-`base_ang_vel` and `projected_gravity` — nothing else (the 98-term observation's
-other entries are commands, raw encoders and the last action). Both come from the
-parts of the estimator that are hardware-validated: the bias-corrected pelvis
-gyro rotated into the body frame, and `R̂ᵀ·down` from the InEKF attitude which
-gravity leveling keeps observable. Base position/velocity never reach the policy,
-which is why contact-FK drift shows up in the scoring but not in the gait.
+**What the policy consumes:** `base_ang_vel` and `projected_gravity`, nothing else (the rest of
+the 98-term observation is commands, raw encoders and the last action). Both come from the
+hardware-validated parts of the estimator — the bias-corrected pelvis gyro rotated into the body
+frame, and `R̂ᵀ·down` from the InEKF attitude that gravity leveling keeps observable. Base
+position/velocity never reach the policy, which is why contact-FK drift shows up in the scoring
+but not in the gait.
 """
 
 from __future__ import annotations
@@ -45,10 +38,9 @@ _DOWN = np.array([0.0, 0.0, -1.0])
 class EstimateView:
     """The estimator's published output for one tick, in NumPy.
 
-    `omega_body` is recomputed here rather than read out of `FusedOutputs`,
-    which does not carry it: it is the boundary quantity
-    `R_mount · (gyro_base − b_base)` (`main_estimator._boundary`, I1). Doing it in
-    NumPy from the published bias keeps the jitted step untouched.
+    `omega_body` is recomputed here because `FusedOutputs` does not carry it: it is the boundary
+    quantity `R_mount · (gyro_base − b_base)` (`main_estimator._boundary`, I1). Doing it in NumPy
+    from the published bias keeps the jitted step untouched.
     """
 
     R: np.ndarray            # (3,3) ^W R_B
@@ -96,15 +88,11 @@ class EstimatorRuntime:
         self.carry = None
         self.last: EstimateView | None = None
 
-    # -- lifecycle ----------------------------------------------------------
-
     def seed(self, d, *, rotation=None, position=None):
         """Seed the carry from the sim's current state.
 
-        The robot boots knowing its own attitude and where it is standing, so the
-        pose is seeded from truth. Yaw is unobservable to this filter either way
-        (`enableYawSeeding=false`), and a deliberately wrong seed is a separate
-        experiment, not the default.
+        The robot boots knowing its own attitude and where it is standing, so the pose is seeded
+        from truth. Yaw is unobservable to this filter either way (`enableYawSeeding=false`).
         """
         t = self.reader.truth(d)
         R0 = t["R"] if rotation is None else np.asarray(rotation)
@@ -124,15 +112,12 @@ class EstimatorRuntime:
     def warmup(self, batch):
         """Compile the scanned step ahead of time, without touching the carry.
 
-        Otherwise XLA compiles on the FIRST control tick — ~11 s of it — which in the viewer
-        reads as a hang and in a timing run poisons the first samples. `lower(...).compile()`
-        populates the same cache the call path uses and has no side effects on the filter state.
+        Otherwise XLA compiles on the FIRST control tick — ~11 s of it — which in the viewer reads
+        as a hang and in a timing run poisons the first samples.
         """
         if self.carry is None:
             raise RuntimeError("call seed() before warmup()")
         self._advance.lower(self.carry, self._stack(batch)).compile()
-
-    # -- per control tick ---------------------------------------------------
 
     @staticmethod
     def _stack(batch):

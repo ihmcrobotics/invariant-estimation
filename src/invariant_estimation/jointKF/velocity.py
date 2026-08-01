@@ -1,82 +1,64 @@
-r"""
-jointKF/velocity.py
-===================
-The **optional** direct joint-velocity measurement channel (Java
-`JointLevelKFPreFilter` `getVelocityMeasurementJacobian` /
+r"""The **optional** direct joint-velocity measurement channel.
+
+Java `JointLevelKFPreFilter` `getVelocityMeasurementJacobian` /
 `getVelocityMeasurementNoise` / `refreshDirectVelocityNoise`, ported test class
-`JointLevelKFDirectVelocityMeasurementTest`).
+`JointLevelKFDirectVelocityMeasurementTest`.
 
-Default **off** (`params.direct_velocity_enabled`, `false` in
-`config/filter_cfg.yaml`).  It exists because some drives publish a firmware
-velocity estimate that is genuinely better than anything the filter can infer
-from the encoder history alone; it is off for sim v1 because that firmware signal
-does not exist in MJX, and a channel whose noise model is calibrated against
-hardware firmware is worse than no channel at all when fed a perfect derivative.
+Default **off** (`params.direct_velocity_enabled`).  It exists because some drives
+publish a firmware velocity estimate better than anything the filter can infer
+from encoder history; it is off for sim v1 because that signal does not exist in
+MJX, and a channel whose noise model is calibrated against hardware firmware is
+worse than no channel at all when fed a perfect derivative.
 
-What is measured is NOT `q_dot`
--------------------------------
-The load-bearing subtlety, and the reason this module is more than
-``H = [0 | I | 0]``: the drive does not publish `q_dot(t)`.  It publishes the
-output of a first-order low-pass with corner `omega_eff`::
+**What is measured is NOT `q_dot`** — the reason this module is more than
+``H = [0 | I | 0]``.  The drive publishes the output of a first-order low-pass
+with corner `omega_eff`::
 
     y_dot = omega_eff * (u - y),      u = true q_dot,   y = published value
 
-so the measurement is *lagged*, and the lag error is not noise-like — it is a
-deterministic function of how fast the joint is currently accelerating.
-Rearranging that one line gives the identity this whole module rests on::
+so the measurement is *lagged*, and the lag error is not noise-like but a
+deterministic function of the joint's current acceleration.  Rearranging gives
+the identity the module rests on::
 
-    u - y = y_dot / omega_eff                      (EXACT, not a small-angle
-                                                    approximation)
+    u - y = y_dot / omega_eff      (EXACT, not a small-angle approximation)
 
-The measurement error is therefore the *published signal's own slope* divided by
-the corner frequency.  We do not know `y_dot` exactly, but we can estimate it
-from the measurement itself, and then declare an honest variance::
+The error is the *published signal's own slope* over the corner frequency, which
+we estimate from the measurement itself and declare as an honest variance::
 
     R_ii(t) = sigma_i^2  +  ( dhat_i / omega_eff,i )^2
 
-The first term is the sensor noise floor; the second is the lag, which is zero at
-constant velocity and large during a swing-leg transient.  A *static* `R` has to
-be sized for the worst case, which means the channel is uselessly loose exactly
-when the robot is standing still — the regime where a velocity measurement is
-worth the most.
+The second term is zero at constant velocity and large during a swing-leg
+transient.  A *static* `R` must be sized for the worst case, leaving the channel
+uselessly loose exactly when the robot is standing still — the regime where a
+velocity measurement is worth the most.
 
-Why `dhat` is smoothed, and why that is not a free parameter
-------------------------------------------------------------
-`dhat` is a finite difference of the **noisy** measurement.  Raw, its variance is
-``2 sigma^2 / dt^2``: at ``sigma = 1e-2 rad/s`` and ``dt = 1e-3 s`` that is
-``2e2 (rad/s^2)^2``, which through ``(dhat/omega_eff)^2`` inflates `R` by roughly
-two orders of magnitude *at quiet standing* — the exact opposite of the point.
-So the finite difference is low-passed at `params.lag_slew_smoothing_hz` (5 Hz:
-above the gait band, so real slew passes; far below the 500 Hz Nyquist, so
-differentiation noise is cut by ~(5/500) in amplitude).
+**Why `dhat` is smoothed.**  It is a finite difference of the *noisy*
+measurement, so raw its variance is ``2 sigma^2 / dt^2``: at
+``sigma = 1e-2 rad/s`` and ``dt = 1e-3 s`` that is ``2e2 (rad/s^2)^2``, which
+through ``(dhat/omega_eff)^2`` inflates `R` by roughly two orders of magnitude
+*at quiet standing* — the exact opposite of the point.  So it is low-passed at
+`params.lag_slew_smoothing_hz` (5 Hz: above the gait band so real slew passes;
+far below the 500 Hz Nyquist so differentiation noise is cut by ~(5/500) in
+amplitude).  The deterministic ramp test
+(`lagInflationTracksMeasuredSlewExactly`) **cannot see this** — on a noiseless
+ramp raw and smoothed both converge to `slope`, and on a constant signal both are
+exactly zero — so the ported suite carries a noisy-input test in addition to the
+Java scenario.
 
-Note that the deterministic ramp test (`lagInflationTracksMeasuredSlewExactly`)
-**cannot see this**: on a noiseless ramp the raw and smoothed finite differences
-both converge to `slope`, and on a constant signal both are exactly zero.  The
-smoothing is constrained only by a noisy-input test, which is why the ported
-suite here carries one in addition to the Java scenario.
+**Constant graph (I7).**  The smoothed slew is a carry, not an attribute:
+`VelocityCarry` is a pytree of float arrays advanced with `jnp.where`.  The "have
+we seen a sample yet" flag is a float in the same carry rather than a Python
+`bool` — the first tick's finite difference against an unset `z_prev` would
+otherwise be `z/dt`, a spike of hundreds of rad/s^2 that inflates `R` for the
+~30 ms the smoother needs to forget it.
 
-Constant graph (I7)
--------------------
-The smoothed slew is a **carry**, not an attribute: `VelocityCarry` is a pytree of
-float arrays advanced with `jnp.where`, so it rides in the `lax.scan` state
-exactly like the trusted-feet mask.  The "have we seen a sample yet" flag is a
-float in the same carry rather than a Python `bool` — the first tick's finite
-difference against an unset `z_prev` would otherwise be `z/dt`, a spike of
-hundreds of rad/s^2 that inflates `R` for the ~30 ms the smoother needs to
-forget it.
-
-Cross-talk (the ported observable of Java's label dispatch)
------------------------------------------------------------
-Java routes diagnostics by an exact-match measurement label — `josephUpdate(H, z,
-R, "encoder")` publishes into `jointKF_encNIS_*`, `"encoderVelocity"` into
-`jointKF_qdNIS_*` — and the ported test asserts that running the velocity channel
-leaves the encoder NIS at `NaN`.  Strings cannot cross a jit boundary (I7), so
-the port replaces string dispatch with **separate fields**: `ChannelDiagnostics`
-has an encoder half and a velocity half, and `velocity_update` structurally
-cannot write the encoder half.  The observable — "the position channel's
-consistency statistic never reports a number it did not compute" — is preserved;
-the mechanism is a struct field instead of a string compare.
+**Cross-talk.**  Java routes diagnostics by an exact-match measurement label
+(`"encoder"` -> `jointKF_encNIS_*`, `"encoderVelocity"` -> `jointKF_qdNIS_*`) and
+the ported test asserts that running the velocity channel leaves the encoder NIS
+at `NaN`.  Strings cannot cross a jit boundary (I7), so the port replaces string
+dispatch with **separate fields**: `velocity_update` structurally cannot write
+`ChannelDiagnostics`' encoder half.  The observable is preserved; the mechanism
+is a struct field instead of a string compare.
 """
 from typing import Mapping, NamedTuple
 
@@ -103,9 +85,7 @@ __all__ = [
 ]
 
 
-# ---------------------------------------------------------------------------
 # Build-time: per-joint noise floor and corner frequency (plain Python, I7)
-# ---------------------------------------------------------------------------
 
 def velocity_var_for_name(
     name: str,
@@ -114,30 +94,17 @@ def velocity_var_for_name(
 ) -> tuple[float, bool]:
     """Per-joint velocity-measurement VARIANCE, and whether the lookup was wired.
 
-    Mirrors `state.encoder_var_for_name` exactly — including the "return the
-    fallback *and say so*" contract, because a joint silently on the fallback is
-    the failure this whole per-joint machinery exists to prevent (invariant I9).
+    Mirrors `state.encoder_var_for_name`, including the "return the fallback *and
+    say so*" contract: a joint silently on the fallback is the failure this
+    per-joint machinery exists to prevent (invariant I9).
 
-    The fallback is `sigma_qd_unfiltered` (0.1 rad/s => 0.01 rad^2/s^2), which is
-    Java's `SIGMA_QD_FALLBACK`.  The two are the same constant in Java and are
-    kept as one here: both answer "what does an *unmodelled* joint velocity cost
-    us", one for a chain joint that is not a filter state and one for a joint
-    whose drive noise was never characterised.
+    The fallback is `sigma_qd_unfiltered` (0.1 rad/s => 0.01 rad^2/s^2), Java's
+    `SIGMA_QD_FALLBACK` — one constant in Java and kept as one here, since both
+    answer "what does an *unmodelled* joint velocity cost us".
 
-    Parameters
-    ----------
-    name : str
-    cfg : mapping, optional
-        The `joint_kf` config section; read once by `build_velocity_channel`.
-    lookup : mapping, optional
-        Overrides `cfg["encoder_vel_std"]` — the test seam standing in for Java's
-        `velSigmaFor` function argument.  A non-finite or non-positive entry
-        counts as *absent*, which is how the Java test injects an "unmatched"
-        joint (it maps that one name to `NaN`).
-
-    Returns
-    -------
-    (variance, wired) : (float, bool)
+    `lookup` overrides `cfg["encoder_vel_std"]` — the test seam standing in for
+    Java's `velSigmaFor` function argument.  A non-finite or non-positive entry
+    counts as *absent*, which is how the Java test injects an "unmatched" joint.
     """
     cfg = cfg if cfg is not None else section("joint_kf")
     table = lookup if lookup is not None else cfg.get("encoder_vel_std", {})
@@ -150,36 +117,21 @@ def velocity_var_for_name(
 class VelocityChannel(NamedTuple):
     """Static, name-resolved structure of the direct-velocity channel.
 
-    Built once in plain Python (I7: no strings, no lookups inside jit) and closed
-    over by the jitted step, exactly like `JointKFBuild`.  It is a separate struct
-    rather than extra `JointKFBuild` fields because `JointKFBuild` is frozen and
-    because the channel is optional: a build with the channel disabled should not
-    carry its arrays at all.
+    Built once in plain Python (I7) and closed over by the jitted step, like
+    `JointKFBuild`.  A separate struct because `JointKFBuild` is frozen and the
+    channel is optional: a build with it disabled should not carry its arrays.
 
-    Attributes
-    ----------
-    var : (n,) float
-        Per-joint sensor-noise variance `sigma_i^2` — the floor `R` decays back
-        to when the joint is at constant velocity.
-    wired : tuple[bool, ...]
-        Per joint: did the name lookup hit?  Reported at build, never read in jit.
-    inv_omega : (n,) float
-        `1 / (2*pi*f_corner,i)`, the seconds of lag the drive's low-pass adds.
-        **Zero** for a joint with no declared corner frequency, which switches the
-        lag inflation off for that joint and leaves a static `R` — the port of
-        Java's nullable `cornerFn`.  Zero is the right disabled value: an unknown
-        corner is not "infinitely laggy", it is "we are not modelling this".
-    smoother_alpha : float
-        `exp(-2*pi*f_smooth*dt)`, the one-pole coefficient of the slew smoother.
-    dt : float
-        Kept here so `advance_slew` needs only the channel and the carry.
+    `inv_omega` is **zero** for a joint with no declared corner frequency, which
+    switches lag inflation off for that joint and leaves a static `R` — the port
+    of Java's nullable `cornerFn`.  Zero is the right disabled value: an unknown
+    corner is not "infinitely laggy", it is "we are not modelling this".
     """
 
-    var: Array
-    wired: tuple[bool, ...]
-    inv_omega: Array
-    smoother_alpha: float
-    dt: float
+    var: Array                  # (n,) sensor-noise variance sigma_i^2, the R floor
+    wired: tuple[bool, ...]     # per joint: did the name lookup hit? build-time only
+    inv_omega: Array            # (n,) 1/(2*pi*f_corner,i) [s] of drive low-pass lag
+    smoother_alpha: float       # exp(-2*pi*f_smooth*dt), the slew smoother's pole
+    dt: float                   # here so `advance_slew` needs only channel + carry
 
 
 def build_velocity_channel(
@@ -192,25 +144,11 @@ def build_velocity_channel(
 ) -> VelocityChannel:
     """Resolve the per-joint velocity noise floor and corner frequency, once.
 
-    Parameters
-    ----------
-    build, params
-        Static structure and scalars.  `params.lag_slew_smoothing_hz` (5 Hz) and
-        `params.dt` set the smoother; `params.sigma_qd_unfiltered` is the noise
-        fallback.
-    vel_std : mapping, optional
-        Joint name -> velocity-noise STD [rad/s].  Defaults to the config's
-        `encoder_vel_std` sidecar.  Java's `velSigmaFor`.
-    corner_hz : mapping or float, optional
-        Joint name -> drive low-pass corner [Hz], or one scalar for all joints.
-        `None` (the default) disables lag inflation entirely — Java's
-        `cornerFn = null`, the configuration every wiring/NIS test uses.
-    cfg : mapping, optional
-        The `joint_kf` config section; read here so the caller can inject one.
-
-    Returns
-    -------
-    VelocityChannel
+    `vel_std` maps joint name -> velocity-noise STD [rad/s] (Java's `velSigmaFor`;
+    defaults to the config's `encoder_vel_std` sidecar).  `corner_hz` maps joint
+    name -> drive low-pass corner [Hz], or is one scalar for all joints; `None`
+    (the default) disables lag inflation entirely — Java's `cornerFn = null`, the
+    configuration every wiring/NIS test uses.
     """
     cfg = cfg if cfg is not None else section("joint_kf")
     names = build.joint_names
@@ -240,20 +178,14 @@ def build_velocity_channel(
     )
 
 
-# ---------------------------------------------------------------------------
-# The measurement model
-# ---------------------------------------------------------------------------
-
 def velocity_jacobian(build: JointKFBuild, params: JointKFParams | None = None) -> Array:
     """`H_qd = [0 | I_n | 0]`, shape `(n, dim)` — Java `getVelocityMeasurementJacobian`.
 
-    Exactly the identity on the velocity block: the drive reports joint velocity
-    directly, with no kinematic transformation and no bias term (the drive's own
-    offset would be indistinguishable from `q_dot` here and is not modelled — the
-    gyro bias state is per-IMU and belongs to a different channel entirely).
-
-    `params` is accepted and unused, matching `measure.encoder_jacobian`'s two
-    call styles.
+    Exactly the identity on the velocity block: no kinematic transformation and no
+    bias term — the drive's own offset would be indistinguishable from `q_dot`
+    here and is not modelled; the gyro bias state is per-IMU and belongs to a
+    different channel.  `params` is accepted and unused, matching
+    `measure.encoder_jacobian`'s two call styles.
     """
     n = build.n_joints
     return jnp.eye(n, build.dim, k=n, dtype=jnp.float64)
@@ -263,43 +195,31 @@ def velocity_noise(channel: VelocityChannel, carry: "VelocityCarry | None" = Non
     """`R_qd = diag(sigma_i^2 + (dhat_i * inv_omega_i)^2)` — Java `getVelocityMeasurementNoise`.
 
     Diagonal: two drives' velocity errors share no mechanism, and the lag term is
-    a per-joint function of that joint's own slew.
-
-    `carry=None` gives the static floor `diag(sigma^2)` — the configuration the
-    wiring and NIS tests use (Java's `cornerFn = null`).  With `inv_omega = 0` the
-    two are identical anyway, so the argument is a convenience, not a second code
-    path.
+    a per-joint function of that joint's own slew.  `carry=None` gives the static
+    floor `diag(sigma^2)` — the configuration the wiring and NIS tests use (Java's
+    `cornerFn = null`).  With `inv_omega = 0` the two are identical anyway, so the
+    argument is a convenience, not a second code path.
     """
     lag = jnp.zeros_like(channel.var) if carry is None else carry.dhat * channel.inv_omega
     return jnp.diag(channel.var + lag ** 2)
 
 
-# ---------------------------------------------------------------------------
-# The lag-inflation carry
-# ---------------------------------------------------------------------------
-
 class VelocityCarry(NamedTuple):
     """Per-tick state of the lag-inflation estimator — a pytree, never an attribute.
 
-    Attributes
-    ----------
-    dhat : (n,) float
-        Smoothed finite difference of the *measured* velocity [rad/s^2].  This is
-        an estimate of the published signal's own slope, which by the first-order
-        identity `u - y = y_dot / omega_eff` **is** the lag error up to the corner
-        frequency.
-    z_prev : (n,) float
-        Previous tick's measurement, the other half of the finite difference.
-    primed : () float
-        `0.0` until the first sample has been seen, `1.0` after.  A float in the
-        carry rather than a Python flag so the graph is identical on every tick
-        (I7).  Without it, tick 0 differences against `z_prev = 0` and produces a
-        `z/dt` spike — at 1 kHz, a 0.1 rad/s standing velocity becomes a phantom
-        100 rad/s^2 slew, and the 5 Hz smoother then takes ~30 ms to forget it.
+    `dhat` `(n,)` [rad/s^2] is the smoothed finite difference of the *measured*
+    velocity: an estimate of the published signal's own slope, which by
+    `u - y = y_dot / omega_eff` **is** the lag error up to the corner frequency.
+
+    `primed` is `0.0` until the first sample has been seen, `1.0` after — a float
+    in the carry rather than a Python flag so the graph is identical on every tick
+    (I7).  Without it, tick 0 differences against `z_prev = 0` and produces a
+    `z/dt` spike: at 1 kHz a 0.1 rad/s standing velocity becomes a phantom
+    100 rad/s^2 slew, which the 5 Hz smoother takes ~30 ms to forget.
     """
 
     dhat: Array
-    z_prev: Array
+    z_prev: Array    # previous tick's measurement, other half of the difference
     primed: Array
 
 
@@ -325,10 +245,9 @@ def advance_slew(channel: VelocityChannel, carry: VelocityCarry, z: Array) -> Ve
     `alpha` is the exact one-pole discretisation (`exp(-dt/tau)`), not the
     `1 - dt/tau` Euler approximation: at 5 Hz and 1 kHz they differ in the fifth
     decimal, but the exact form is unconditionally stable for any `dt` a caller
-    might pass, and costs one build-time `exp`.
-
-    Both the smoother and the priming gate are `jnp.where` on float carries, so
-    the traced graph is the same on tick 0 and tick 10^6 (I7).
+    might pass, and costs one build-time `exp`.  Both the smoother and the priming
+    gate are `jnp.where` on float carries, so the traced graph is the same on tick
+    0 and tick 10^6 (I7).
     """
     z = jnp.asarray(z, dtype=jnp.float64)
     fd = jnp.where(carry.primed > 0.0, (z - carry.z_prev) / channel.dt, 0.0)
@@ -340,40 +259,30 @@ def advance_slew(channel: VelocityChannel, carry: VelocityCarry, z: Array) -> Ve
     )
 
 
-# ---------------------------------------------------------------------------
-# Diagnostics — separate fields ARE the port of Java's label dispatch
-# ---------------------------------------------------------------------------
-
 class ChannelDiagnostics(NamedTuple):
     """Per-joint consistency statistics, one field per measurement channel.
 
-    Java publishes `jointKF_encNIS_<joint>` / `jointKF_qdNIS_<joint>` and
-    dispatches on an exact-match label string.  Here the destination is chosen
-    *structurally* — `velocity_update` can only construct the velocity half —
-    which is the same guarantee without a string inside jit (I7).
+    Separate fields ARE the port of Java's label dispatch: it publishes
+    `jointKF_encNIS_<joint>` / `jointKF_qdNIS_<joint>` by exact-match label
+    string, while here the destination is chosen *structurally* —
+    `velocity_update` can only construct the velocity half — which is the same
+    guarantee without a string inside jit (I7).
 
-    Every field is `(n,)` per-joint and initialises to `NaN`
-    (`no_diagnostics`): a channel that did not run reports "no statistic", never
-    a stale or borrowed number.  `NaN` specifically, because it cannot be
-    mistaken for "in band" by a downstream consistency check the way `0.0` can.
-
-    Attributes
-    ----------
-    encoder_nis, encoder_innovation : (n,)
-        Written only by the position channel.
-    velocity_nis, velocity_innovation : (n,)
-        Written only by this module.
-    velocity_r_diag : (n,)
-        The `R` diagonal actually used this tick, i.e. floor + lag inflation —
-        Java's `jointKF_qdR_<joint>`.  Published because the inflation is the
-        channel's whole behaviour and is otherwise invisible from outside.
+    Every field is `(n,)` per-joint and initialises to `NaN` (`no_diagnostics`):
+    a channel that did not run reports "no statistic", never a stale or borrowed
+    number.  `NaN` specifically, because it cannot be mistaken for "in band" by a
+    downstream consistency check the way `0.0` can.
     """
 
-    encoder_nis: Array
+    encoder_nis: Array          # written only by the position channel
     encoder_innovation: Array
-    velocity_nis: Array
+    velocity_nis: Array         # written only by this module
     velocity_innovation: Array
-    velocity_r_diag: Array
+    velocity_r_diag: Array      # R diagonal used this tick (floor + lag
+                                # inflation) -- Java `jointKF_qdR_<joint>`.
+                                # Published because the inflation is the
+                                # channel's whole behaviour and is otherwise
+                                # invisible from outside.
 
 
 def no_diagnostics(build: JointKFBuild) -> ChannelDiagnostics:
@@ -401,24 +310,14 @@ def velocity_update(
 
     Order matters and matches Java: the slew carry is advanced with **this**
     tick's measurement *before* `R` is built, because the lag error being modelled
-    is the one present in the sample about to be fused, not the previous one.
+    is the one present in the sample about to be fused, not the previous one.  The
+    update goes through the shared `joseph_update` so this channel inherits the
+    `cond(S)` gate, the finite-mask hardening and the Joseph form unchanged.
 
-    The update itself goes through the shared `joseph_update` so this channel
-    inherits the `cond(S)` gate, the finite-mask hardening and the Joseph form
-    unchanged — one gating semantics for every channel is the reason that function
-    exists.
-
-    Returns
-    -------
-    state : JointKFState
-    carry : VelocityCarry
-        Advanced slew state.  Note it is advanced whether or not the update was
-        gated out: the drive kept publishing, so the slew estimate must keep
-        tracking, or a single gated tick would leave `dhat` stale.
-    diagnostics : ChannelDiagnostics
-        `diagnostics` with **only** the velocity half replaced.
-    info : UpdateInfo
-        The shared per-update diagnostics (whole-channel NIS, `S`, gate flag).
+    The returned carry is advanced whether or not the update was gated out: the
+    drive kept publishing, so the slew estimate must keep tracking, or a single
+    gated tick would leave `dhat` stale.  Only the velocity half of `diagnostics`
+    is replaced.
     """
     from .diagnostics import per_joint_nis
 

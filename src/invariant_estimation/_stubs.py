@@ -1,13 +1,10 @@
-"""Regenerate LSP type stubs for libraries that ship no ``py.typed`` / ``.pyi``.
+"""Regenerate LSP type stubs into ``typings/`` (``uv run gen-stubs``).
 
-Exposed as ``uv run gen-stubs`` via ``[project.scripts]`` in ``pyproject.toml``.
-
-mujoco's public classes (``MjModel``/``MjData``) live in a compiled ``_structs``
-extension that pyright cannot introspect; mjx is pure Python but ships no
-``py.typed``, so its re-exports (``put_data``/``put_model``) don't resolve. Both
-are fixed by generating stubs into ``typings/`` (gitignored; on pyright's
-``stubPath``). mypy is installed on demand and removed afterwards so it never
-lingers in the environment.
+mujoco's ``MjModel``/``MjData`` live in a compiled ``_structs`` extension pyright
+cannot introspect; mjx is pure Python but ships no ``py.typed``, so its
+re-exports (``put_data``/``put_model``) don't resolve.  ``typings/`` is gitignored
+and on pyright's ``stubPath``.  mypy is installed on demand and removed
+afterwards so it never lingers in the environment.
 """
 
 from __future__ import annotations

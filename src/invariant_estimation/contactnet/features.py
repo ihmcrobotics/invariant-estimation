@@ -1,20 +1,13 @@
-r"""
-contactnet/features.py
-======================
-Per-contact feature extraction and history windowing for ContactNet
-(``network_plan.md`` §2, §9 step 2).
+r"""Per-contact feature extraction and history windowing (``network_plan.md`` §2, §9 step 2).
 
-Two halves, deliberately separated:
+Two halves, deliberately separated: **windowing** (`window_indices`, `window`) is
+mechanical plumbing with an exact oracle; **channel extraction**
+(`contact_channels`) is HAND-AUTHORED and convention-bound — a wrong channel
+choice produces a network that trains, converges, exports and is simply worse,
+with nothing to fail.
 
-* **Windowing** (`window_indices`, `window`) — pure plumbing with an exact
-  oracle (spec'd in PORT_NOTES.md; NOT YET WRITTEN).  Mechanical.
-* **Channel extraction** (`contact_channels`) — **HAND-AUTHOR**.  Which
-  channels, which subchain joints, what ordering: convention-bound, with no
-  cheap oracle.  A wrong choice here produces a network that trains, converges
-  and exports, and is simply worse, with nothing to fail.
-
-This module imports nothing from ``inEKF.state`` on purpose.  ContactNet sees
-**sensor history only** (§1); if the signatures here cannot see filter state,
+This module imports nothing from ``inEKF.state`` on purpose: ContactNet sees
+**sensor history only** (§1), and if the signatures here cannot see filter state
 that invariant cannot be broken by accident.
 """
 
@@ -24,26 +17,20 @@ import numpy as np
 from jax import Array
 
 
-# ---------------------------------------------------------------------------
-# Windowing (mechanical — oracle-tested)
-# ---------------------------------------------------------------------------
-
 def window_indices(T: int, H: int, stride: int = 1) -> Array:
-    r"""``(T, H)`` index matrix: row ``k`` holds the ticks feeding the window at ``k``.
+    r"""``(T, H)`` index matrix: ``idx[k, h] = k - (H - 1 - h)·stride``, so every row ends at ``k``.
 
-    ``idx[k, h] = k - (H - 1 - h)·stride``, so every row **ends** at ``k``.
-    Causality is structural, not incidental: ``idx[k, h] <= k`` holds for every
-    entry.  The oracle asserting that is spec'd in PORT_NOTES.md and is NOT
-    YET WRITTEN -- it is the highest-value test in this module.  A
-    window that peeks at ``k + 1`` trains beautifully and cannot be deployed, and
-    nothing anywhere raises — which is why it gets its own oracle.
+    Causality is structural: ``idx[k, h] <= k`` for every entry.  The oracle
+    asserting that is spec'd in PORT_NOTES.md and is NOT YET WRITTEN -- it is the
+    highest-value test in this module, because a window that peeks at ``k + 1``
+    trains beautifully, cannot be deployed, and raises nothing.
 
     ``stride`` spreads the window over ``(H-1)·stride + 1`` ticks without adding
-    samples.  This is not a shortcut: measured on the 2026-07-17 Alex log, joint
-    position has ``f99 = 1.10 Hz`` and torque ``f99 = 4.25 Hz``, so at 1 kHz a
-    consecutive-tick window is oversampled by ~200x and carries one value plus a
-    slope.  The sensors also update at 500 Hz behind a 2-tick hold, so
-    ``stride = 1`` literally repeats every second sample.  See PORT_NOTES.md.
+    samples.  Measured on the 2026-07-17 Alex log, joint position has
+    ``f99 = 1.10 Hz`` and torque ``f99 = 4.25 Hz``, so at 1 kHz a consecutive-tick
+    window is oversampled by ~200x and carries one value plus a slope.  The
+    sensors also update at 500 Hz behind a 2-tick hold, so ``stride = 1``
+    literally repeats every second sample.
 
     Lower-clamped at 0, so early rows repeat the earliest sample.  Prefer feeding
     ``(H - 1)·stride`` ticks of lead-in and slicing them off afterwards: clamping
@@ -51,23 +38,9 @@ def window_indices(T: int, H: int, stride: int = 1) -> Array:
     exactly where the filter state was freshly reseeded, so the two artifacts
     compound.
 
-    Only the lower bound is clamped.  An upper clamp would *hide* a
-    future-peeking bug rather than expose it — JAX silently clamps
-    out-of-bounds gathers, so the test is the only thing standing between you
-    and a leak.
-
-    Parameters
-    ----------
-    T : int
-        Number of ticks.
-    H : int
-        History length per evaluation (sample count, not span).
-    stride : int
-        Tick spacing between consecutive history samples.
-
-    Returns
-    -------
-    Array, shape (T, H)
+    **Only the lower bound is clamped.**  An upper clamp would *hide* a
+    future-peeking bug rather than expose it — JAX silently clamps out-of-bounds
+    gathers, so the test is the only thing standing between you and a leak.
     """
     if stride < 1:
         raise ValueError(f"stride must be >= 1, got {stride}")
@@ -84,20 +57,19 @@ def boxcar(x: Array, s: int) -> Array:
     accelerometer that is real foot-strike impact energy (~24% of its power sits
     above 50 Hz, and walking carries 43x more of it than standing), so naive
     subsampling would scatter impact energy across the low band **and** make the
-    result depend on where the sampling grid happens to land relative to the
-    impact — variance that looks like signal and does not reproduce between sim
-    and hardware.
+    result depend on where the sampling grid lands relative to the impact —
+    variance that looks like signal and does not reproduce between sim and
+    hardware.
 
-    A boxcar is crude as filters go, but its first null sits at ``f_s / s``,
-    which is exactly the new sample rate and therefore exactly where the most
-    damaging folding originates (content near ``f_s/s`` folds to near DC).  What
-    makes it the right choice over a real low-pass is that it carries **no
+    A boxcar is crude, but its first null sits at ``f_s / s``, exactly the new
+    sample rate and therefore exactly where the most damaging folding originates.
+    What makes it the right choice over a real low-pass is that it carries **no
     state**: nothing crosses the Java boundary (§7) but an ``s``-tap average,
     where an IIR filter's state would have to be reproduced bit-for-bit in EJML.
 
     Two free side effects: it attenuates sensor noise by ``sqrt(s)`` on channels
-    that had nothing above Nyquist to lose, and it makes the log's 500 Hz
-    2-tick sensor hold irrelevant.
+    that had nothing above Nyquist to lose, and it makes the log's 500 Hz 2-tick
+    sensor hold irrelevant.
 
     Computed by cumulative sum, so cost is O(T) rather than O(T·s).  Early ticks
     clamp by repeating ``x[0]``, matching `window_indices`.
@@ -119,30 +91,12 @@ def window(channels: Array, H: int, stride: int = 1) -> Array:
     ``stride`` apart.  The two go together: the average is the anti-alias filter
     for the subsampling (see `boxcar`), so calling `window_indices` directly on
     unsmoothed channels at ``stride > 1`` is the thing this function exists to
-    prevent.
-
-    One gather on a constant-shape index matrix: jit-safe, no scan, and it lands
-    directly in the layout `rollout.contact_factors` expects.
+    prevent.  One gather on a constant-shape index matrix: jit-safe, no scan.
 
     The gather produces ``(T, H, N_c, F)`` — the index axis lands where the time
     axis was, pushing contacts right — so one ``swapaxes`` is required.  Skipping
     it interleaves contacts into the history axis, which (unlike the H/F flatten
     ordering) is wrong in Python too, not just in the Java port.
-
-    Parameters
-    ----------
-    channels : Array, shape (T, N_c, F)
-        Per-tick, per-contact channels from `contact_channels`, already
-        normalized (see `make_feature_windows`).
-    H : int
-        History length per evaluation (sample count, not span).
-    stride : int
-        Tick spacing between history samples; the window spans
-        ``(H-1)·stride + 1`` ticks.
-
-    Returns
-    -------
-    Array, shape (T, N_c, H, F)
     """
     if channels.ndim != 3:
         raise ValueError(f"expected (T, N_c, F), got shape {channels.shape}")
@@ -152,11 +106,7 @@ def window(channels: Array, H: int, stride: int = 1) -> Array:
     return jnp.swapaxes(gathered, 1, 2)                  # (T, N_c, H, F)
 
 
-# ---------------------------------------------------------------------------
-# HAND-AUTHOR boundary (network_plan.md §2)
-#
-# Everything below is convention-bound.  Author it by hand, then freeze it.
-# ---------------------------------------------------------------------------
+# Everything below is convention-bound (network_plan.md §2): author by hand, then freeze.
 
 ALEX_FOOT_CHAINS: tuple[tuple[str, ...], ...] = (
     ("LEFT_HIP_X", "LEFT_HIP_Z", "LEFT_HIP_Y", "LEFT_KNEE_Y",
@@ -167,9 +117,8 @@ ALEX_FOOT_CHAINS: tuple[tuple[str, ...], ...] = (
 """Base→foot joint chain per contact, in order.
 
 Only the first four of each are joint-KF **states**; the two ankles are the
-off-path joints, so a chain spans two different sensor arrays — which is exactly
-why `build_subchain_indices` resolves into one concatenated index space rather
-than carrying two.
+off-path joints, so a chain spans two different sensor arrays — which is why
+`build_subchain_indices` resolves into one concatenated index space.
 """
 
 JOINT_LABELS: tuple[str, ...] = ("hip_x", "hip_z", "hip_y", "knee_y", "ankle_y", "ankle_x")
@@ -178,24 +127,20 @@ JOINT_LABELS: tuple[str, ...] = ("hip_x", "hip_z", "hip_y", "knee_y", "ankle_y",
 
 def build_subchain_indices(joint_names, unfiltered_names, foot_chains=ALEX_FOOT_CHAINS,
                            contacts_per_foot: int = 1):
-    r"""Resolve joint NAMES to indices into ``concat(filtered, unfiltered)``.
+    r"""Resolve joint NAMES to ``(N_c, J_sub)`` indices into ``concat(filtered, unfiltered)``.
 
     One index space for both ``q`` and ``τ``: `FusedSensors.torques` already
     arrives as that concatenation, so building ``q`` the same way leaves a single
-    convention instead of two that can silently drift apart.
+    convention instead of two that can silently drift apart.  Resolved by name,
+    never by assuming an index coincidence — a permuted gather still produces a
+    network that trains.
 
-    Resolved by name, never by assuming an index coincidence — the same
-    discipline `sim.sensors.SimSensorReader` applies at the plant boundary, and
-    for the same reason: a permuted gather still produces a network that trains.
-
-    ``contacts_per_foot``
-    ---------------------
-    The returned table is one row per **contact point**, not per foot, because
+    The table is one row per **contact point**, not per foot, because
     `make_contact_channels` reads ``N_c`` from its shape and must agree with the
     contact FK's ``y`` (``(T, N_c, 3)``). With toe/heel contacts
     (`pipeline.main_estimator.ALEX_CONTACT_SITES`) there are two contact points on
-    each leg, and they share that leg's joints entirely — so each chain is
-    repeated ``contacts_per_foot`` times, **foot-major**, matching the
+    each leg sharing that leg's joints entirely, so each chain is repeated
+    ``contacts_per_foot`` times, **foot-major**, matching the
     ``(left_heel, left_toe, right_heel, right_toe)`` slot order.
 
     Heel and toe therefore receive *identical* ``q_sub`` and ``tau_sub``; they are
@@ -203,12 +148,8 @@ def build_subchain_indices(joint_names, unfiltered_names, foot_chains=ALEX_FOOT_
     That is sufficient rather than accidental: ``p_x`` is a near-constant +0.1475
     for a toe and −0.0495 for a heel, so the shared-weight network has an implicit
     "which point am I" identifier and can read the shared ankle-pitch torque
-    accordingly. Worth knowing that the *load* signal alone cannot say which end
-    of the foot is carrying weight.
-
-    Returns
-    -------
-    np.ndarray, shape (N_c, J_sub) with ``N_c = len(foot_chains) * contacts_per_foot``
+    accordingly. The *load* signal alone cannot say which end of the foot is
+    carrying weight.
     """
     if contacts_per_foot < 1:
         raise ValueError(f"contacts_per_foot must be >= 1, got {contacts_per_foot}")
@@ -237,8 +178,7 @@ def subchain_for(fused, unfiltered_names, foot_chains=ALEX_FOOT_CHAINS):
     The single place that division lives. `make_contact_channels` reads ``N_c``
     from the subchain's shape while ``p``/``v`` come from the contact FK, so the
     two MUST agree — and the authority on how many contact points there are is the
-    filter that was built, not a constant here. `with_contactnet` re-checks it and
-    raises, so a mismatch is loud, but deriving it removes the chance entirely.
+    filter that was built, not a constant here.
     """
     n_feet = len(foot_chains)
     n_c = int(fused.n_contacts)
@@ -274,25 +214,16 @@ def make_contact_channels(subchain, base_imu: int, kinematics, dt: float):
 
         o_i = ( ᴮω(3), ᴮa(3), q(J_sub), τ(J_sub), ᴮp_{B→C_i}(3), ᴮv_{B→C_i}(3) )
 
-    so ``F = 12 + 2·J_sub`` — **24** for Alex, giving ``D_in = H·F = 480``.
+    so ``F = 12 + 2·J_sub`` — **24** for Alex, giving ``D_in = H·F = 1200`` at the
+    default ``H = 50``.
 
     Every term is body-frame, so no filter state is required — and that is
     forced, not chosen: expressing any of it in world needs ``R̂`` (§1).
 
-    A factory for the same reason as `make_step`: ``subchain``, ``base_imu``,
-    ``kinematics`` and ``dt`` are static and get closed over, so the returned
-    callable takes only ``sensors``.
-
-    Parameters
-    ----------
-    subchain : (N_c, J_sub) int array
-        From `build_subchain_indices`.
-    base_imu : int
-        IMU ordinal of the star centre (`FusedEstimator.base_imu`).
-    kinematics : ContactKinematics
-        The ``robot/`` seam — same object `make_step` closes over.
-    dt : float
-        Tick period, for the ``ᴮv`` finite difference.
+    ``subchain`` ``(N_c, J_sub)`` from `build_subchain_indices`, ``base_imu`` the
+    IMU ordinal of the star centre, ``kinematics`` the ``robot/`` seam and ``dt``
+    the tick period for the ``ᴮv`` finite difference — all static and closed over,
+    so the returned callable takes only ``sensors``.
     """
     subchain = jnp.asarray(subchain)
     n_c, j_sub = subchain.shape
@@ -345,10 +276,7 @@ def make_contact_channels(subchain, base_imu: int, kinematics, dt: float):
 
 def make_feature_windows(subchain, base_imu: int, kinematics, dt: float, H: int,
                          stride: int = 1):
-    r"""Factory → ``feature_windows(sensors) -> (T, N_c, H, F)``.
-
-    Composes `make_contact_channels` with `window`, ready for
-    `rollout.Segment.windows`.
+    r"""Factory → ``feature_windows(sensors) -> (T, N_c, H, F)``: `make_contact_channels` then `window`.
 
     Normalization is **not** applied here: `normalize.py` owns the frozen
     per-channel constants and runs on the ``(T, N_c, F)`` channels *before*

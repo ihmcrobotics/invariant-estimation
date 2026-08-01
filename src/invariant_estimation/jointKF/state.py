@@ -1,60 +1,35 @@
-"""
-jointKF/state.py
-================
-The **frozen contract** for the joint-space KF (CLAUDE.md §1 deliverable 1, gates
-G6-G8).  Every other module in this package -- and every ported test -- builds
-against the layout, parameter names, and index helpers defined here.
+"""The **frozen contract** for the joint-space KF (CLAUDE.md §1 deliverable 1, G6-G8).
 
-State layout (locked by `JointLevelKFStateTest.testXOrdering`)
--------------------------------------------------------------
-::
+State layout, locked by `JointLevelKFStateTest.testXOrdering`::
 
     x = [ q (n) ; q_dot (n) ; b_omega (3m) ]  in R^{2n + 3m}
 
-    n = number of FILTERED joints (the union of 1-DoF joints on the IMU-pair
-        chains -- fixed at build time, so `dim` is static)
-    m = number of DISTINCT IMUs
+    n = FILTERED joints (union of 1-DoF joints on the IMU-pair chains, fixed at
+        build time so `dim` is static);  m = DISTINCT IMUs
 
-**`m` is per-IMU, not per-pair.**  This is the breaking change from the
-superseded Rev.1 design and it is not cosmetic: invariant I6 requires the exact
-`L Sigma L^T` cross-covariance on the stacked gyro measurement over a
-shared-base-IMU star, and the bias columns of `H_g` must *be* the mixing operator
-`L` (`testBiasColumnsOfHgAreExactlyL` asserts this bit-identically).  With
-per-pair bias, two pairs sharing an IMU carry two independent copies of one
+**`m` is per-IMU, not per-pair.**  Invariant I6 requires the exact `L Sigma L^T`
+cross-covariance on the shared-base-IMU star, and the bias columns of `H_g` must
+*be* the mixing operator `L` (`testBiasColumnsOfHgAreExactlyL`, bit-identical).
+With per-pair bias, two pairs sharing an IMU carry two independent copies of one
 physical bias, the shared-IMU cross terms vanish, and the G7 stacked oracle
 cannot pass.
 
 Bias lives here and **only** here -- invariant I1.  The InEKF state stays pure
 SE_{N+2}(3) and consumes bias-corrected `omega_bar, a_bar`.
 
-Design notes
-------------
-* `JointKFState` is a NamedTuple, hence a JAX pytree with no registration, so
-  `jax.lax.scan` carries it directly.
+`n`/`m` are NOT stored in the state: array shapes encode them, and storing them
+would make the struct non-pytree-safe under jit unless marked static everywhere.
+`b_omega` is stored FLAT `(3m,)` so `x` is a plain concatenation and `P`'s blocks
+are contiguous; `b_omega_imus` gives the `(m, 3)` view.
 
-* `n` and `m` are NOT stored in the state -- array shapes encode them.  Storing
-  them would make the struct non-pytree-safe under jit unless marked static
-  everywhere.
+`JointKFBuild` holds everything resolved from **names**, once, in plain Python at
+build time (invariant I7).  Every "skip"/"gate"/"anchor active" decision is a
+fixed-shape float mask, never a Python branch or a reshape (CLAUDE.md §4).
 
-* `b_omega` is stored FLAT `(3m,)` so the stacked vector `x` is a plain
-  concatenation and the `P` block layout is contiguous.  `b_omega_imus` gives the
-  `(m, 3)` view.
-
-* `JointKFBuild` holds everything resolved from **names** -- index arrays, masks,
-  per-joint parameter vectors.  Name-table resolution happens once, in plain
-  Python, at build time (invariant I7: no strings and no data-dependent shapes
-  inside jit).  The jitted step closes over a `JointKFBuild`.
-
-* Every "skip"/"gate"/"anchor active" decision is a fixed-shape float mask, never
-  a Python branch or a reshape (CLAUDE.md §4).
-
-Pure-function discipline (invariant I10)
-----------------------------------------
-Both filters are pure functions over an explicit `(x, P)` carry.  The Java
-suite's `*ForTest` seams then cost nothing -- they are just these sub-functions
-called directly.  `TEST_SUITE_MAP.md` §"Test seams" is the required public
-surface; the mapping is recorded in `SEAM_MAP` below so a ported test can be read
-against the Java one without guessing.
+Pure-function discipline (invariant I10): both filters are pure functions over an
+explicit `(x, P)` carry, so the Java suite's `*ForTest` seams are just these
+sub-functions called directly.  `TEST_SUITE_MAP.md` §"Test seams" is the required
+public surface; `SEAM_MAP` below records the mapping.
 """
 from typing import Any, NamedTuple
 
@@ -64,10 +39,7 @@ from jax import Array
 
 from ..config import section
 
-# ---------------------------------------------------------------------------
-# Seam map: Java test hook  ->  Python callable. Part of the public surface
-# (invariant I10), kept here so a ported test reads 1:1 against the Java one.
-# ---------------------------------------------------------------------------
+# Seam map: Java test hook -> Python callable. Part of the public surface (I10).
 SEAM_MAP: dict[str, str] = {
     "initialize":                        "jointKF.filter.initialize",
     "predict":                           "jointKF.predict.predict",
@@ -104,35 +76,18 @@ SEAM_MAP: dict[str, str] = {
 }
 
 
-# ---------------------------------------------------------------------------
-# State
-# ---------------------------------------------------------------------------
-
 class JointKFState(NamedTuple):
-    """Sufficient statistic for the bias-augmented joint KF: the `(x, P)` carry.
+    """The `(x, P)` carry: mean `x` `(2n+3m,)` and full covariance `P`.
 
-    Attributes
-    ----------
-    x : Array, shape (2n + 3m,)
-        Stacked mean `[q ; q_dot ; b_omega]`.  Stored stacked rather than as
-        three fields because every seam the Java suite exposes
-        (`getStateVector`, `setStateForTest`, `josephUpdate`) operates on the
-        stacked vector, and `P`'s blocks are indexed against it.
-    P : Array, shape (2n + 3m, 2n + 3m)
-        Full error covariance::
-
-            P = [[ P_qq    P_q_qd   P_q_b  ],
-                 [ P_qd_q  P_qdqd   P_qd_b ],
-                 [ P_b_q   P_b_qd   P_bb   ]]
-
-        `P_qq` is `Sigma_q`, the marginal the InEKF contact update pushes forward
-        as `N = J_C Sigma_q J_C^T`.
+    `x` is stored stacked because every Java seam (`getStateVector`,
+    `setStateForTest`, `josephUpdate`) operates on the stacked vector and `P`'s
+    blocks are indexed against it.  `P[:n,:n]` is `Sigma_q`, the marginal the
+    InEKF contact update pushes forward as `N = J_C Sigma_q J_C^T`.
     """
 
     x: Array
     P: Array
 
-    # -- segment views ------------------------------------------------------
     def q(self, n: int) -> Array:
         """Joint positions `q`, shape (n,)."""
         return self.x[..., :n]
@@ -148,13 +103,11 @@ class JointKFState(NamedTuple):
     def b_omega_imus(self, n: int) -> Array:
         """Per-IMU view of the gyro bias, shape (m, 3).
 
-        The Java seam `getAngularVelocityBiasInIMUFrame(imu)` is row `imu` of
-        this: the bias is *stored* in each IMU's own measurement frame, so no
-        rotation is applied on read.
+        Java seam `getAngularVelocityBiasInIMUFrame(imu)` is row `imu`: the bias
+        is *stored* in each IMU's own measurement frame, so no rotation on read.
         """
         return self.b_omega(n).reshape(-1, 3)
 
-    # -- covariance marginals ----------------------------------------------
     def sigma_q(self, n: int) -> Array:
         r"""Marginal position covariance $\Sigma_q$, shape (n, n) -- InEKF FK noise."""
         return self.P[:n, :n]
@@ -173,25 +126,17 @@ class JointKFState(NamedTuple):
 
 
 def split_x(x: Array, n_joints: int) -> tuple[Array, Array, Array]:
-    """Split `[q ; q_dot ; b_omega]` into its three segments.
-
-    `b_omega` is the remainder, so `m` is not needed.
-    """
+    """Split `[q ; q_dot ; b_omega]` into its three segments (`b_omega` is the rest)."""
     n = n_joints
     return x[..., :n], x[..., n:2 * n], x[..., 2 * n:]
 
-
-# ---------------------------------------------------------------------------
-# Parameters -- scalars, straight from config/filter_cfg.yaml
-# ---------------------------------------------------------------------------
 
 class JointKFParams(NamedTuple):
     """Scalar tunables, constant for a filter run.  See `config/filter_cfg.yaml`.
 
     Everything name-resolved (per-joint alpha, rotor inertia, encoder variance,
-    per-IMU gyro Sigma) lives in `JointKFBuild`, not here -- those are arrays
-    produced by build-time name matching, and keeping them out of this struct is
-    what lets the jitted step treat `JointKFParams` as a plain pytree of scalars.
+    per-IMU gyro Sigma) lives in `JointKFBuild`, not here -- keeping those arrays
+    out is what lets the jitted step treat this as a plain pytree of scalars.
     """
 
     dt: float                       # [s]
@@ -224,13 +169,7 @@ class JointKFParams(NamedTuple):
 
 
 def default_params(**overrides: Any) -> JointKFParams:
-    """Build `JointKFParams` from the `joint_kf` config section.
-
-    Any field may be overridden by keyword so a test or a sweep needn't touch the
-    file::
-
-        default_params(dt=2.0e-3, qa_max=1e9)
-    """
+    """`JointKFParams` from the `joint_kf` config section; any field overridable by keyword."""
     cfg = section("joint_kf")
     values = dict(
         dt=cfg["dt"],
@@ -261,9 +200,7 @@ def default_params(**overrides: Any) -> JointKFParams:
     return JointKFParams(**values)
 
 
-# ---------------------------------------------------------------------------
 # Build-time name tables (plain Python -- invariant I7, no strings in jit)
-# ---------------------------------------------------------------------------
 
 def _ci_get(table: dict[str, float], name: str) -> float | None:
     """Case-insensitive **exact** lookup, mirroring Java's per-joint sensor tables.
@@ -341,28 +278,17 @@ def encoder_var_for_name(name: str, cfg: dict[str, Any] | None = None) -> tuple[
     return float(std) ** 2, True
 
 
-# ---------------------------------------------------------------------------
-# Build -- everything resolved from names, once, before jit
-# ---------------------------------------------------------------------------
-
 class JointKFBuild(NamedTuple):
-    """Static structure + per-joint/per-IMU parameter arrays.
+    """Static structure + per-joint/per-IMU parameter arrays, resolved from names.
 
     Produced by `jointKF.build.build_joint_kf(...)` and closed over by the jitted
     step.  Nothing here is traced and nothing here changes shape during a run
-    (invariants I2, I7).
+    (invariants I2, I7).  Index conventions: ``q`` of joint i -> ``i``, ``q_dot``
+    -> ``n + i``, ``b_omega`` of IMU k -> ``2n + 3k .. 2n + 3k + 3``.
 
-    Index conventions
-    -----------------
-    ``q``      of joint i  -> state index ``i``
-    ``q_dot``  of joint i  -> state index ``n + i``
-    ``b_omega`` of IMU k   -> state indices ``2n + 3k .. 2n + 3k + 3``
-
-    Masks, not branches
-    -------------------
     `pair_velocity_mask` and `anchor_*` are fixed-shape float masks.  An inactive
     anchor keeps its rows but gets `R_LARGE * I3`; its rows are never zeroed,
-    which would make `S` singular (CLAUDE.md §6).
+    which would make `S` singular (CLAUDE.md §4).
     """
 
     # -- static dimensions (plain ints; static under jit) -------------------
@@ -402,7 +328,6 @@ class JointKFBuild(NamedTuple):
     dof_nuisance: Array             # (n_nuisance,)  base 6 DoF + gap joints
     use_mass_matrix: bool           # False => scalar-CWNA fallback path
 
-    # -- anchor-chain gather indices ----------------------------------------
     # DoFs of the unfiltered joints on the base->foot anchor chains, in
     # `anchor_unfiltered_mask` column order. A SEPARATE set from `dof_nuisance`:
     # Alex's ankles belong here but are off the root->filtered paths, so they are
@@ -410,7 +335,6 @@ class JointKFBuild(NamedTuple):
     # slice of `dof_nuisance` (the pre-decoupling layout the fixtures build).
     dof_anchor_unfiltered: Array | tuple[int, ...] = ()
 
-    # -- derived ------------------------------------------------------------
     @property
     def dim(self) -> int:
         """State dimension `2n + 3m`."""
@@ -455,10 +379,6 @@ class JointKFBuild(NamedTuple):
         """Total stacked-measurement rows: `3*(n_pairs + n_anchors)`, always."""
         return 3 * (self.n_pairs + self.n_anchors)
 
-
-# ---------------------------------------------------------------------------
-# Initialisation
-# ---------------------------------------------------------------------------
 
 def init_state(build: JointKFBuild, params: JointKFParams, q0: Array | None = None) -> JointKFState:
     """Seed `(x, P)` -- Java `initialize()`.

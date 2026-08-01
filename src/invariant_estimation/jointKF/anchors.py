@@ -1,36 +1,26 @@
-r"""
-jointKF/anchors.py
-==================
-Stance anchors — the **only absolute observation of gyro bias in the filter**
-(Java `JointLevelKFPreFilter` anchor loop L1826-1875, gate G7,
-`JointLevelKFBiasObservabilityTest`).
+r"""Stance anchors — the **only absolute observation of gyro bias in the filter**.
 
-Why this module exists at all
------------------------------
-The IMU-pair rows measure a *relative* gyro,
-``omega_child - {}^{c}R_{p} omega_parent``.  Rotate every IMU's bias by that
-IMU's own attitude and the differences cancel identically: for
-``delta b_i = {}^{i}R_{W} beta`` (one common bias in the *world*, seen by each
-IMU in its own frame),
+Java `JointLevelKFPreFilter` anchor loop L1826-1875, gate G7,
+`JointLevelKFBiasObservabilityTest`.
+
+The IMU-pair rows measure a *relative* gyro, and one common bias in the world
+seen by each IMU in its own frame (``delta b_i = {}^{i}R_{W} beta``) cancels
+identically:
 
 .. math::
     (+I_3)\,\delta b_c \;-\; {}^{c}R_{p}\,\delta b_p
       = {}^{c}R_{W}\beta - {}^{c}R_{p}\,{}^{p}R_{W}\beta = 0 .
 
 So the pair block has an exact **3-dimensional nullspace** — the common-mode
-gauge.  No amount of relative-gyro data ever shrinks it.  Left unfixed, the
-gauge direction of the bias covariance grows without bound under the bias random
-walk, the joint KF hands the InEKF a bias-corrected ``omega_bar`` that is wrong
-by a slowly-wandering constant, and the InEKF integrates that straight into
-attitude.  This is the documented root cause of Alex's pelvis pitch drift.
+gauge — that no amount of relative-gyro data shrinks.  Left unfixed it grows
+without bound under the bias random walk, the joint KF hands the InEKF an
+``omega_bar`` wrong by a slowly-wandering constant, and the InEKF integrates that
+straight into attitude: the documented root cause of Alex's pelvis pitch drift.
+A trusted stance foot fixes the gauge, being the one thing with a *known
+absolute* angular rate: ~zero.
 
-A trusted stance foot fixes the gauge, because it is the one thing in the system
-with a *known absolute* angular rate: ~zero.
-
-The anchor equation
--------------------
-Expressed in the **base IMU's** measurement frame (which is why the ``+I_3``
-lands on the base IMU's bias columns and nowhere else):
+**The anchor equation**, in the **base IMU's** measurement frame (which is why the
+``+I_3`` lands on the base IMU's bias columns and nowhere else):
 
 .. math::
     0 \;\approx\; \omega_{\text{foot}}
@@ -38,72 +28,57 @@ lands on the base IMU's bias columns and nowhere else):
     \qquad
     \omega_{\text{baseIMU}} = \tilde\omega_{\text{base}} - b_{\text{base}} .
 
-Splitting ``J qdot = J_F qdot_F + J_U qdot_U`` (see the F/U split below) and
-moving everything measured to the left gives the row this module builds::
+Splitting ``J qdot = J_F qdot_F + J_U qdot_U`` and moving everything measured to
+the left gives the row this module builds::
 
     z = omega_tilde_base + J_U qdot_U_measured
     H = [ 0_q | -J_F | +I3 at bias_col(base_imu) ]
 
-The ``+I_3`` is the gauge fixer.  Applying it to the gauge direction returns
-``{}^{b}R_{W}\beta``, whose norm is ``|beta|`` — the anchor reads the common-mode
-bias back *exactly*, which is precisely what
+Applying the ``+I_3`` to the gauge direction returns ``{}^{b}R_{W}\beta``, of norm
+``|beta|`` — the anchor reads the common-mode bias back *exactly*, which is what
 `testStanceAnchorFixesTheGauge` asserts.
 
-Sign note: the overall row sign is a free choice (both tests are on norms).  The
-convention above is the one forced by `tests/jointKF/_oracles.reference_marginalized`
-— eliminate the nuisance ``omega_base`` from that oracle's base-IMU row
-(``z = J qdot + b + I omega_base``, with ``J = 0`` for the base IMU itself) and
-substitute into its foot row (``0 = J_leg qdot + omega_base``), and this row is
-what drops out.  Keeping the two consistent is what lets the Phase-3 stacked
-oracle compose.
+Sign note: the overall row sign is free (both tests are on norms).  This
+convention is the one forced by `tests/jointKF/_oracles.reference_marginalized` —
+eliminate the nuisance ``omega_base`` from that oracle's base-IMU row
+(``z = J qdot + b + I omega_base``, ``J = 0`` for the base IMU itself) and
+substitute into its foot row (``0 = J_leg qdot + omega_base``).  Keeping the two
+consistent is what lets the Phase-3 stacked oracle compose.
 
-The F/U split and why ``R_anchor`` is not just ``Sigma_eps``
------------------------------------------------------------
-The base->foot chain generally contains joints that are **not filter states** —
-on Alex the ankles, because there are no foot IMUs, so no IMU pair brackets them.
-Their velocity is not estimated; it enters the anchor row as a **known input**
-read straight off the encoders.  By the standard input-noise congruence its
-covariance must therefore propagate into the measurement covariance:
+**The F/U split**: base->foot chain joints that are not filter states (on Alex the
+ankles, no foot IMUs) enter as a **known input** read off the encoders, so by the
+input-noise congruence their covariance propagates into the measurement
+covariance:
 
 .. math::
     R_{\text{anchor}} = \Sigma_\varepsilon + J_U \operatorname{diag}(\sigma_{\dot q,U}^2) J_U^\mathsf{T}
 
 with ``Sigma_eps = anchor_var * I3`` (4e-4; the ContactNet injection point,
 CLAUDE.md §7) and ``sigma_qd_unfiltered = 0.1 rad/s``.  Dropping the congruence
-term is not conservative: with four ankle joints at 0.1 rad/s the congruence is
-an order of magnitude *above* ``Sigma_eps``, so omitting it over-trusts a noisy
-input and feeds that noise directly into the base gyro-bias estimate the whole
-InEKF attitude solution rests on.  Erring large merely weakens the anchor — the
-gauge still gets fixed, just with more averaging.
+term is not conservative: with four ankle joints at 0.1 rad/s it is an order of
+magnitude *above* ``Sigma_eps``, so omitting it over-trusts a noisy input and
+feeds that noise into the base gyro-bias estimate the whole InEKF attitude
+solution rests on.  Erring large merely weakens the anchor.
 
-Constant-graph masking (CLAUDE.md §4 — this rule lives HERE, not in the InEKF)
------------------------------------------------------------------------------
-``K_max = build.n_anchors`` is fixed for the filter's lifetime (invariant I2), so
-the block is **always** ``3*K_max`` rows and a foot landing changes a *mask*,
-never a shape.  For an inactive anchor:
+**Constant-graph masking (CLAUDE.md §4).**  ``K_max = build.n_anchors`` is fixed
+for the filter's lifetime (I2), so the block is **always** ``3*K_max`` rows.  An
+inactive anchor gets its residual zeroed, its ``H`` rows zeroed, and its ``R``
+block set to ``r_large * I3`` — **never zero**: a zeroed ``R`` on zeroed ``H``
+rows makes ``S = H P Hᵀ + R`` exactly singular, the Cholesky in
+`update.joseph_update` goes non-finite, and the *whole* stacked update, pair rows
+included, is gated out.
 
-* the residual is zeroed,
-* the ``H`` rows are zeroed,
-* and the ``R`` block becomes ``r_large * I3`` — **never zero**.  A zeroed ``R``
-  block on zeroed ``H`` rows makes ``S = H P Hᵀ + R`` exactly singular, which is
-  a named trap (CLAUDE.md §6): the Cholesky in `update.joseph_update` goes
-  non-finite and the *whole* stacked update — pair rows included — is gated out.
+Zeroing ``H`` goes one step beyond §4's minimum, deliberately.  Java's stacked
+``H`` literally *has no anchor rows* when no foot is trusted, and
+`testCommonModeBiasIsUnobservableWithoutAnchors` reads ``H`` directly: an
+unmasked-but-large-``R`` row would leave the gauge looking observable *in H*.
+Masking ``H`` makes the fixed-shape block behave exactly like Java's dynamic one
+— the gain contribution is identically zero, not merely ``O(1/r_large)``.
 
-Zeroing ``H`` as well as the residual goes one step beyond CLAUDE.md §4's
-minimum, deliberately.  Java's stacked ``H`` literally *has no anchor rows* when
-no foot is trusted, and `testCommonModeBiasIsUnobservableWithoutAnchors` reads
-``H`` directly: an unmasked-but-large-``R`` anchor row would leave the gauge
-looking observable *in H* while contributing nothing to the estimate, so the
-ported assertion would have to be weakened to a slice.  Masking ``H`` makes the
-fixed-shape block behave exactly like Java's dynamic one — the gain contribution
-is identically zero rather than merely ``O(1/r_large)``.
-
-Phase ordering
---------------
-`trusted_feet` is an explicit argument and is **never** computed here: the
-previous tick's trusted set drives this tick's anchors (CLAUDE.md §4, mask
-written at the end of step k and read at the start of k+1).  Deciding trust
-inside this module would silently make it same-tick.
+**Phase ordering**: `trusted_feet` is an explicit argument and is **never**
+computed here — the previous tick's trusted set drives this tick's anchors
+(CLAUDE.md §4).  Deciding trust inside this module would silently make it
+same-tick.
 """
 from typing import NamedTuple
 
@@ -126,15 +101,9 @@ __all__ = [
 class AnchorJacobians(NamedTuple):
     r"""The F/U split of the base->foot angular Jacobian, in the base IMU frame.
 
-    Attributes
-    ----------
-    filtered : Array, shape (K, 3, n)
-        ``J_F`` — columns of the filter's own joints.  These multiply *state*
-        (``q_dot``), so they land in ``H``.
-    unfiltered : Array, shape (K, 3, n_u)
-        ``J_U`` — columns of chain joints that are not filter states.  These
-        multiply a *measured input*, so they land in ``z`` (times the reading)
-        and in ``R`` (times the reading's covariance).
+    ``J_F`` `(K, 3, n)` multiplies *state* (``q_dot``), so it lands in ``H``.
+    ``J_U`` `(K, 3, n_u)` multiplies a *measured input*, so it lands in ``z``
+    (times the reading) and in ``R`` (times the reading's covariance).
     """
 
     filtered: Array
@@ -148,27 +117,24 @@ class AnchorBlock(NamedTuple):
     ``build.anchor_row0 == 3 * build.n_pairs``; together they fill
     ``build.n_stacked_rows``.
 
-    Attributes
-    ----------
-    H : Array, shape (3K, dim)
-    z : Array, shape (3K,)
-    R : Array, shape (3K, 3K)
-        Block-diagonal by construction: each foot's slip is modelled as
-        independent of every other foot's.  (The two feet *are* correlated
-        through the shared base-IMU gyro noise — see the module note in
-        PORT_NOTES; Java models neither that nor the base gyro's own
-        contribution to ``R_anchor``, and this port follows Java.)
-    active : Array, shape (K,)
-        The float mask actually applied, echoed back so a caller need not
-        re-derive it.
-    n_active : Array, scalar
-        Java `getActiveAnchorCountForTest` — a diagnostic, part of the seam
-        surface (invariant I10), not optional logging.
+    ``R`` here is the **slip term only**, block-diagonal by construction: each
+    foot's slip is independent of every other foot's.  The base gyro's own
+    contribution to ``R_anchor`` and the two feet's correlation through it are NOT
+    modelled here and are NOT dropped — `measure.build_stacked` supplies both by
+    running the ``L Sigma Lᵀ`` congruence over the *whole* stack and adding this
+    block on top.  Java models neither term, and this port deliberately does not
+    follow it: the stacked oracle catches the omission at 12/12 trials off by
+    2e-4..9e-4 against a 1e-5 tolerance (see `measure.build_stacked`,
+    PORT_NOTES.md).
+
+    `active` `(K,)` is the float mask actually applied, echoed back so a caller
+    need not re-derive it.  `n_active` is Java `getActiveAnchorCountForTest` — a
+    diagnostic, part of the seam surface (invariant I10), not optional logging.
     """
 
-    H: Array
-    z: Array
-    R: Array
+    H: Array         # (3K, dim)
+    z: Array         # (3K,)
+    R: Array         # (3K, 3K)
     active: Array
     n_active: Array
 
@@ -176,21 +142,16 @@ class AnchorBlock(NamedTuple):
 def unfiltered_dof(build: JointKFBuild) -> np.ndarray:
     """DoF indices of the unfiltered anchor-chain joints, in mask-column order.
 
-    `build.py` publishes these as ``dof_anchor_unfiltered``, in the same (sorted)
-    order as ``anchor_unfiltered_mask``'s columns, which is exactly what ``J_U``'s
-    column gather needs.
+    `build.py` publishes these as ``dof_anchor_unfiltered``, sorted the same as
+    ``anchor_unfiltered_mask``'s columns, which is what ``J_U``'s column gather
+    needs.  The ``dof_nuisance`` tail slice survives only as a fallback for
+    fixtures that build a `JointKFBuild` by hand: on Alex the ankles are
+    anchor-chain-unfiltered but *off* the root->filtered paths, so they must be
+    locked in ``M``, not marginalised.
 
-    These used to be read off the tail of ``dof_nuisance``, which happened to
-    hold them only because `build.py` appended the anchor chain's unfiltered
-    joints to the mass-matrix nuisance set. That coupling was wrong on Alex (the
-    ankles are anchor-chain-unfiltered but *off* the root->filtered paths, so
-    they must be locked in ``M``, not marginalised); the tail slice survives here
-    only as a fallback for fixtures that build a `JointKFBuild` by hand.
-
-    Kept as a named helper rather than inlined at the call site because a
-    silently mis-ordered gather would put the ankle's Jacobian column under the
-    hip's velocity noise, inflating ``R_anchor`` by the wrong amount in a way no
-    shape check would catch.
+    A named helper, not inlined, because a silently mis-ordered gather would put
+    the ankle's Jacobian column under the hip's velocity noise, inflating
+    ``R_anchor`` by the wrong amount in a way no shape check would catch.
     """
     n_u = int(np.asarray(build.anchor_unfiltered_mask).shape[1])
     if not n_u:
@@ -221,38 +182,22 @@ def anchor_jacobians(
     .. math::
         J = {}^{W}R_{b}^{\mathsf{T}} \left( J^{W}_{\text{foot}} - J^{W}_{\text{base}} \right).
 
-    Differencing is also what removes the floating base: its three rotational DoFs
-    enter both site Jacobians as the same identity block and cancel exactly, while
-    its translational DoFs generate no angular velocity at all.  Gathering only
-    joint columns therefore loses nothing — the same argument
+    Differencing also removes the floating base: its three rotational DoFs enter
+    both site Jacobians as the same identity block and cancel exactly, while its
+    translational DoFs generate no angular velocity at all.  Gathering only joint
+    columns therefore loses nothing — the same argument
     `MjxModel.relative_gyro_jacobian` rests on.
 
-    Parameters
-    ----------
-    build : JointKFBuild
-        Supplies ``dof_joint`` and the two anchor masks.
-    J_ang_world : Array, shape (n_sites, 3, nv)
-        World-frame site angular Jacobians (`MjxModel.site_angular_jacobians`).
-    site_rot : Array, shape (n_sites, 3, 3)
-        World rotations of the same sites.
-    base_site : int
-        Site ordinal of the base IMU.  Static (a Python int) — it selects the
-        frame the whole row is written in, not data.
-    foot_sites : Array, shape (K,) int
-        Site ordinals of the sole sites, in `build`'s anchor order.
-    dof_unfiltered : Array, shape (n_u,) int, optional
-        Defaults to `unfiltered_dof(build)`.
+    `J_ang_world` `(n_sites, 3, nv)` is `MjxModel.site_angular_jacobians`;
+    `site_rot` `(n_sites, 3, 3)` the world rotations of the same sites.
+    `base_site` is a Python int, static: it selects the frame the whole row is
+    written in, not data.  `foot_sites` `(K,)` is in `build`'s anchor order;
+    `dof_unfiltered` defaults to `unfiltered_dof(build)`.
 
-    Returns
-    -------
-    AnchorJacobians
-
-    Notes
-    -----
-    Both masks are applied.  For a clean tree they are redundant — a joint off
-    the base->foot path either moves both sites identically (and cancels in the
-    difference) or moves neither — which is exactly what makes applying them a
-    cheap structural assertion rather than a correction.
+    Both masks are applied.  For a clean tree they are redundant — a joint off the
+    base->foot path either moves both sites identically (and cancels) or moves
+    neither — which is what makes applying them a cheap structural assertion
+    rather than a correction.
     """
     J_ang_world = jnp.asarray(J_ang_world, dtype=jnp.float64)
     site_rot = jnp.asarray(site_rot, dtype=jnp.float64)
@@ -287,16 +232,12 @@ def anchor_noise(
 
     Inactive::
 
-        R_k = r_large * I3          # NEVER zero -- singular S (CLAUDE.md §6)
+        R_k = r_large * I3          # NEVER zero -- singular S (CLAUDE.md §4)
 
-    Parameters
-    ----------
-    sigma_eps : Array, shape (K, 3, 3), optional
-        The ContactNet socket (CLAUDE.md §7): per-foot slip covariance.  Defaults
-        to the heuristic ``anchor_var * I3`` on every foot.  Kept as an argument
-        rather than read from `params` so the learned provider can be dropped in
-        without touching this module — and so nothing here ever needs a
-        `stop_gradient`.
+    ``sigma_eps`` `(K, 3, 3)` is the ContactNet socket (CLAUDE.md §7): per-foot
+    slip covariance, defaulting to the heuristic ``anchor_var * I3``.  An argument
+    rather than a `params` read so the learned provider drops in without touching
+    this module, and so nothing here ever needs a `stop_gradient`.
     """
     K = build.n_anchors
     eye3 = jnp.eye(3, dtype=jnp.float64)
@@ -308,10 +249,9 @@ def anchor_noise(
         if sigma_eps is None
         else jnp.asarray(sigma_eps, dtype=jnp.float64)
     )
-    # Input-noise congruence for the unfiltered chain velocities.  Written as a
-    # Gram product (scale the columns, then J J^T) so it is exactly symmetric
-    # PSD by construction rather than merely to round-off -- the same reason
-    # `process.qa_from_lambda_eff` uses the Gram form.
+    # Input-noise congruence for the unfiltered chain velocities, as a Gram
+    # product (scale the columns, then J J^T) so it is exactly symmetric PSD by
+    # construction -- same reason `process.qa_from_lambda_eff` uses the Gram form.
     Y = J_U * params.sigma_qd_unfiltered
     R_on = eps + jnp.einsum("kic,kjc->kij", Y, Y)
     R_off = jnp.broadcast_to(params.r_large * eye3, (K, 3, 3))
@@ -330,27 +270,17 @@ def anchor_block(
 ) -> AnchorBlock:
     r"""Build the ``(H, z, R)`` anchor block — Java's anchor loop, fixed-shape.
 
-    Parameters
-    ----------
-    gyro_base : Array, shape (3,)
-        **Raw** (bias-uncorrected) gyro of the base IMU, in its own measurement
-        frame.  Uncorrected on purpose: the bias is what the row observes, so
-        subtracting an estimate here would close the loop on the filter's own
-        guess and destroy the very observability the anchor provides.
-    qd_unfiltered : Array, shape (n_u,)
-        Measured velocities of the unfiltered chain joints, in
-        ``anchor_unfiltered_mask`` column order (see `unfiltered_dof`).
-    trusted_feet : Array, shape (K,)
-        **Previous tick's** trusted-stance mask, one entry per anchor slot.
-        Non-zero means trusted; the value itself is not used as a weight, because
-        the Java trusted set is boolean and partial trust is expressed upstream
-        (the Schmitt trigger) rather than by softening the anchor.
-    sigma_eps : Array, shape (K, 3, 3), optional
-        See `anchor_noise`.
+    ``gyro_base`` `(3,)` is the **raw**, bias-uncorrected gyro of the base IMU in
+    its own measurement frame.  Uncorrected on purpose: the bias is what the row
+    observes, so subtracting an estimate here would close the loop on the filter's
+    own guess and destroy the very observability the anchor provides.
 
-    Returns
-    -------
-    AnchorBlock
+    ``qd_unfiltered`` `(n_u,)` is in ``anchor_unfiltered_mask`` column order (see
+    `unfiltered_dof`).  ``trusted_feet`` `(K,)` is the **previous tick's** mask;
+    non-zero means trusted, and the value is not used as a weight, because the
+    Java trusted set is boolean and partial trust is expressed upstream (the
+    Schmitt trigger) rather than by softening the anchor.  ``sigma_eps``: see
+    `anchor_noise`.
     """
     n, K = build.n_joints, build.n_anchors
     dim, m = build.dim, build.n_imus

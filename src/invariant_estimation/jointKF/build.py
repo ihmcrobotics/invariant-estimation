@@ -1,44 +1,20 @@
-"""
-jointKF/build.py
-================
-Graph resolution: turn a robot description plus an IMU-pair list into the static
-`JointKFBuild` the jitted filter step closes over.
+"""Graph resolution: robot description + IMU-pair list -> the static `JointKFBuild`.
 
-This module is where **every name becomes an index** (invariant I7).  Substring
-tables, site names, joint names, sensor-map keys — all resolved here, once, in
-plain Python.  Nothing downstream ever sees a string, and no shape downstream
-ever depends on data.  The Java filter does the equivalent work in its
-constructor; the difference is that we must also fix `K_max` (the anchor count)
-for the filter's lifetime, because a `jnp` graph cannot grow rows when a foot
-lands (invariant I2 / CLAUDE.md §4).
+Where **every name becomes an index** (invariant I7): substring tables, site
+names, joint names, sensor-map keys, all resolved here once in plain Python.
+Unlike the Java constructor this must also fix `K_max` (the anchor count) for the
+filter's lifetime, because a `jnp` graph cannot grow rows when a foot lands
+(invariant I2 / CLAUDE.md §4).
 
-Structural rejection at build time
-----------------------------------
-Two IMU-pair configurations produce a singular measurement and must be rejected
-loudly here rather than debugged later as an ill-conditioned `S`:
+`check_pair_graph` rejects self-pairs, same-link pairs and cycles at build time
+because each produces a *singular* `S` rather than a merely inaccurate one; the
+error strings carry the reasons.  Acyclicity is paper §II-B3 — Alex's star on the
+base IMU is a tree, so this guards a mis-specified config, not a limitation.
 
-* **self-pair** (`parent is child`) — the relative gyro is identically zero, so
-  the pair's three rows are all-zero: `S` loses rank.
-* **same-link pair** — both IMUs rigidly attached to the same body.  No joint
-  lies between them, the selection `S_ab` is empty, and the rows again carry no
-  joint information while still claiming three measurement dimensions.
-
-Acyclicity (paper §II-B3) is checked by union-find over the pair graph.  A cycle
-means two IMU paths share joints in a way that makes the same `q_dot` observable
-twice through different rotations; the stacked measurement is then rank-deficient
-in a way `LSigmaL^T` cannot express, because the shared-bias bookkeeping assumes
-a *tree* of relative measurements over the IMU set.  The star topology Alex
-actually uses (every pair against the base IMU) is a tree, so this passes; it is
-a guard against a mis-specified config, not a limitation.
-
-Loud fallbacks
---------------
-Java logs a boot warning for every joint that falls back to a default noise
-value.  We do the same, via `logging`, because the fallback encoder variance
-(5e-5) is two to four orders of magnitude *above* the hardware-measured
-per-joint values: a joint silently on the fallback badly under-trusts its
-encoder, and the only symptom is a slightly-too-smooth estimate.  The build log
-is the one place that is cheap to notice.
+Fallbacks are logged loudly (Java parity): the fallback encoder variance (5e-5)
+is two to four orders of magnitude *above* the hardware-measured per-joint
+values, so a joint silently on it badly under-trusts its encoder, and the only
+symptom is a slightly-too-smooth estimate.
 """
 import logging
 from collections.abc import Callable, Sequence
@@ -57,48 +33,23 @@ from .state import (
 log = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Robot description — the minimal tree the build needs
-# ---------------------------------------------------------------------------
-
 class KinematicTree(NamedTuple):
-    """The subset of a robot description `build_joint_kf` actually needs.
+    """The subset of a robot description `build_joint_kf` needs.
 
-    Deliberately *not* an MJX object: the build logic is pure graph work, and
-    keeping it model-agnostic means it can be exercised against a hand-written
-    tree in a unit test without standing up a physics engine.  The MJX adapter
-    (`model/mjx_model.py`) produces one of these; so can a URDF reader.
-
-    Attributes
-    ----------
-    joint_names : tuple of str
-        All 1-DoF (hinge) joints, in model order.
-    joint_body : ndarray, shape (n_all,)
-        Body index each joint drives (its child body).
-    body_parent : ndarray, shape (n_bodies,)
-        Parent body of each body; the root's parent is itself or -1.
-    joint_dof : ndarray, shape (n_all,)
-        DoF index of each hinge joint in the full velocity vector.
-    base_dofs : ndarray
-        The floating base's DoF indices (6 for a free joint, empty if fixed).
-    site_body : dict
-        Site (IMU / sole) name -> body index it is attached to.
-    tau_max : ndarray, shape (n_all,)
-        Effort limit per joint; NaN where absent (then `sigma_tau` falls back).
+    Deliberately *not* an MJX object: the build logic is pure graph work, so a
+    hand-written tree exercises it in a unit test with no physics engine.  The
+    MJX adapter (`model/mjx_model.py`) produces one of these; so can a URDF
+    reader.  `tau_max` is NaN where absent (then `sigma_tau` falls back).
     """
 
-    joint_names: tuple[str, ...]
-    joint_body: np.ndarray
-    body_parent: np.ndarray
-    joint_dof: np.ndarray
-    base_dofs: np.ndarray
-    site_body: dict[str, int]
-    tau_max: np.ndarray
+    joint_names: tuple[str, ...]    # all 1-DoF (hinge) joints, in model order
+    joint_body: np.ndarray          # (n_all,) child body each joint drives
+    body_parent: np.ndarray         # (n_bodies,) root's parent is itself or -1
+    joint_dof: np.ndarray           # (n_all,) DoF index in the velocity vector
+    base_dofs: np.ndarray           # floating base DoFs (6, or empty if fixed)
+    site_body: dict[str, int]       # site (IMU / sole) name -> body index
+    tau_max: np.ndarray             # (n_all,) effort limit per joint
 
-
-# ---------------------------------------------------------------------------
-# Tree helpers
-# ---------------------------------------------------------------------------
 
 def _ancestors(tree: KinematicTree, body: int) -> list[int]:
     """Bodies from `body` up to the root, inclusive."""
@@ -114,12 +65,10 @@ def _ancestors(tree: KinematicTree, body: int) -> list[int]:
 
 
 def joints_between(tree: KinematicTree, body_a: int, body_b: int) -> list[int]:
-    """Indices of the hinge joints strictly on the path between two bodies.
+    """Hinge joints strictly on the path between two bodies (LCA of both root walks).
 
-    Walks both bodies to the root, finds the lowest common ancestor, and takes
-    the joints driving every body on either branch below it.  This is the Java
-    "union of 1-DoF joints on the pair chain", and it is what makes `n` — and
-    therefore the whole state dimension — a build-time constant.
+    The Java "union of 1-DoF joints on the pair chain" — what makes `n`, and
+    therefore the whole state dimension, a build-time constant.
     """
     up_a, up_b = _ancestors(tree, body_a), _ancestors(tree, body_b)
     set_b = set(up_b)
@@ -155,9 +104,9 @@ class _UnionFind:
 def check_pair_graph(pairs: Sequence[tuple[int, int]], n_imus: int, imu_body: Sequence[int]) -> None:
     """Reject self-pairs, same-link pairs, and cycles. Raises `ValueError`.
 
-    Called before anything else in the build, because each of these produces a
-    *singular* measurement rather than a merely inaccurate one — and a singular
-    `S` surfaces as an inscrutable conditioning failure thousands of ticks later.
+    Called first in the build: each produces a *singular* measurement rather than
+    a merely inaccurate one, and a singular `S` surfaces as an inscrutable
+    conditioning failure thousands of ticks later.
     """
     uf = _UnionFind(n_imus)
     for e, (parent, child) in enumerate(pairs):
@@ -182,10 +131,6 @@ def check_pair_graph(pairs: Sequence[tuple[int, int]], n_imus: int, imu_body: Se
             )
 
 
-# ---------------------------------------------------------------------------
-# The build
-# ---------------------------------------------------------------------------
-
 def build_joint_kf(
     tree: KinematicTree,
     imu_sites: Sequence[str],
@@ -200,32 +145,17 @@ def build_joint_kf(
 ) -> JointKFBuild:
     """Resolve a robot + IMU-pair spec into the static `JointKFBuild`.
 
-    Parameters
-    ----------
-    tree : KinematicTree
-        The robot description (see that class).
-    imu_sites : sequence of str
-        Site names of the IMUs, in the order that fixes each IMU's *ordinal* —
-        and therefore its bias columns `2n + 3k`. Stable ordering matters: the
-        ordinal is baked into the state layout.
-    pairs : sequence of (parent_ordinal, child_ordinal)
-        The IMU graph. On Alex this is a star on the base IMU.
-    foot_sites : sequence of str
-        Sole sites that can host a stance anchor. `K_max = len(foot_sites)` and
-        is FIXED for the filter's lifetime (invariant I2): a foot landing changes
-        a *mask*, never a shape.
-    base_imu : int
-        Ordinal of the IMU whose bias the stance anchor pins. This is the gauge
-        fixer — without an anchor the common-mode bias direction is unobservable.
-    use_armature_for_rotor : bool
-        If True (the production path) rotor inertia is expected to reach the
-        filter through the MJCF `armature`, folded into `qM` pre-Schur, and the
-        returned `rotor_inertia` array is INFORMATIONAL ONLY — adding it again
-        post-Schur would double-count the drivetrain (CLAUDE.md §6).
+    `imu_sites` order fixes each IMU's *ordinal*, and therefore its bias columns
+    `2n + 3k`, so it is baked into the state layout.  `pairs` is the IMU graph (a
+    star on the base IMU for Alex).  `K_max = len(foot_sites)` is FIXED for the
+    filter's lifetime (invariant I2): a foot landing changes a *mask*, never a
+    shape.  `base_imu` is the IMU whose bias the stance anchor pins — the gauge
+    fixer, without which the common-mode bias direction is unobservable.
 
-    Returns
-    -------
-    JointKFBuild
+    `use_armature_for_rotor=True` (production) means rotor inertia reaches the
+    filter through the MJCF `armature`, folded into `qM` pre-Schur, so the
+    returned `rotor_inertia` array is INFORMATIONAL ONLY — adding it again
+    post-Schur would double-count the drivetrain (CLAUDE.md §6).
     """
     cfg = cfg if cfg is not None else section("joint_kf")
     imu_body = [tree.site_body[s] for s in imu_sites]
@@ -252,18 +182,15 @@ def build_joint_kf(
             pair_velocity_mask[e, index_of[j]] = 1.0
 
     # -- stance anchors, F/U split ------------------------------------------
-    # A base->foot chain generally contains joints that are NOT filter states
-    # (on Alex: the ankles, because there are no foot IMUs). Their measured
-    # velocity enters the anchor row as a known INPUT, so by the input-noise
-    # congruence their covariance must be pushed into R_anchor. Splitting the
-    # chain here is what lets measure/anchors build that congruence.
-    # The chain starts at the BASE IMU's body, NOT the world root. The anchor
-    # asserts that a stance foot's ABSOLUTE angular rate is ~zero, and that rate
-    # is `omega_baseIMU + J(baseIMU->foot) q_dot`; the base IMU's own rate is
-    # what the `+I3` bias column reads back. Rooting the chain at the world
-    # instead would drag every joint between the world and the base IMU into the
-    # unfiltered set, inflating `R_anchor` with velocities the anchor equation
-    # never referenced. (Java `singlePairFootBeyondIMUs(10, 1, 5, 9)` pins this:
+    # Unfiltered chain joints (on Alex: the ankles, no foot IMUs) enter the
+    # anchor row as a known INPUT, so their covariance must be pushed into
+    # R_anchor by the input-noise congruence; this split is what lets
+    # measure/anchors build it.
+    # The chain starts at the BASE IMU's body, NOT the world root, because the
+    # anchor asserts `omega_baseIMU + J(baseIMU->foot) q_dot ~ 0`. Rooting at the
+    # world would drag every joint between world and base IMU into the unfiltered
+    # set, inflating `R_anchor` with velocities the anchor equation never
+    # referenced. (Java `singlePairFootBeyondIMUs(10, 1, 5, 9)` pins this:
     # F = joints 2..5, U = joints 6..9 -- joints 0..1 appear in NEITHER.)
     anchor_root = imu_body[base_imu]
     anchor_filtered = np.zeros((len(foot_sites), n))
@@ -373,6 +300,7 @@ def build_joint_kf(
         alpha=alpha,
         tau_max=tau_max,
         sigma_tau=sigma_tau,
+        # FIXME(owner review): this ternary is a no-op -- both arms are `rotor`.
         rotor_inertia=rotor if not use_armature_for_rotor else rotor,
         encoder_var=encoder_var,
         encoder_wired=encoder_wired,

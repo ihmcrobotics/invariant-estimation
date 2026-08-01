@@ -1,49 +1,36 @@
-"""
-jointKF/filter.py
-=================
-The tick: `predict -> encoder update -> stacked gyro/anchor update`, and a
+"""The tick — `predict -> encoder update -> stacked gyro/anchor update` — and a
 `lax.scan` over a trajectory.
 
-This is the orchestrator the Java `computeJointState()` (phase 1) and
-`computeImuBiases(feet)` (phase 2) map onto.  It owns three things that are
-easy to get wrong in ways no single module can see, and that therefore live
-here rather than being distributed:
+The orchestrator the Java `computeJointState()` (phase 1) and
+`computeImuBiases(feet)` (phase 2) map onto.  It owns three things no single
+module can see:
 
 **1. Phase ordering of the trusted-feet mask.**  The *previous* tick's trust set
-drives *this* tick's anchors (CLAUDE.md §4): the mask is written at the end of
-step `k` and read at the start of `k+1`.  This is not a stylistic choice.  The
-contact signal is derived from the same sensors the filter is about to consume,
-so using this tick's mask would let a foot's contact decision and the
-measurement it gates be correlated through the noise, which quietly biases the
-bias estimate — the one quantity the anchor exists to make observable.  Carrying
-the mask in the scan state is also what keeps it a *value* rather than a
-Python-level decision (I7).
+drives *this* tick's anchors (CLAUDE.md §4).  The contact signal is derived from
+the same sensors the filter is about to consume, so using this tick's mask would
+correlate a foot's contact decision with the measurement it gates through the
+noise, quietly biasing the bias estimate — the one quantity the anchor exists to
+make observable.  Carrying the mask in the scan state also keeps it a *value*
+rather than a Python-level decision (I7).
 
-**2. Two separate updates, not one stacked block.**  Encoders and the gyro/anchor
-stack are applied as sequential Joseph updates rather than one concatenated
-measurement.  Algebraically the two agree only if the noises are independent —
-which they are — but they differ completely under *gating*: one stacked update
-means a single ill-conditioned gyro row throws the encoders away too.  Splitting
-them means a foot in swing, or a NaN on one IMU, costs the filter only the
-channel that actually went bad.  The `cond(S)` gate makes this a behavioural
-difference, not a numerical one.
+**2. Two separate updates, not one stacked block.**  Algebraically they agree
+when the noises are independent (they are), but they differ completely under
+*gating*: one stacked update means a single ill-conditioned gyro row throws the
+encoders away too.  Splitting them means a foot in swing, or a NaN on one IMU,
+costs only the channel that actually went bad.
 
-**3. Everything is a fixed-shape mask.**  No branch in this file depends on a
-traced value, so the jaxpr is identical whichever feet are on the ground and
-whichever gates fire (I7).  What that genuinely buys is *no recompilation* in a
-vmapped/scanned MJX rollout; it does not by itself prove the masks are right,
-which is what the ported tests are for.
+**3. Everything is a fixed-shape mask.**  No branch here depends on a traced
+value, so the jaxpr is identical whichever feet are on the ground and whichever
+gates fire (I7).  That buys *no recompilation* in a vmapped/scanned MJX rollout;
+it does not prove the masks are right, which is what the ported tests are for.
 
-Model quantities as inputs
---------------------------
 `step` takes the model-derived quantities (`J_rel`, `R_rel`, `M`, the anchor
-Jacobians) as *arguments* rather than evaluating a `RobotModel` internally.  Two
-reasons.  It keeps the filter free of any simulator dependency, matching the seam
-discipline the InEKF already follows; and MJX's kinematics tracing cost grows
-sharply with chain depth (PORT_NOTES G1: ~1.3 s to jit a 4-link chain, ~240 s for
-10), so the caller must stay free to evaluate the model once per tick, batch it
-under `vmap`, or precompute a trajectory — decisions that belong to the rollout,
-not to the filter.
+Jacobians) as *arguments* rather than evaluating a `RobotModel` internally.  It
+keeps the filter free of any simulator dependency, and MJX's kinematics tracing
+cost grows sharply with chain depth (PORT_NOTES G1: ~1.3 s to jit a 4-link chain,
+~240 s for 10), so the caller must stay free to evaluate the model once per tick,
+batch it under `vmap`, or precompute a trajectory — decisions belonging to the
+rollout, not the filter.
 """
 from typing import NamedTuple
 
@@ -59,25 +46,17 @@ from .state import JointKFBuild, JointKFParams, JointKFState
 class SensorInputs(NamedTuple):
     """One tick of proprioception.
 
-    Attributes
-    ----------
-    encoders : (n,)
-        Measured joint positions, in filter state order.
-    gyros : (m, 3)
-        Per-IMU angular rate, each **in its own measurement frame** — the frame
-        `b_omega` is stored in, which is what makes the child bias block `+I3`.
-    qd_unfiltered : (n_u,)
-        Measured velocities of the base->foot chain joints that are not filter
-        states (the Alex ankles), in `anchor_unfiltered_mask` column order.
-    contact : (K,)
-        This tick's contact/trust signal per anchor slot. Consumed on the NEXT
-        tick — see the module docstring on phase ordering.
+    `gyros` are each **in that IMU's own measurement frame** — the frame `b_omega`
+    is stored in, which is what makes the child bias block `+I3`.  `contact` is
+    consumed on the NEXT tick (module docstring, phase ordering).
     """
 
-    encoders: Array
-    gyros: Array
-    qd_unfiltered: Array
-    contact: Array
+    encoders: Array         # (n,) measured joint positions, filter state order
+    gyros: Array            # (m, 3) per-IMU angular rate
+    qd_unfiltered: Array    # (n_u,) base->foot chain joints that are not filter
+                            # states (the Alex ankles), in
+                            # `anchor_unfiltered_mask` column order
+    contact: Array          # (K,) this tick's trust signal per anchor slot
 
 
 class ModelInputs(NamedTuple):
@@ -100,16 +79,15 @@ class TickDiagnostics(NamedTuple):
     """Per-tick observables (CLAUDE.md §4: the tests read these, so they are seam).
 
     The Java filter publishes these as YoVariables; here they are a pytree so a
-    scan can stack them over a trajectory without any host callback.
+    scan stacks them over a trajectory with no host callback.
 
-    The per-channel NIS fields are kept **separate** rather than merged into one
-    array.  Java dispatches its diagnostics on an exact-match label string
-    (``"encoder"`` vs ``"encoderVelocity"``), which cannot cross a jit boundary;
-    separate fields port the *observable* that dispatch existed to provide — one
-    channel structurally cannot publish into another's diagnostic.  The
-    direct-velocity channel's cross-talk guard (`velocity.py`) asserts exactly
-    this, and it only holds end-to-end because the encoder channel writes the
-    encoder field and nothing else does.
+    Per-channel NIS fields are kept **separate** rather than merged: Java
+    dispatches diagnostics on an exact-match label string (``"encoder"`` vs
+    ``"encoderVelocity"``), which cannot cross a jit boundary, so separate fields
+    port the observable — one channel structurally cannot publish into another's
+    diagnostic.  `velocity.py`'s cross-talk guard asserts this, and it only holds
+    end-to-end because the encoder channel writes the encoder field and nothing
+    else does.
     """
 
     encoder_nis: Array
@@ -128,10 +106,9 @@ class TickDiagnostics(NamedTuple):
 def init_carry(build: JointKFBuild, params: JointKFParams, q0: Array | None = None) -> FilterCarry:
     """Seed the scan carry.  Feet start untrusted.
 
-    Untrusted rather than trusted is deliberate and matches the Java on-ground
-    init gate's intent: the base bias is observable *only* through the anchor, so
-    seeding as if a foot were planted when the robot is actually hanging asserts
-    an observation that was never made.
+    Deliberate, matching the Java on-ground init gate's intent: the base bias is
+    observable *only* through the anchor, so seeding as if a foot were planted
+    when the robot is hanging asserts an observation that was never made.
     """
     from .state import init_state
 
@@ -217,11 +194,11 @@ def run(
     build: JointKFBuild,
     params: JointKFParams,
 ) -> tuple[FilterCarry, TickDiagnostics]:
-    """Scan `step` over a trajectory.
+    """Scan `step` over a trajectory; `sensors`/`model` are pytrees with a leading
+    time axis.
 
-    `sensors` and `model` are pytrees with a leading time axis.  The scan is over
-    *values*, so the compiled graph is one tick regardless of trajectory length —
-    which is the point of keeping every gate a mask.
+    The scan is over *values*, so the compiled graph is one tick regardless of
+    trajectory length — the point of keeping every gate a mask.
     """
     def body(c, inputs):
         s, mdl = inputs

@@ -3,29 +3,19 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ContactNetConfig:
-    """
-    Every hyperparameter, in one immutable and static object.
+    """Every hyperparameter, in one immutable static object — never a pytree leaf, never traced.
 
-    Never a pytree leaf and never is traced, this is passed to `network.init`,
-    `rollout.make_segment_loss`, and `train.train` as plain Python scalars, which
-    is what keeps `ContactNetParams` arrays-only (if it was non-Array,
-    it would become a leaf and `jax.grad`/`optax` would try and update it).
-
-    `frozen=True` also makes it hashable, so it can be a `static_argnum` if a call site
-    needs it to be in the future.
-
-    The two fields without defaults are the open numbers that cannot be guessed,
-    as they are positional and cannot be omitted.
+    Passed to `network.init`, `rollout.make_segment_loss` and `train.train` as
+    plain Python scalars, which is what keeps `ContactNetParams` arrays-only: a
+    non-Array field here would become a leaf and `jax.grad`/`optax` would try to
+    update it. `frozen=True` also makes it hashable, so it can be a
+    `static_argnum` if a call site ever needs that.
     """
     F: int
-    """
-    Per contact feature count (channels x subchain joints). Fixed by
-    `features.py` once its channel ordering is frozen, with `d_in = H * F`.
-    """
+    """Per-contact feature count (channels × subchain joints), fixed by `features.py`; ``d_in = H * F``."""
 
     sigma_0: float
-    """
-    Initial per axis contact STD, the constant `network.init` makes the head emit.
+    """Initial per-axis contact STD — the constant `network.init` makes the head emit.
 
     **1e-4 is a MEASUREMENT-socket number and does not transfer.** Its
     justification was: the port has no contact measurement noise (`N = J Sigma_q
@@ -43,18 +33,15 @@ class ContactNetConfig:
     configuration.
 
     **Choose the initialization deliberately before the next run** -- see TODO.md,
-    "Initialization on the process socket". Nothing here enforces it.
-
-    NOTE: still worth re-measuring on the real model, as described in PORT_NOTES.md
+    "Initialization on the process socket". Nothing here enforces it. Still worth
+    re-measuring on the real model (PORT_NOTES.md).
     """
 
     # architecture
     H: int = 50 # history SAMPLES per evaluation (not span -- see `window_span_s`)
 
     window_span_s: float = 0.392
-    """
-    Seconds the history window reaches BACK over. The window is specified as a
-    DURATION, and `stride` is derived from it and `dt` -- never the reverse.
+    """Seconds the history window reaches BACK over; `stride` is DERIVED from it and `dt`, never the reverse.
 
     The span, not the sample count, is what has to be argued about. Measured on
     the 2026-07-17 Alex log (1 kHz): joint position f99 = 1.10 Hz, joint torque
@@ -72,11 +59,9 @@ class ContactNetConfig:
     """
 
     dt: float = 1.0e-3
-    """
-    Sim/filter tick period [s]. MUST match the loop this config is windowed on
+    """Sim/filter tick period [s]. MUST match the loop this config is windowed on
     (`run_policy.DT`, and the estimator's own `dt`) -- it is the only thing
-    converting `window_span_s` into ticks.
-    """
+    converting `window_span_s` into ticks."""
 
     widths: tuple[int, ...] = (256, 256) # trunk
     eps: float = 1.0e-6 # softplus floor on diag(L)
@@ -99,16 +84,11 @@ class ContactNetConfig:
     # filter coupling
     n_contacts: int = 2
     contact_chol_const: float = 1.0e-4
-    """
-    Stance anchor process factor used ONLY when `freeze_contact_chol` is set.
-
-    Kept so the run-1 configuration stays reproducible; see `freeze_contact_chol`
-    for why it is no longer the default.
-    """
+    """Stance-anchor process factor used ONLY when `freeze_contact_chol` is set;
+    kept so the run-1 configuration stays reproducible."""
 
     freeze_contact_chol: bool = False
-    """
-    Freeze the stance-anchor PROCESS socket at `contact_chol_const` (run-1 behaviour).
+    """Freeze the stance-anchor PROCESS socket at `contact_chol_const` (run-1 behaviour).
 
     `False` is the default because freezing it was measured to be the primary
     cause of run 1's collapse. `sim/sensors.py` drives `contact_chol` from
@@ -138,12 +118,14 @@ class ContactNetConfig:
     condition belongs in the process noise, and the FK measurement is not wrong
     during swing. The freeze removes the correct lever and asks the measurement
     socket to compensate.
+
+    This is the canonical statement; `dataset.py`, `rollout.make_warm_in` and
+    `online.make_provider` cross-reference it.
     """
 
     # chained segments (see `dataset.ChainedBatcher`)
     warm_in_s: float = 1.0
-    """
-    Seconds a freshly seeded chain runs before its segments are trained on.
+    """Seconds a freshly seeded chain runs before its segments are trained on.
 
     A chain is seeded from ground truth, so it starts at **zero** estimation
     error -- a state the deployed filter is never in. Until the error grows to
@@ -160,8 +142,7 @@ class ContactNetConfig:
     """
 
     episode_s: float = 43.0
-    """
-    Seconds a chain runs before being re-seeded from ground truth.
+    """Seconds a chain runs before being re-seeded from ground truth.
 
     Bounds how far the filter may drift. CoCo-InEKF (arXiv 2605.15122) uses
     T = 100 s (dancing) / 6 s (ground motions).
@@ -210,19 +191,16 @@ class ContactNetConfig:
     def window_span_ticks(self) -> int:
         """Ticks the history window reaches back over: ``(H-1)*stride + 1``.
 
-        This, not `H`, is the number to compare against the signal bandwidth.
-        Measured on the 2026-07-17 log, joint position has f99 = 1.10 Hz and
-        torque f99 = 4.25 Hz, so the span must cover a meaningful fraction of a
-        stride (5.47 s there) rather than a fraction of a millisecond.
+        This, not `H`, is the number to compare against the signal bandwidth
+        (see `window_span_s` for the measured f99s and the stride fundamental).
         """
         return (self.H - 1) * self.stride + 1
 
     @property
     def window_span_seconds(self) -> float:
-        """The ACHIEVED span, ``(H-1)*stride*dt`` -- compare against `window_span_s`.
+        """The ACHIEVED span, ``(H-1)*stride*dt`` -- print this, never the request.
 
-        Differs from the request whenever `stride` had to round (see there).
-        Print this, never the request, when reporting what the network sees.
+        Differs from `window_span_s` whenever `stride` had to round (see there).
         """
         return (self.H - 1) * self.stride * self.dt
 
@@ -230,8 +208,8 @@ class ContactNetConfig:
     def effective_rate_hz(self) -> float:
         """Sample rate the window actually observes, ``1/(stride*dt)``.
 
-        The strided gather resamples at this rate; `features.boxcar` is the
-        anti-alias filter for it, and its first null sits exactly here.
+        `features.boxcar` is the anti-alias filter for it, and its first null
+        sits exactly here.
         """
         return 1.0 / (self.stride * self.dt)
 
@@ -239,20 +217,18 @@ class ContactNetConfig:
     def nyquist_hz(self) -> float:
         """``0.5/(stride*dt)`` -- the number the bandwidth argument is about.
 
-        Every channel's f99 must sit below this or it folds: torque 4.25 Hz,
-        gyro 53.9 Hz, accel 155.6 Hz (2026-07-17 log). At the defaults this is
-        62.5 Hz, so `q`, `tau` and gyro are clear and only the accelerometer is
-        deliberately decimated -- its >Nyquist impact ringing is removed by the
-        boxcar rather than scattered into the low band (PORT_NOTES.md).
+        Every channel's f99 (see `window_span_s`) must sit below this or it
+        folds. At the defaults this is 62.5 Hz, so `q`, `tau` and gyro are clear
+        and only the accelerometer is deliberately decimated -- its >Nyquist
+        impact ringing is removed by the boxcar rather than scattered into the
+        low band (PORT_NOTES.md).
         """
         return 0.5 / (self.stride * self.dt)
 
     @property
     def dof(self) -> int:
-        """
-        Contact measurement dimension. NIS ~ chi^2(dof), so a calibrated
-        filter has `nis_over_dof == 1`.
-        """
+        """Contact measurement dimension. NIS ~ chi^2(dof), so a calibrated
+        filter has `nis_over_dof == 1`."""
         return 3 * self.n_contacts
 
     def __post_init__(self):
@@ -321,6 +297,3 @@ class ContactNetConfig:
     @property
     def episode_ticks(self) -> int:
         return int(round(self.episode_s / self.dt))
-
-
-

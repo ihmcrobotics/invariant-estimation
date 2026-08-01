@@ -1,61 +1,46 @@
-r"""
-jointKF/update.py
-=================
-The **one** measurement-update path of the joint-space KF: Joseph-form covariance
-update with a masked gain (Java `josephUpdate`, gate G6).  Every measurement the
-filter takes — encoder rows, the stacked ``L Σ Lᵀ`` gyro block, the stance
-anchors, the optional direct-velocity channel — goes through this function, so
-the gating and conditioning semantics cannot drift between channels.
+r"""The **one** measurement-update path of the joint-space KF: Joseph-form
+covariance update with a masked gain (Java `josephUpdate`, gate G6).
 
-Joseph, not ``(I − KH)P``
--------------------------
-The short form is algebraically equal to the Joseph form **only at the exactly
-optimal gain**.  Two things here guarantee the gain is not exactly optimal: the
-gyro rows carry a Jacobian ``J_ang(q̂)`` linearised at an estimate, and the gate
-below deliberately applies ``K = 0`` (a legal but suboptimal gain) whenever ``S``
-is ill-conditioned.  The Joseph form
+Every measurement — encoder rows, the stacked ``L Σ Lᵀ`` gyro block, the stance
+anchors, the optional direct-velocity channel — goes through this function, so the
+gating and conditioning semantics cannot drift between channels.
 
-    P⁺ = (I − KH) P (I − KH)ᵀ + K R Kᵀ
+**Joseph, not ``(I − KH)P``.**  The short form equals the Joseph form only at the
+exactly optimal gain, and two things guarantee the gain is not optimal: the gyro
+rows carry a ``J_ang(q̂)`` linearised at an estimate, and the gate below applies
+``K = 0`` (legal but suboptimal) whenever ``S`` is ill-conditioned.
+``P⁺ = (I − KH) P (I − KH)ᵀ + K R Kᵀ`` is the honest pushforward of
+``e⁺ = (I − KH) e⁻ − K v`` over *both* error sources, correct for whatever ``K``
+was actually applied and a sum of two congruences — structurally PSD.  The short
+form under a suboptimal gain is neither.
 
-is the honest ``L Σ Lᵀ`` pushforward of the posterior error
-``e⁺ = (I − KH) e⁻ − K v`` over *both* error sources, so it is correct for
-whatever ``K`` was actually applied and is a sum of two congruences — structurally
-PSD.  The short form under a suboptimal gain is neither.
+**Conditioning gate — skip, never latch.**  ``cond(S)`` is estimated from the
+Cholesky factor's diagonal as ``(max L_ii / min L_ii)²``: an eigendecomposition
+costs more than the update and is not differentiable-friendly, whereas the factor
+is already computed for the gain solve.  Above `cond_s_max` the entire update is
+dropped by zeroing ``K``.  A finite but ill-conditioned ``S`` inverts to a huge
+gain and the ``K R Kᵀ`` term squares it every tick — the covariance divergence
+mechanism a plain `isfinite` guard is blind to.  Dropping the update loses
+information for one tick; taking it poisons ``P`` permanently.
 
-Conditioning gate — skip, never latch
--------------------------------------
-``cond(S)`` is estimated from the Cholesky factor's diagonal as
-``(max L_ii / min L_ii)²``: an eigendecomposition would cost more than the update
-and is not differentiable-friendly, whereas the factor is already computed for the
-gain solve.  Above `cond_s_max` the entire update is dropped by zeroing ``K``.
+The gate is a **float mask**, never a Python branch (I7).  A gated update must
+leave ``(x, P)`` **bit-identical** (`testSingularInnovationIsSkippedNotLatched`,
+tolerance exactly 0.0), so the result is selected with `jnp.where` on the *whole*
+carry rather than merely zeroing the gain: with ``K = 0``, ``(I−KH) P (I−KH)ᵀ``
+re-derives ``P`` through two matrix products and a symmetrisation, and neither is
+obliged to return the input bit-for-bit if ``P`` is not already exactly symmetric.
 
-This matters more than it looks.  A finite but ill-conditioned ``S`` inverts to a
-huge gain, and the ``K R Kᵀ`` term squares it every tick — that is the covariance
-divergence mechanism a plain `isfinite` guard is blind to.  Dropping the update
-loses information for one tick; taking it poisons ``P`` permanently.
-
-The gate is a **float mask**, never a Python branch (I7): the graph is identical
-whether or not the update is taken, which is what lets the whole step live inside
-one jitted `lax.scan`.  A gated update must leave ``(x, P)`` **bit-identical**
-(`testSingularInnovationIsSkippedNotLatched`, tolerance exactly 0.0), so the
-result is selected with `jnp.where` on the *whole* carry rather than merely
-zeroing the gain: with `K = 0`, ``(I−KH) P (I−KH)ᵀ`` re-derives ``P`` through two
-matrix products and a symmetrisation, and neither is obliged to return the input
-bit-for-bit if ``P`` is not already exactly symmetric.
-
-NaN hardening
--------------
-A single non-finite sensor sample must be *skipped*, not propagated, and must not
-latch — `testTransientNonFiniteInputRecovers` restores clean input and demands the
-filter track again with no intervention.  So ``H, z, R`` are checked for
-finiteness and **sanitised before use**, not merely multiplied by a zero gate:
+**NaN hardening.**  A single non-finite sample must be *skipped*, not propagated,
+and must not latch (`testTransientNonFiniteInputRecovers` restores clean input and
+demands the filter track again with no intervention).  So ``H, z, R`` are checked
+for finiteness and **sanitised before use**, not merely multiplied by a zero gate:
 ``0.0 * NaN = NaN``, and a NaN reaching ``P`` is permanent.  The sanitised
-``R → I`` (never ``0``) keeps ``S`` non-singular so the Cholesky itself stays
-finite; the gate independently records that nothing was applied.
+``R → I`` (never ``0``) keeps ``S`` non-singular so the Cholesky stays finite; the
+gate independently records that nothing was applied.
 
-NIS is computed on the **prior** ``P`` and the **prior** residual
-(CLAUDE.md §6): ``ν ᵀ S⁻¹ ν`` with ``S = H P⁻ Hᵀ + R``.  Computing it after the
-update passes every easy test and fails the quadratic-form oracle.
+NIS is computed on the **prior** ``P`` and the **prior** residual (CLAUDE.md §6):
+``ν ᵀ S⁻¹ ν`` with ``S = H P⁻ Hᵀ + R``.  Computing it after the update passes
+every easy test and fails the quadratic-form oracle.
 """
 from typing import NamedTuple
 
@@ -69,26 +54,13 @@ from .state import JointKFParams, JointKFState
 def joseph_covariance(P: Array, K: Array, H: Array, R: Array) -> Array:
     r"""``P⁺ = (I − KH) P (I − KH)ᵀ + K R Kᵀ``, symmetrised.
 
-    Exposed as its own function because it is the only part of the update that is
-    correct for an **arbitrary** gain, and therefore the only part a test can
-    constrain independently: at the optimal ``K`` the short form ``(I − KH) P`` is
+    Its own function because it is the only part of the update correct for an
+    **arbitrary** ``K``, and therefore the only part a test can constrain
+    independently: at the optimal ``K`` the short form ``(I − KH) P`` is
     algebraically identical, so no test driven through `joseph_update` can tell
     the two apart.  Feed this a deliberately suboptimal ``K`` and they diverge —
-    which is exactly the regime the filter enters whenever ``H`` is a linearised
-    Jacobian or the conditioning gate has zeroed the gain.
-
-    Parameters
-    ----------
-    P : Array, shape (dim, dim)
-        Prior covariance.
-    K : Array, shape (dim, k)
-        The gain **actually applied** — not necessarily the optimal one.
-    H : Array, shape (k, dim)
-    R : Array, shape (k, k)
-
-    Returns
-    -------
-    Array, shape (dim, dim)
+    exactly the regime the filter enters whenever ``H`` is a linearised Jacobian
+    or the conditioning gate has zeroed the gain.
     """
     IKH = jnp.eye(P.shape[0], dtype=P.dtype) - K @ H
     P_new = IKH @ P @ IKH.T + K @ R @ K.T
@@ -101,46 +73,27 @@ class UpdateInfo(NamedTuple):
     CLAUDE.md §4: the Java filter publishes these as YoVariables and the ported
     tests read them, so they are returned as a pytree of arrays.
 
-    Attributes
-    ----------
-    nu : Array, shape (k,)
-        Prior innovation ``z − H x⁻`` actually used.  When the finiteness gate
-        fires this is the sanitised (zero) residual; `was_applied` is the flag to
-        read, not `nu`.
-    S : Array, shape (k, k)
-        Symmetrised innovation covariance ``H P⁻ Hᵀ + R``.
-    nis : Array, scalar
-        Normalised innovation squared ``νᵀ S⁻¹ ν`` on the **prior** ``P`` and the
-        **prior** residual.  ``NaN`` whenever the update was gated out — a skipped
-        update has no meaningful consistency statistic, and NaN cannot be
-        mistaken for "in band".
-    condition_proxy : Array, scalar
-        ``(max L_ii / min L_ii)²`` from the Cholesky factor of ``S``.  ``inf`` or
-        ``NaN`` for an exactly singular ``S`` (either gates).
-    was_applied : Array, scalar float
-        ``1.0`` if the gain was applied, ``0.0`` if the update was skipped.
-        Java `wasLastUpdateApplied`.
-    nis_per_row : Array, shape (k,)
-        Per-row ``ν_i² / S_ii``.  ``NaN`` when gated, same convention as `nis`.
+    `nu` is the prior innovation actually used; when the finiteness gate fires it
+    is the sanitised (zero) residual, so `was_applied` is the flag to read, not
+    `nu`.  `nis` and `nis_per_row` are ``NaN`` whenever the update was gated out —
+    a skipped update has no meaningful consistency statistic, and NaN cannot be
+    mistaken for "in band".
 
-        The aggregate `nis` cannot localise a fault: the whole point of the Java
-        per-joint `jointKF_encNIS_<joint>` diagnostic is to say *which* encoder
-        went bad, and a single scalar over all rows cannot.  For a diagonal
-        channel (encoders, direct velocity) each row is an independent
-        ``chi²₁``, which is exactly what the NIS-consistency tests assert.
-
-        Note this is the per-row *marginal* statistic, not a decomposition of
-        `nis` — they agree only when ``S`` is diagonal.  For the correlated
-        stacked gyro measurement the marginals are still individually
-        interpretable, but they do not sum to `nis`.
+    `nis_per_row` is the per-row *marginal* ``ν_i² / S_ii``, not a decomposition
+    of `nis`; the two agree only when ``S`` is diagonal.  It exists because the
+    aggregate cannot localise a fault, which is the whole point of the Java
+    per-joint `jointKF_encNIS_<joint>` diagnostic.  For a diagonal channel each
+    row is an independent ``chi²₁``, which is what the NIS-consistency tests
+    assert; for the correlated stacked gyro measurement the marginals stay
+    individually interpretable but do not sum to `nis`.
     """
 
-    nu: Array
-    S: Array
-    nis: Array
-    condition_proxy: Array
-    was_applied: Array
-    nis_per_row: Array
+    nu: Array               # (k,) prior innovation z − H x⁻
+    S: Array                # (k, k) symmetrised H P⁻ Hᵀ + R
+    nis: Array              # () νᵀ S⁻¹ ν on the PRIOR P and PRIOR residual
+    condition_proxy: Array  # () (max L_ii/min L_ii)²; inf/NaN if S is singular
+    was_applied: Array      # () 1.0 applied / 0.0 skipped. Java wasLastUpdateApplied
+    nis_per_row: Array      # (k,)
 
 
 def joseph_update(
@@ -164,30 +117,11 @@ def joseph_update(
     all multiplied by the float gate ``was_applied = finite(H, z, R) ∧
     cond(S) < cond_s_max``.  A gated update returns ``(x, P)`` bit-identically.
 
-    Parameters
-    ----------
-    state : JointKFState
-        Prior (post-predict) carry.
-    H : Array, shape (k, dim)
-        Measurement Jacobian.  Fixed-shape: inactive rows are masked by giving
-        them ``R_LARGE`` (`JointKFParams.r_large`), never by dropping them (I7).
-    z : Array, shape (k,)
-        Measurement.
-    R : Array, shape (k, k)
-        Measurement covariance.
-    params : JointKFParams
-        Supplies ``cond_s_max``.
-    label : str, optional
-        Static tag for host-side diagnostic attribution (Java passes a label into
-        `describeSingularInnovation`).  Not returned in `UpdateInfo`: strings
-        cannot cross a jit boundary, and the constant-graph rule (I7) forbids
-        branching on it.
-
-    Returns
-    -------
-    state : JointKFState
-        Posterior carry, or the prior bit-for-bit if gated.
-    info : UpdateInfo
+    ``H`` `(k, dim)` is fixed-shape: inactive rows are masked by giving them
+    ``R_LARGE`` (`JointKFParams.r_large`), never by dropping them (I7).  ``label``
+    is a static tag for host-side attribution (Java passes one into
+    `describeSingularInnovation`) and is not returned in `UpdateInfo`: strings
+    cannot cross a jit boundary, and I7 forbids branching on it.
     """
     del label  # host-side attribution only; see the docstring.
 
@@ -216,20 +150,15 @@ def joseph_update(
     # block-diagonal there and its Cholesky diagonal is exactly `sqrt(R_LARGE)`.
     # Counting it would make `cond(S) ~ R_LARGE / lambda_min(pair block) ~ 4e11`,
     # far above `cond_s_max = 1e9` — so the gate would drop the ENTIRE stacked
-    # update, gyro rows included, on every tick any foot is in swing. That is to
-    # say: the filter would stop updating for the whole of walking.
+    # update, gyro rows included, on every tick any foot is in swing: the filter
+    # would stop updating for the whole of walking. Java never meets this because
+    # its stacked measurement has no anchor rows when no foot is trusted.
     #
-    # Java never meets this because its stacked measurement literally has no
-    # anchor rows when no foot is trusted; the fixed-shape port has to say the
-    # same thing with a mask, and `R_LARGE` and `cond_s_max` are otherwise
-    # mutually destructive as configured.
-    #
-    # Excluding them is not a fudge, it is the gate's own semantics: the gate
-    # exists to catch an `S` that inverts to a HUGE gain, and a row we have
-    # declared uninformative contributes gain ~1/R_LARGE ~ 0. It is the safest
-    # row in the matrix, not the most dangerous. Deriving the mask from `R`
-    # rather than an extra argument keeps this true for any caller that follows
-    # the masking rule, with no plumbing to forget.
+    # Excluding them is the gate's own semantics, not a fudge: the gate exists to
+    # catch an `S` that inverts to a HUGE gain, and a row declared uninformative
+    # contributes gain ~1/R_LARGE ~ 0. Deriving the mask from `R` rather than an
+    # extra argument keeps this true for any caller that follows the masking
+    # rule, with no plumbing to forget.
     diag = jnp.abs(jnp.diag(factor[0]))
     informative = jnp.diag(Rs) < 0.5 * params.r_large
     any_informative = jnp.any(informative)

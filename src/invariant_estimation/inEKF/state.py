@@ -1,13 +1,8 @@
-"""
-inEKF/state.py
-==============
-State and parameter types for the world-centric, right-invariant contact-aided
-InEKF on ``SE_{N+2}(3)`` (CLAUDE.md §1), plus the two state-independent constants
-the whole filter is built around: the propagation transition ``Φ`` (§3.2) and the
-FK observation matrix ``H`` (§4.1).
+r"""State and parameter types for the InEKF on ``SE_{N+2}(3)``, plus the two
+state-independent constants the whole filter is built around: the propagation
+transition ``Φ`` (§3.2) and the FK observation matrix ``H`` (§4.1).
 
-The estimated group element is the ``(N+5)x(N+5)`` matrix (left-superscript /
-Traversaro notation)
+The estimated group element is the ``(N+5)x(N+5)`` matrix
 
         ┌ R   v   p   d_1  …  d_N ┐
         │ 0   1   0   0    …  0   │
@@ -21,27 +16,15 @@ Traversaro notation)
   p   = {}^{W}p_{WB}     base position in world
   d_i = {}^{W}p_{WC_i}   world position of contact candidate i
 
-The right-invariant error ``η^r = X̄ X⁻¹ = exp(ξ^)`` lives in ``ξ ∈ R^{3N+9}``
-with the fixed ordering (never permuted — ``P``, ``Φ`` and ``H`` all assume it):
+The right-invariant error ``η^r = X̄ X⁻¹ = exp(ξ^)`` lives in ``ξ ∈ R^{3N+9}`` with
+the fixed ordering (never permuted — ``P``, ``Φ`` and ``H`` all assume it):
 
   ξ = [ ξ_R ; ξ_v ; ξ_p ; ξ_{d_1} ; … ; ξ_{d_N} ]
 
-Design notes
-------------
-* `InEKFState` is a `NamedTuple` → valid JAX pytree, clean `lax.scan` carry.
-* **`N` is NOT stored** — it is implicit in `d.shape[0]`.  Storing it would force
-  static-int handling and provoke recompiles (CLAUDE.md §1.3).
-* All `N` contact candidates are kept in the state *permanently* (CoCo): a
-  candidate not in contact is expressed through a large contact covariance, never
-  a shape change.  This keeps the computation graph constant — required for
-  `jit` + `scan` + BPTT (§1.1, invariant 5).
-* `d` is one `(N, 3)` array, not a Python list, so every per-contact op is a
-  single `vmap` / broadcast.
-* The dense matrix is built on demand (`InEKFState.as_matrix`); only
-  `(R, v, p, d)` are stored (§1.3).
-* `InEKFParams` carries the run-fixed config **and the precomputed constants
-  ``Φ`` and ``H``** (invariant 6): they are never rebuilt inside the scan body —
-  in particular `expm` is never called in the loop (§3.2).
+**``N`` is not stored** — it is implicit in ``d.shape[0]``.  Storing it would force
+static-int handling and provoke recompiles.  All ``N`` contact candidates stay in
+the state permanently (I2): a candidate not in contact is expressed through a large
+contact covariance, never a shape change.
 """
 from typing import NamedTuple
 
@@ -52,14 +35,8 @@ from ..config import section
 from .group import skew
 
 
-# ---------------------------------------------------------------------------
-# Tangent-space layout  (CLAUDE.md I4 — rotation-first, never permuted)
-#
-#   ξ = [ ξ_R (0:3) ; ξ_v (3:6) ; ξ_p (6:9) ; ξ_{d_i} (9+3i : 12+3i) ]
-#
-# Locked by the ported `InvariantStateTest.testTangentIndices`.  These are
-# plain Python ints (static) — safe to index traced arrays with.
-# ---------------------------------------------------------------------------
+# Tangent-space layout (I4 — rotation-first, never permuted), locked by the ported
+# `InvariantStateTest.testTangentIndices`.  Plain Python ints (static).
 
 ROTATION_TANGENT_INDEX = 0
 BASE_VELOCITY_TANGENT_INDEX = 3
@@ -79,22 +56,10 @@ def _check_contact_index(i: int, N: int) -> None:
 
 
 class InEKFState(NamedTuple):
-    """Sufficient statistic for the contact-aided InEKF.
-
-    Attributes
-    ----------
-    R : Array, shape (3, 3)
-        Base orientation ``{}^{W}R_{B}`` (world ← body).
-    v : Array, shape (3,)
-        Base linear velocity ``{}^{W}v_{B}`` in world.
-    p : Array, shape (3,)
-        Base position ``{}^{W}p_{WB}`` in world.
-    d : Array, shape (N, 3)
-        Stacked contact-candidate world positions ``{}^{W}p_{WC_i}`` — the
-        ``vmap`` axis is axis 0.
-    P : Array, shape (3N+9, 3N+9)
-        Right-invariant error covariance over
-        ``ξ = [ξ_R ; ξ_v ; ξ_p ; ξ_{d_1} ; … ; ξ_{d_N}]``.
+    """Sufficient statistic for the contact-aided InEKF: the group element's blocks
+    ``(R, v, p, d)`` as named in the module docstring, plus the right-invariant error
+    covariance ``P`` over ``ξ``.  A `NamedTuple`, so a valid pytree and a clean
+    `lax.scan` carry; ``d``'s vmap axis is axis 0.
     """
     R: Array      # (3, 3)
     v: Array      # (3,)
@@ -112,11 +77,8 @@ class InEKFState(NamedTuple):
         """Tangent / covariance dimension ``3N + 9``."""
         return 3 * self.N + 9
 
-    # -- Java-parity aliases (`InvariantState`, ported suite) ---------------
-    #
-    # `getGroupSize()` / `getTangentSize()` / `getNumberOfContacts()` in the
-    # Java `InvariantState`.  Same numbers as `N` / `dim`, named so the ported
-    # tests read 1:1 against `InvariantStateTest`.
+    # Java-parity aliases (`InvariantState`, ported suite): same numbers as
+    # `N` / `dim`, named so the ported tests read 1:1 against `InvariantStateTest`.
 
     @property
     def group_size(self) -> int:
@@ -132,10 +94,8 @@ class InEKFState(NamedTuple):
     def identity(cls, N: int) -> "InEKFState":
         """Fresh state at the group identity with **zero** covariance.
 
-        The Java `InvariantState(int numberOfContacts)` constructor: ``X = I``
-        of size ``(5+N)x(5+N)``, ``P = 0`` of size ``(9+3N)x(9+3N)``.  Note
-        ``P`` is zeros, *not* identity — a prior is applied separately by
-        `init_state`.
+        Java `InvariantState(int numberOfContacts)`: ``P`` is zeros, *not*
+        identity — a prior is applied separately by `init_state`.
         """
         return cls(
             R=jnp.eye(3),
@@ -146,18 +106,13 @@ class InEKFState(NamedTuple):
         )
 
     def set_to_identity(self) -> "InEKFState":
-        """Reset ``X`` to the group identity, leaving ``P`` untouched.
-
-        Mirrors Java `setToIdentity()`, which only touches the group element.
-        """
+        """Reset ``X`` to the group identity, leaving ``P`` untouched (Java `setToIdentity()`)."""
         return self._replace(
             R=jnp.eye(3),
             v=jnp.zeros(3),
             p=jnp.zeros(3),
             d=jnp.zeros_like(self.d),
         )
-
-    # -- contact accessors (bounds-checked, static index) -------------------
 
     def get_contact_position(self, i: int) -> Array:
         """World position ``d_i`` of contact ``i``; `IndexError` if out of range."""
@@ -176,12 +131,7 @@ class InEKFState(NamedTuple):
 
     @property
     def as_matrix(self) -> Array:
-        """Dense ``(N+5, N+5)`` group element ``X`` built from `(R, v, p, d)`.
-
-        Built on demand for the Lie ops that need the dense form (Adjoint,
-        innovation mapping); the state itself stores only the compact parts
-        (§1.3).
-        """
+        """Dense ``(N+5, N+5)`` group element ``X``, built on demand from `(R, v, p, d)`."""
         N = self.N
         X = jnp.eye(N + 5)
         X = X.at[0:3, 0:3].set(self.R)
@@ -191,14 +141,10 @@ class InEKFState(NamedTuple):
         return X
 
 
-# ---------------------------------------------------------------------------
-# Precomputed constants:  Φ (transition)  and  H (FK observation)
-# ---------------------------------------------------------------------------
-
 def build_Phi(g: Array, dt: float, N: int) -> Array:
-    r"""Constant right-invariant transition ``Φ = expm(A^r dt)`` (§3.2).
+    r"""Constant right-invariant transition ``Φ = expm(A^r dt)``, shape ``(3N+9, 3N+9)`` (§3.2).
 
-    With no bias in the state the error dynamics matrix ``A^r`` is constant and
+    With no bias in the state (I1) the error dynamics matrix ``A^r`` is constant and
     nilpotent (``(A^r)³ = 0``), so ``Φ`` is the exact closed form
 
         ┌ I            0      0   0 ┐   (R)
@@ -207,20 +153,7 @@ def build_Phi(g: Array, dt: float, N: int) -> Array:
         └ 0            0      0   I ┘   (d, all identity — contacts uncoupled)
 
     independent of ``R̄, v̄, p̄`` and of the IMU input.  Built directly from the
-    closed form (cheaper and exact); `expm` is never used in the scan body.
-
-    Parameters
-    ----------
-    g : Array, shape (3,)
-        Gravity acceleration vector in world.
-    dt : float
-        Filter timestep.
-    N : int
-        Number of contact candidates (static).
-
-    Returns
-    -------
-    Array, shape (3N+9, 3N+9)
+    closed form; `expm` is never called in the scan body.
     """
     G = skew(g)
     Phi = jnp.eye(3 * N + 9)
@@ -231,31 +164,21 @@ def build_Phi(g: Array, dt: float, N: int) -> Array:
 
 
 def build_H(N: int) -> Array:
-    r"""Constant FK observation matrix ``H`` (§4.1), shape ``(3N, 3N+9)``.
+    r"""Constant FK observation matrix ``H``, shape ``(3N, 3N+9)`` (§4.1).
 
     Each contact's right-invariant FK observation has Jacobian
-    ``H_i = [ 0  0  +I  …  −I(col d_i)  … ]`` — ``+I`` in the ``p`` block and
-    ``−I`` in its own ``d_i`` block.  Stacked over contacts this is
+    ``H_i = [ 0  0  +I  …  −I(col d_i)  … ]``.  Stacked over contacts::
 
         H = [ 0_{3N×3} | 0_{3N×3} | (+I_3 ×N) | −I_{3N} ]
 
     State-independent by construction (world-centric + right-invariant).
 
-    **Sign convention** — this is the Java `ContactUpdater.computeJacobian`
-    layout, locked element-wise (tol 0.0) by the ported
-    `ContactUpdaterTest.testJacobianStructureAndStateIndependence`, and it is
-    what makes CLAUDE.md I5 read literally: the residual linearises as
-    ``ν ≈ +H ξ``, so the correction ``ξ⁺ = Kν`` *estimates* the error and is
-    removed by ``X̂⁺ = exp(−(Kν)^∧) X̂``.
-
-    Parameters
-    ----------
-    N : int
-        Number of contact candidates (static).
-
-    Returns
-    -------
-    Array, shape (3N, 3N+9)
+    **Sign convention** — this is the Java `ContactUpdater.computeJacobian` layout,
+    locked element-wise (tol 0.0) by the ported
+    `ContactUpdaterTest.testJacobianStructureAndStateIndependence`, and it is what
+    makes I5 read literally: the residual linearises as ``ν ≈ +H ξ``, so the
+    correction ``ξ⁺ = Kν`` *estimates* the error and is removed by
+    ``X̂⁺ = exp(−(Kν)^∧) X̂``.
     """
     H = jnp.zeros((3 * N, 3 * N + 9))
     H = H.at[:, 6:9].set(jnp.tile(jnp.eye(3), (N, 1)))    # p block: +I per contact
@@ -263,37 +186,12 @@ def build_H(N: int) -> Array:
     return H
 
 
-# ---------------------------------------------------------------------------
-# Parameters
-# ---------------------------------------------------------------------------
-
 class InEKFParams(NamedTuple):
     """Run-fixed configuration plus the precomputed constants ``Φ`` and ``H``.
 
-    Passed into the filter step rather than stored in the mutable state.  ``Φ``
-    and ``H`` are precomputed here (invariant 6) so the scan body never rebuilds
-    them — in particular `expm` is never called in the loop.
-
-    Attributes
-    ----------
-    g : Array, shape (3,)
-        Gravity acceleration vector in world [m/s²], e.g. ``[0, 0, -9.81]``.
-    dt : float
-        Filter timestep [s].
-    gyro_var : float
-        Gyro continuous noise **variance** density [(rad/s)²/Hz].  Builds the
-        isotropic gyro block ``Q_g = gyro_var · I₃`` of the continuous error
-        density (§3.3).
-    accel_var : float
-        Accelerometer continuous noise **variance** density [(m/s²)²/Hz].
-        Builds ``Q_a = accel_var · I₃``.
-    contact_floor : float
-        Variance floor [m²] applied to the per-contact covariances before they
-        enter the ``Q̄_d`` contact block (the digest/clamp of §5).
-    Phi : Array, shape (3N+9, 3N+9)
-        Precomputed constant transition (`build_Phi`).
-    H : Array, shape (3N, 3N+9)
-        Precomputed constant FK observation (`build_H`).
+    Passed into the filter step rather than stored in the mutable state, and
+    precomputed here so the scan body never rebuilds them — in particular `expm` is
+    never called in the loop.  The IMU noises are continuous **variance** densities.
     """
     g: Array            # (3,) gravity accel [m/s²], world
     dt: float           # [s]
@@ -303,10 +201,6 @@ class InEKFParams(NamedTuple):
     Phi: Array          # (3N+9, 3N+9) precomputed transition
     H: Array            # (3N, 3N+9) precomputed FK observation
 
-
-# ---------------------------------------------------------------------------
-# Initialisation helpers
-# ---------------------------------------------------------------------------
 
 def init_state(
     N: int,
@@ -319,27 +213,12 @@ def init_state(
     p_p: float | None = None,
     p_d: float | None = None,
 ) -> InEKFState:
-    """Construct an initial `InEKFState` with a diagonal prior covariance.
+    """Initial `InEKFState` with a diagonal prior covariance.
 
-    Parameters
-    ----------
-    N : int
-        Number of contact candidates (static).
-    R0, v0, p0 : Array, optional
-        Initial base orientation (3, 3), velocity (3,), position (3,).  Default
-        to identity / zeros.
-    d0 : Array, shape (N, 3), optional
-        Initial contact positions.  Defaults to zeros.
-    p_R, p_v, p_p, p_d : float, optional
-        Diagonal prior variances on the orientation / velocity / position /
-        per-contact error blocks.  ``None`` (the default) takes the value from
-        ``inekf.init`` in ``config/filter_cfg.yaml``.  Contacts default to a
-        diffuse ``p_d`` because a candidate not yet in firm contact is "off" via
-        a large covariance (CoCo).
-
-    Returns
-    -------
-    InEKFState
+    ``R0`` ``(3,3)`` / ``v0`` ``(3,)`` / ``p0`` ``(3,)`` / ``d0`` ``(N,3)`` default
+    to identity / zeros.  The prior variances ``p_R, p_v, p_p, p_d`` default to
+    ``inekf.init`` in ``config/filter_cfg.yaml``; contacts take a diffuse ``p_d``
+    because a candidate not yet in firm contact is "off" via a large covariance.
     """
     prior = section("inekf")["init"]
     p_R = prior["rotation_var"] if p_R is None else p_R
@@ -371,25 +250,12 @@ def default_params(
     accel_var: float | None = None,
     contact_floor: float | None = None,
 ) -> InEKFParams:
-    """Sensible default `InEKFParams` for an ``N``-contact filter at 1 kHz.
+    """Default `InEKFParams` for an ``N``-contact filter at 1 kHz, with ``Φ`` and ``H`` precomputed.
 
-    Precomputes ``Φ`` and ``H`` from the closed forms.  The noise densities are
-    starting-point values (untuned); match them to the IMU spec and the
-    ContactNet covariance scale once the baseline is consistent.
-
-    Parameters
-    ----------
-    N : int
-        Number of contact candidates (static — fixes the constant graph).
-    dt : float, optional
-    g : Array, shape (3,), optional
-    gyro_var, accel_var : float, optional
-        Isotropic IMU noise **variance** densities (see `InEKFParams`).
-    contact_floor : float, optional
-        Variance floor on the contact covariances [m²].
-
-    All of the above default to the ``inekf`` section of
-    ``config/filter_cfg.yaml``; pass a value to override it.
+    Every argument defaults to the ``inekf`` section of ``config/filter_cfg.yaml``;
+    pass a value to override it.  The noise densities there are starting-point
+    values (untuned) — match them to the IMU spec and the ContactNet covariance
+    scale once the baseline is consistent.
     """
     cfg = section("inekf")
     dt = cfg["dt"] if dt is None else dt

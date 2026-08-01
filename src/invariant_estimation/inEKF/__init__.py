@@ -7,9 +7,10 @@ correction side only (see `CLAUDE.md` for the full design record).  The filter
 holds no trainable parameters — BPTT during training flows *through* it.
 
 Build order: group -> state -> propagate -> correct -> contact -> gravity_update
--> ekf -> filter.  All implemented; `filter.step`/`filter.run` are the scan body
-and trajectory driver.  Deferred by decision: reseed, contact trust (see
-PORT_NOTES.md).
+-> ekf -> reseed -> filter.  `filter.step`/`filter.run` are the scan body and
+trajectory driver.  Touchdown re-seed shipped 2026-07-30 (`reseed.py`); it is off by
+default (`InvariantEKF.reseed is None`) and wired as an ablation arm in
+`filter.make_step`.  Contact trust remains deferred (see PORT_NOTES.md).
 """
 from .contact import (
     apply_floor,

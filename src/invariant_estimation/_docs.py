@@ -1,8 +1,4 @@
-"""Small entry points for building and serving the Sphinx docs.
-
-Exposed as ``uv run docs`` (live-reload server) and ``uv run docs-build``
-(one-off HTML build) via ``[project.scripts]`` in ``pyproject.toml``.
-"""
+"""Sphinx docs entry points: ``uv run docs`` (live server) / ``docs-build`` (HTML)."""
 
 from __future__ import annotations
 

@@ -1,28 +1,18 @@
-r"""
-replay/logsource.py
-===================
-Pull named channels out of an IHMC SCS2 hardware log and hand them to the port as
-plain float64 arrays.
+r"""Pull named channels out of an IHMC SCS2 hardware log as plain float64 arrays.
 
-This is the input half of the Java-parity harness.  The output half -- what the
-Java estimator actually produced on that run -- comes out of the *same* log
-through the same reader, which is the point: inputs and reference outputs are
-tick-aligned by construction, with no clock to reconcile.
+The input half of the Java-parity harness.  The output half -- what the Java
+estimator actually produced on that run -- comes out of the *same* log through
+the same reader, so inputs and reference outputs are tick-aligned by
+construction, with no clock to reconcile.
 
-The decoder is not vendored
----------------------------
-Decoding `robotData.bsz` (zstd frames, big-endian int64 records, a 7 MB
-handshake) is ~700 lines that already exist and are already exercised, in the
-`ihmc-log` skill's `ihmclog.py`.  Copying it here would create a second copy of a
-*binary format* parser to keep in sync with logger version bumps -- the worst
-kind of duplication.  So this module locates that file and imports it, in order:
-
-1. ``$IHMCLOG`` if set (an explicit override for CI or a moved checkout),
-2. ``~/.claude/skills/ihmc-log/ihmclog.py`` (where the skill installs it).
-
-If neither resolves, every entry point raises `LogToolUnavailable` with the
-remedy in the message, and the parity tests **skip** rather than fail: a missing
-log tool is a missing fixture, not a broken port.
+The `robotData.bsz` decoder is **not vendored**: it is ~700 lines of binary
+format parsing that already exist and are already exercised in the `ihmc-log`
+skill's `ihmclog.py`, and a second copy would have to track logger version bumps.
+This module locates that file instead, trying ``$IHMCLOG`` (an override for CI or
+a moved checkout) then ``~/.claude/skills/ihmc-log/ihmclog.py``.  If neither
+resolves, every entry point raises `LogToolUnavailable` with the remedy in the
+message and the parity tests **skip** rather than fail: a missing log tool is a
+missing fixture, not a broken port.
 
 The sensor-processing chain (the trap this module exists to encode)
 -------------------------------------------------------------------
@@ -114,8 +104,8 @@ class LogWindow:
         return self.channels[name]
 
     def stack(self, names: Sequence[str]) -> np.ndarray:
-        """(T, k) column stack, in the order given -- the usual way to assemble a
-        joint vector or an IMU triple without a Python loop at the call site."""
+        """(T, k) column stack, in the order given -- assembles a joint vector or an
+        IMU triple without a Python loop at the call site."""
         return np.column_stack([self.channels[n] for n in names])
 
     def has(self, *names: str) -> bool:
@@ -123,14 +113,10 @@ class LogWindow:
 
 
 def joint_channel(reader, joint: str, chan: str) -> str:
-    """Resolve the variable the *estimator* saw for ``<chan>`` of ``<joint>``.
-
-    Returns the highest-numbered ``_spN`` stage published for that joint/channel,
-    falling back to ``raw_<chan>_<joint>`` when the log has no processing chain
-    (older builds, or a channel `SensorProcessing` passes through untouched).
-
-    ``chan`` is one of ``q``, ``qd``, ``tau``.
-    """
+    """The variable the *estimator* saw for ``<chan>`` (``q``/``qd``/``tau``) of
+    ``<joint>``: the highest-numbered ``_spN`` stage published for it, falling back
+    to ``raw_<chan>_<joint>`` only when the log has no processing chain (older
+    builds, or a channel `SensorProcessing` passes through untouched)."""
     names = frozenset(reader.hs.names)
     best_idx, best_name = -1, None
     for name in names:
@@ -151,11 +137,9 @@ def joint_channel(reader, joint: str, chan: str) -> str:
 def imu_channels(imu: str) -> dict[str, list[str]]:
     """The raw gyro/accel variable names for one IMU, in XYZ order.
 
-    These are the *unprocessed* sensor reads, which is correct here: unlike the
-    joint channels, `SensorProcessing`'s IMU stages are published under a
-    different registry and the invariant estimator's own bias handling is what
-    the port is being compared against.  Taking the raw triple keeps the bias
-    path inside the port under test rather than borrowing Java's answer.
+    *Unprocessed* is correct here, unlike the joint channels: `SensorProcessing`'s
+    IMU stages are published under a different registry, and the raw triple keeps
+    the bias path inside the port under test rather than borrowing Java's answer.
     """
     return {
         "gyro": [f"gyroscope_{imu}{a}" for a in "XYZ"],
@@ -176,9 +160,8 @@ def read_window(
 
     Decoding is the expensive step by orders of magnitude -- a 630 s Alex log is
     131 GB uncompressed, and even a seeked, strided read of a few dozen channels
-    costs one zstd frame decompress per touched batch.  The result is therefore
-    memoised to an ``.npz`` keyed by a hash of every argument that can change the
-    numbers, so an iterating test suite pays it once.
+    costs one zstd frame decompress per touched batch.  The result is memoised to
+    an ``.npz`` keyed by a hash of every argument that can change the numbers.
 
     ``cache_dir`` defaults to ``<log_dir>/.parity-cache`` when writable, else a
     temp dir -- logs often live on read-only or shared storage.

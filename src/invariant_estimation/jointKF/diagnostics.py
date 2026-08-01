@@ -1,58 +1,41 @@
-r"""
-jointKF/diagnostics.py
-======================
-Two observables the filter publishes but does not act on: the **per-joint NIS**
+r"""Two observables the filter publishes but does not act on: the **per-joint NIS**
 of a diagonal channel, and the **attribution of a near-singular innovation
-covariance** to the physical measurement that caused it (Java
-`describeSingularInnovation`, ported class
-`JointLevelKFSingularInnovationDiagnosticTest`).
+covariance** to the physical measurement that caused it.
 
-Why attribution is worth code
------------------------------
-`update.py` already *handles* a singular `S`: the `cond(S)` gate drops the update
-and leaves `(x, P)` bit-identical.  That is the correct runtime behaviour and it
-is silent by design — which is the problem.  On hardware the failure looked like
-"the estimator stopped updating", with 40+ measurement rows and no indication of
-which one had gone degenerate.  The gate protects the filter; this module is what
-lets a human find the sensor.
+Java `describeSingularInnovation`, ported class
+`JointLevelKFSingularInnovationDiagnosticTest`.
 
-Port the observable, not the message (CLAUDE.md §5)
----------------------------------------------------
-Java returns a human-readable string and its test asserts on substrings
-(`"gyro pair 0"`, the base IMU's sensor name, `"encoder q of joint <name>"`).  A
-string is not a portable contract, so this module returns **structured
-attribution** — row index -> channel, ordinal, name, dominant state column — and
-offers `.summary()` for the log line.  The ported tests assert on the structure;
-the text is free to change.
+`update.py` already *handles* a singular `S` — the `cond(S)` gate drops the update
+and leaves `(x, P)` bit-identical — and is silent by design, which is the problem.
+On hardware the failure looked like "the estimator stopped updating", with 40+
+measurement rows and no indication of which had gone degenerate.  The gate
+protects the filter; this module lets a human find the sensor.
 
-How the attribution works
--------------------------
-`S = H P H^T + R` is symmetric PSD.  Near-singularity means some direction `v` in
-*measurement* space has almost no innovation variance: `v^T S v ~ 0`.  Take `v` =
-the eigenvector of the smallest eigenvalue; the rows with large `|v_i|` are the
-rows that participate in the degenerate combination.  Two rows measuring the same
-physical quantity with tight `R` give `v ~ (1, -1)/sqrt(2)` — their *difference*
-is unobservably small, which is exactly the "duplicate measurement" pathology.
+**Port the observable, not the message (CLAUDE.md §5).**  Java returns a
+human-readable string and asserts on substrings.  A string is not a portable
+contract, so this returns **structured attribution** — row index -> channel,
+ordinal, name, dominant state column — with `.summary()` for the log line.  The
+ported tests assert on the structure; the text is free to change.
 
-Each implicated row is then described twice over, because neither description
-alone is enough:
+**How it works.**  `S = H P H^T + R` is symmetric PSD, so near-singularity means
+some direction `v` in *measurement* space has `v^T S v ~ 0`.  Take `v` = the
+eigenvector of the smallest eigenvalue; rows with large `|v_i|` participate in the
+degenerate combination.  Two rows measuring the same physical quantity with tight
+`R` give `v ~ (1, -1)/sqrt(2)` — the "duplicate measurement" pathology.
 
-* by **row block** — which channel and which ordinal within it (gyro pair 3,
-  anchor 1, encoder row 5).  The stacked layout owns this and `H` cannot tell you
-  it: a gyro row's columns identify joints, not the pair.
-* by **dominant state column** of that row of `H` — which state the row actually
-  loads.  This is what names the *joint* in the encoder case, and it is not the
-  same as the row ordinal: the Java encoder test builds two rows that both put
-  their weight on joint 0's column, so row 1 must be reported as observing joint
-  0, not joint 1.
+Each implicated row is described twice, because neither alone is enough: by **row
+block** (channel and ordinal — the stacked layout owns this and `H` cannot tell
+you it, since a gyro row's columns identify joints, not the pair), and by
+**dominant state column** of that row of `H`.  The second is what names the
+*joint* in the encoder case, and it differs from the row ordinal: the Java encoder
+test builds two rows both weighted on joint 0's column, so row 1 must be reported
+as observing joint 0.
 
-Host-side, deliberately
------------------------
-This runs off the jit path: it eigendecomposes, allocates, and returns Python
-strings.  It is called when a gate has already fired (`UpdateInfo.was_applied ==
-0`), i.e. never in the hot loop, so I7 does not apply and NumPy is the right
-tool.  `per_joint_nis` is the exception — it is pure array arithmetic and is
-called every tick from inside the traced step.
+Host-side deliberately: this eigendecomposes, allocates, and returns Python
+strings, and is called only after a gate has fired (`UpdateInfo.was_applied ==
+0`), never in the hot loop, so I7 does not apply and NumPy is the right tool.
+`per_joint_nis` is the exception — pure array arithmetic, called every tick from
+inside the traced step.
 """
 from typing import NamedTuple
 
@@ -70,97 +53,47 @@ __all__ = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Per-joint NIS
-# ---------------------------------------------------------------------------
-
 def per_joint_nis(nu: Array, S: Array) -> Array:
-    r"""Per-row normalised innovation squared `nu_i^2 / S_ii`.
+    r"""Per-row normalised innovation squared `nu_i^2 / S_ii`, from the PRIOR `(nu, S)`.
 
-    This is the **marginal** consistency statistic, not a slice of the joint one:
-    each `nu_i` is marginally `N(0, S_ii)`, so `nu_i^2 / S_ii ~ chi^2_1` (mean 1,
-    variance 2) regardless of the correlations `S` carries off the diagonal.  The
-    whole-channel statistic `nu^T S^-1 nu ~ chi^2_k` is the one `UpdateInfo.nis`
-    reports; the per-joint form is what localises a bad encoder to a joint, which
-    the aggregate cannot do.
+    The **marginal** consistency statistic, not a slice of the joint one: each
+    `nu_i` is marginally `N(0, S_ii)`, so `nu_i^2 / S_ii ~ chi^2_1` regardless of
+    `S`'s off-diagonal correlations.  `UpdateInfo.nis` reports the whole-channel
+    `nu^T S^-1 nu ~ chi^2_k`; this form is what localises a bad encoder to a
+    joint, which the aggregate cannot do.
 
     Both must be computed on the **prior** `S` and the **prior** residual
     (CLAUDE.md §6) — `UpdateInfo` supplies exactly those, which is why this takes
     `(nu, S)` rather than a state.
-
-    Parameters
-    ----------
-    nu : (k,)   prior innovation
-    S : (k, k)  prior innovation covariance
-
-    Returns
-    -------
-    (k,) array
     """
     return jnp.asarray(nu) ** 2 / jnp.diag(jnp.asarray(S))
 
 
-# ---------------------------------------------------------------------------
-# Near-singular innovation attribution
-# ---------------------------------------------------------------------------
-
 class RowAttribution(NamedTuple):
-    """One measurement row's share of a degenerate direction.
+    """One measurement row's share of a degenerate direction."""
 
-    Attributes
-    ----------
-    row : int
-        Index into the channel's stacked measurement.
-    channel : str
-        `"gyro_pair"`, `"anchor"`, `"encoder"` or `"velocity"`.
-    ordinal : int
-        Index within the channel: pair number, anchor slot, or joint number.
-    name : str
-        Human-readable identification of the *physical* measurement, e.g.
-        `"gyro pair 0 (imu0 -> imu1)"`.
-    state_index : int
-        The state column this row loads most heavily — `-1` for an all-zero row.
-    state_name : str
-        That column, named: `"q of joint3"`, `"q_dot of joint3"`,
-        `"b_omega[1] of imu0"`.
-    weight : float
-        `v_i^2` for the near-null eigenvector `v`; the rows sum to 1.
-    """
-
-    row: int
-    channel: str
-    ordinal: int
-    name: str
-    state_index: int
-    state_name: str
-    weight: float
+    row: int            # index into the channel's stacked measurement
+    channel: str        # "gyro_pair", "anchor", "encoder" or "velocity"
+    ordinal: int        # index within the channel: pair, anchor slot, or joint
+    name: str           # the physical measurement, e.g. "gyro pair 0 (imu0 -> imu1)"
+    state_index: int    # state column this row loads most; -1 for an all-zero row
+    state_name: str     # that column named, e.g. "b_omega[1] of imu0"
+    weight: float       # v_i^2 for the near-null eigenvector v; rows sum to 1
 
 
 class SingularInnovationReport(NamedTuple):
     """Structured answer to "which sensor made `S` singular?".
 
-    Attributes
-    ----------
-    label : str
-        The channel label the caller passed (Java's `label` argument).
-    reason : str
-        Free text from the caller (Java's `reason`).
-    condition_number : float
-        `max_eig / min_eig` of `S`, `inf` if `min_eig <= 0`.  This is the honest
-        eigenvalue condition number, not `update.py`'s Cholesky-diagonal proxy:
-        the proxy is what the hot path can afford, this is what the diagnostic
-        should report.
-    min_eigenvalue : float
-    null_vector : np.ndarray, shape (k,)
-        Eigenvector of the smallest eigenvalue, sign-normalised so its
-        largest-magnitude entry is positive (an eigenvector's sign is arbitrary;
-        pinning it makes the report reproducible).
-    rows : tuple[RowAttribution, ...]
-        The implicated rows, heaviest first.
+    `condition_number` is the honest eigenvalue `max_eig / min_eig` (`inf` if
+    `min_eig <= 0`), not `update.py`'s Cholesky-diagonal proxy: the proxy is what
+    the hot path can afford, this is what the diagnostic should report.
+    `null_vector` is sign-normalised so its largest-magnitude entry is positive —
+    an eigenvector's sign is arbitrary, and pinning it makes the report
+    reproducible.  `rows` is heaviest first.
     """
 
-    label: str
-    reason: str
+    label: str          # the channel label the caller passed (Java's `label`)
+    reason: str         # free text from the caller (Java's `reason`)
     condition_number: float
     min_eigenvalue: float
     null_vector: np.ndarray
@@ -169,10 +102,8 @@ class SingularInnovationReport(NamedTuple):
     def summary(self) -> str:
         """The log line — Java's message, rebuilt from the structure.
 
-        Deliberately derived from `rows` rather than being the primary product:
-        the tests assert on `rows`, so the text can be reworded without breaking
-        anything, which is the point of porting the observable instead of the
-        message.
+        Derived from `rows` rather than being the primary product: the tests
+        assert on `rows`, so the text can be reworded without breaking anything.
         """
         who = "; ".join(f"{r.name} [{r.state_name}, weight {r.weight:.2f}]" for r in self.rows)
         return (f"near-singular innovation covariance in '{self.label}' "
@@ -196,17 +127,15 @@ def _state_name(build: JointKFBuild, index: int) -> str:
 def _row_identity(build: JointKFBuild, row: int, channel: str, state_index: int) -> tuple[str, int, str]:
     """`(channel, ordinal, name)` for one measurement row.
 
-    The stacked channel is the interesting one: rows are grouped in threes,
-    `3e..3e+2` for pair `e` and then `anchor_row0 + 3k..` for anchor `k`
-    (`JointKFBuild.stacked_row_for_pair` / `anchor_row0`).  A gyro row is named by
-    its pair *and* both IMUs, because "pair 0" alone does not tell an operator
-    which box to go and look at — Java's message includes the sensor name for
-    exactly that reason.
+    Stacked rows are grouped in threes, `3e..3e+2` for pair `e` then
+    `anchor_row0 + 3k..` for anchor `k`.  A gyro row is named by its pair *and*
+    both IMUs, because "pair 0" alone does not tell an operator which box to look
+    at — Java's message includes the sensor name for that reason.
 
     For the diagonal channels (encoder, velocity) the ordinal comes from the
     **dominant state column**, not the row index: a duplicated row observes a
     joint other than its own, and reporting the row's own ordinal would name the
-    wrong joint (the Java encoder scenario is precisely this).
+    wrong joint (precisely the Java encoder scenario).
     """
     n = build.n_joints
     if channel == "stacked":
@@ -240,29 +169,20 @@ def describe_singular_innovation(
 ) -> SingularInnovationReport:
     """Attribute a near-singular `S = H P H^T + R` to measurement rows.
 
-    Parameters
-    ----------
-    build : JointKFBuild
-        Supplies the row layout and the names.
-    H : (k, dim), R : (k, k), P : (dim, dim)
-        The measurement the gate rejected, and the prior covariance it was formed
-        against.  `P` is taken as an argument rather than a state so the caller
-        can pass the *prior* explicitly — attributing against a posterior would
-        describe a matrix that was never inverted.
-    channel : {"stacked", "encoder", "velocity"}
-        Which row layout `H` follows.  This is the port of Java's exact-match
-        label dispatch; it is a host-side Python string, so I7 does not apply.
-    label, reason : str
-        Carried into the report for the log line only.
-    weight_floor : float
-        Rows with `v_i^2` below this are omitted as noise.  0.05 keeps a row that
-        carries 5% of the degenerate direction and drops numerical dust; with `k`
-        rows the uniform share is `1/k`, so this floor never hides a genuine
-        participant for the row counts this filter uses.
+    `H` `(k, dim)`, `R` `(k, k)`, `P` `(dim, dim)` are the measurement the gate
+    rejected and the prior covariance it was formed against.  `P` is an argument
+    rather than a state so the caller passes the *prior* explicitly — attributing
+    against a posterior would describe a matrix that was never inverted.
 
-    Returns
-    -------
-    SingularInnovationReport
+    `channel` is `"stacked"`, `"encoder"` or `"velocity"`: which row layout `H`
+    follows, the port of Java's exact-match label dispatch.  Host-side Python
+    string, so I7 does not apply.  `label`/`reason` are carried into the report
+    for the log line only.
+
+    `weight_floor` omits rows carrying less than `v_i^2` of the degenerate
+    direction.  0.05 keeps a 5% participant and drops numerical dust; with `k`
+    rows the uniform share is `1/k`, so it never hides a genuine participant at
+    the row counts this filter uses.
     """
     H = np.asarray(H, dtype=float)
     R = np.asarray(R, dtype=float)

@@ -1,28 +1,19 @@
-r"""
-pipeline/main_estimator.py
-==========================
-G9 -- the **fused estimator step**: one constant-XLA-graph `lax.scan` body that
+r"""G9 -- the **fused estimator step**: one constant-XLA-graph `lax.scan` body that
 runs the joint-space KF and the world-centric InEKF back to back, threading the
 joint KF's live `(q̂, q̇̂, Σ_q, Σ_q̇, b̂)` into the InEKF the way the log fed each
 filter independently at Tier-2 (CLAUDE.md §0 deliverable 3, §3 gate G9).
 
-What is new here, and what is not
----------------------------------
-Both filters are already validated at the sensor→state level (`PORT_NOTES.md`;
-memory `invariant-estimation-port-status`). G9 is a *composition* job, not an
-estimator job. The only genuinely new code is the **boundary** (`_boundary`
-below): the joint KF's per-IMU bias corrects the base gyro, which is then rotated
-IMU-frame→body-frame and handed to the InEKF as the bias-corrected `ω̄` (I1). The
-rest is wiring two `step` functions and one carry.
+Both filters are already validated at the sensor→state level (`PORT_NOTES.md`), so
+this is a *composition* job. The only genuinely new code is the **boundary**
+(`_boundary`): the joint KF's per-IMU bias corrects the base gyro, which is then
+rotated IMU-frame→body-frame and handed to the InEKF as the bias-corrected `ω̄`
+(I1). The rest is wiring two `step` functions and one carry.
 
-The single invariant that makes this non-trivial is **I7 (constant XLA graph)**:
-no data-dependent shapes or Python branches inside the jitted step. Each filter
-already obeys it individually (every gate is a `jnp.where` mask). G9 keeps it true
-across the fusion by (a) resolving every name→index at build time in plain Python,
-and (b) evaluating the MJX model *inside* the scan at the carry's estimate, with
-no Python `if` on any traced value. `tests/pipeline/test_main_estimator.py` proves
-it: the `fused_step` jaxpr hashes identically across differing contact / gate
-states.
+**I7 (constant XLA graph)** is what makes it non-trivial. G9 keeps it true across
+the fusion by (a) resolving every name→index at build time in plain Python, and
+(b) evaluating the MJX model *inside* the scan at the carry's estimate, with no
+Python `if` on any traced value. `tests/pipeline/test_main_estimator.py` proves it:
+the `fused_step` jaxpr hashes identically across differing contact / gate states.
 
 The two G9 landmines (memory `invariant-estimation-g9-landmines`)
 -----------------------------------------------------------------
@@ -37,8 +28,8 @@ The two G9 landmines (memory `invariant-estimation-g9-landmines`)
    argument (default 0.0 = current port behaviour); when non-zero it is added as an
    isotropic floor to the InEKF's contact-position noise. See `_boundary`.
 
-Frames — THREE of them, kept distinct (guide §G9.3; the real-Alex trap)
------------------------------------------------------------------------
+Frames — THREE of them, kept distinct (the real-Alex trap)
+----------------------------------------------------------
 1. **Base IMU site `S`** (`imu_sites[base_imu]`): where the base gyro/accel are
    measured, and the joint-KF stance-anchor frame.
 2. **Body frame `B`** (`base_body_site`, the pelvis *root* body): the frame the
@@ -104,9 +95,7 @@ __all__ = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Alex topology — the resolved `imu_pairs` TODO (CLAUDE.md §2b)
-# ---------------------------------------------------------------------------
+# Alex topology — the resolved `imu_pairs` TODO (CLAUDE.md §2b).
 # Derived from the 2026-07-17 Alex001 log's model.sdf and cross-checked three ways
 # (scratch verification, recorded in PORT_NOTES "G9 — real model"):
 #   * this IMU set + star reproduces EXACTLY the 9 logged FILTERED_JOINTS
@@ -146,10 +135,9 @@ ALEX_SOLE_OFFSET: tuple[float, float, float] = (0.197 / 2.0 - 0.052, 0.0, -ALEX_
 # the PLATE is the right extent to anchor on, not the box.
 #
 # Why two points per foot: a single contact point carries **no information about
-# foot orientation**, so nothing in the filter observes rotation about the vertical
-# except through the base. Two points 0.197 m apart do constrain it -- which is
-# what run 5 gave up when it learned to loosen the anchors (PORT_NOTES, "the cost
-# is rotational, and it is yaw"). This is also CoCo-InEKF's own choice.
+# foot orientation**. Two points 0.197 m apart do constrain it -- which is what run
+# 5 gave up when it learned to loosen the anchors (PORT_NOTES, "the cost is
+# rotational, and it is yaw"). Also CoCo-InEKF's own choice.
 ALEX_HEEL_X: float = -0.052
 ALEX_TOE_X: float = 0.197 - 0.052
 ALEX_CONTACT_SITES: tuple[str, ...] = (
@@ -190,8 +178,8 @@ def build_alex_fused_estimator(spec, *, toe_heel: bool = False, **overrides) -> 
     `spec` must come from `urdf2mjcf.convert_log_model(log_dir,
     extra_sites=ALEX_EXTRA_SITES, ...)` so the body-frame and sole sites exist.
     Encapsulates the resolved Alex topology (`ALEX_*` above) so production and the
-    replay test share one definition; `**overrides` pass straight through to
-    `build_fused_estimator` (e.g. `contact_meas_var=1e-4`, `dt=...`).
+    replay test share one definition; `**overrides` pass through to
+    `build_fused_estimator`.
     """
     model = MjxModel.from_xml_string(spec.mjcf, site_names=alex_site_names(), pairs=ALEX_PAIRS)
     return build_fused_estimator(
@@ -203,11 +191,8 @@ def build_alex_fused_estimator(spec, *, toe_heel: bool = False, **overrides) -> 
 
 
 def alex_spec_from_urdf(urdf_path):
-    """`AlexModelSpec` from a standalone `.urdf` (the config rotor table + Alex sites).
-
-    The URDF analogue of `convert_log_model`: reads the file, writes the rotor
-    inertia into `armature`, and adds the `base_body`/sole `extra_sites`.
-    """
+    """`AlexModelSpec` from a standalone `.urdf` — the URDF analogue of
+    `convert_log_model` (config rotor table into `armature`, Alex `extra_sites`)."""
     import pathlib
 
     from ..config import load_config
@@ -229,14 +214,10 @@ def build_alex_fused_estimator_from_urdf(urdf_path, **overrides) -> "FusedEstima
     `alex_with_imus.urdf`) rather than a log's `model.sdf`. Verified in
     `tests/replay/test_fused_real_model.py` to reproduce the Java-model `R_mount`
     and site FK bit-for-bit — the permanent lock on the training↔hardware
-    cross-check. `**overrides` pass through to `build_fused_estimator`.
+    cross-check.
     """
     return build_alex_fused_estimator(alex_spec_from_urdf(urdf_path), **overrides)
 
-
-# ---------------------------------------------------------------------------
-# mj_model -> KinematicTree adapter (generalised from tests/jointKF/_fixture.py)
-# ---------------------------------------------------------------------------
 
 def kinematic_tree_from_mj(
     mj_model,
@@ -246,18 +227,13 @@ def kinematic_tree_from_mj(
     """Describe a MuJoCo model as the model-agnostic `build.KinematicTree`.
 
     `build_joint_kf` deliberately takes a plain tree rather than an `mjx.Model`
-    (its graph logic is pure and unit-testable without a physics engine). This is
-    the adapter that lets the real build run on a real MuJoCo model — the
-    production analogue of the test fixture's `kinematic_tree`.
+    (its graph logic is pure and unit-testable without a physics engine); this is
+    the adapter that lets the real build run on a real MuJoCo model.
 
-    Parameters
-    ----------
-    mj_model : mujoco.MjModel
-    effort_limits : dict, optional
-        Per-joint URDF effort limit (`AlexModelSpec.effort_limits`). Joints absent
-        from the dict get `tau_max = NaN`, which makes `sigma_tau` fall back to the
-        config scalar — acceptable for a synthetic fixture, wrong for flight, so
-        pass the real limits in production.
+    Joints absent from `effort_limits` (`AlexModelSpec.effort_limits`) get
+    `tau_max = NaN`, which makes `sigma_tau` fall back to the config scalar —
+    acceptable for a synthetic fixture, wrong for flight, so pass the real limits
+    in production.
     """
     import mujoco
 
@@ -286,10 +262,6 @@ def kinematic_tree_from_mj(
     )
 
 
-# ---------------------------------------------------------------------------
-# Per-tick I/O
-# ---------------------------------------------------------------------------
-
 class FusedSensors(NamedTuple):
     """One tick of raw proprioception feeding the fused estimator.
 
@@ -309,20 +281,19 @@ class FusedSensors(NamedTuple):
         (Alex's ankles), in `anchor_unfiltered_mask` column order. Empty when the
         model has no such joints.
     contact : (K,)
-        This tick's contact/trust signal per stance-anchor slot (joint KF). It is
+        This tick's contact/trust signal per stance-anchor slot (joint KF),
         consumed on the NEXT tick — the one-tick-delayed phase ordering is handled
         inside `jkf.step`.
     contact_chol : (N, 3, 3)
         ContactNet Cholesky factors for the InEKF (the ONLY contact-condition
-        input to the InEKF; firm ⇒ small, swing ⇒ large). `N == K`.
+        input to the InEKF; firm ⇒ small, swing ⇒ large). `N` is the InEKF's
+        contact count, which is NOT `K` under toe/heel — see
+        `build_fused_estimator`.
     q_unfiltered : (n_u,), optional
         Measured POSITIONS of the same off-path anchor joints. Only read when the
-        estimator was built with `contact_fk_unfiltered=True`, which lets the
-        contact FK stand on the live ankle angles instead of `qpos0`; ignored
-        otherwise, so the field is optional and defaults to empty.
+        estimator was built with `contact_fk_unfiltered=True`; empty otherwise.
     torques : (n + n_u,), optional
-        Measured joint torques, ordered `concat(filtered, unfiltered)` — the same
-        concatenation `fused_inputs` already uses to widen `q̂` for the contact FK.
+        Measured joint torques, ordered `concat(filtered, unfiltered)`.
 
         **The estimator does not read this.** It exists solely as a ContactNet
         feature channel (`contactnet/features.py`): torque is the only available
@@ -361,12 +332,10 @@ class FusedOutputs(NamedTuple):
     inekf_inputs: inf.InEKFInputs
     """The boundary `_boundary` handed the InEKF this tick — emitted, not rebuilt.
 
-    Everything in it is already computed; publishing it costs one reference and
-    saves the only consumer from reconstructing it. `sigma_q` comes off
-    `jkf_carry.state.P[:n,:n]`, which `run_fused` does not otherwise expose (only
-    the final carry survives), so a caller *cannot* rebuild this from the other
-    fields — it would have to duplicate `_boundary`'s bias-correction, `R_mount`
-    framing and `q_unfiltered` widening, and then drift from it.
+    A caller *cannot* rebuild it: `sigma_q` comes off `jkf_carry.state.P[:n,:n]`,
+    which `run_fused` does not otherwise expose (only the final carry survives),
+    so reconstructing it would mean duplicating `_boundary`'s bias-correction,
+    `R_mount` framing and `q_unfiltered` widening, and then drifting from it.
 
     The consumer is ContactNet's data collection: this is exactly
     `contactnet.rollout.Segment.inputs`. Because the joint KF is strictly
@@ -376,16 +345,10 @@ class FusedOutputs(NamedTuple):
     """
 
 
-# ---------------------------------------------------------------------------
-# The assembled estimator (built once, plain Python — I7)
-# ---------------------------------------------------------------------------
-
 @dataclass(frozen=True)
 class FusedEstimator:
-    """Everything the jitted `fused_step` closes over. Built by `build_fused_estimator`.
-
-    Nothing here is traced or changes shape during a run (I2, I7).
-    """
+    """Everything the jitted `fused_step` closes over (`build_fused_estimator`).
+    Nothing here is traced or changes shape during a run (I2, I7)."""
 
     model: MjxModel
     build: JointKFBuild
@@ -408,14 +371,12 @@ class FusedEstimator:
     contactnet: "ContactNetSeam | None" = None
     """The learned stance-anchor process noise, or `None` for the analytic filter.
 
-    `None` is the default and reproduces the pre-ContactNet filter bit-for-bit —
+    `None` (the default) reproduces the pre-ContactNet filter bit-for-bit:
     `contact_chol` stays on `sim.sensors`' Schmitt-switched heuristic, the unused
-    `contact_meas_chol` stays zero, and the fused carry stays the 2-tuple
-    `(jkf_carry, inekf_carry)` every existing caller and test expects.
-
-    When set, the carry gains a third slot holding the provider's ring buffer and
-    `contact_chol` comes from `contactnet.step` instead of from the heuristic.
-    Attach one with `with_contactnet`.
+    `contact_meas_chol` stays zero, and the carry stays the 2-tuple
+    `(jkf_carry, inekf_carry)` every existing caller and test expects.  Set (via
+    `with_contactnet`), the carry gains a third slot holding the provider's ring
+    buffer and `contact_chol` comes from `contactnet.step`.
     """
 
     @property
@@ -476,21 +437,12 @@ def build_fused_estimator(
     `imu_sites`, `pairs`, `foot_sites` follow the same conventions as
     `build_joint_kf` / `MjxModel`: `imu_sites` fixes each IMU's ordinal; `pairs`
     are `(parent_ordinal, child_ordinal)` over that ordering; `foot_sites` host the
-    stance anchors (`K = len(foot_sites)`) AND become the InEKF's `N` contacts.
+    stance anchors (`K = len(foot_sites)`).
 
-    Three frames, kept distinct (the real-Alex frame trap)
-    ------------------------------------------------------
-    * **Base IMU site** = `imu_sites[base_imu]`: the joint-KF anchor frame and the
-      source of the base gyro/accel. The measurement lives here.
-    * **Body frame `B`** = `base_body_site`: the InEKF's `R = ᵂR_B` frame and the
-      contact-FK origin — the *root/pelvis body*, which is what
-      `invariantRootAngularVelocityBody` reports. Defaults to the base IMU site
-      (correct only when the IMU is mounted at the body origin with no rotation,
-      e.g. the synthetic fixture). On real Alex, pass the pelvis-body site: the
-      pelvis IMU is offset AND yawed +90° from the body, and using the IMU site as
-      the body frame puts that offset+rotation straight into the pose.
-    * **`R_mount = ᴮR_S`**: rotates the base IMU measurement into `B`. Auto-computed
-      from the model at `qpos0` (`base_body_rotᵀ · base_imu_rot`) unless overridden.
+    `base_body_site` selects the InEKF body frame `B` and defaults to the base IMU
+    site — correct only when the two coincide (the synthetic fixture). `R_mount =
+    ᴮR_S` is auto-computed at `qpos0` unless overridden. See the module docstring
+    for the three frames and why `B ≠ S` on real Alex.
 
     The two landmine arguments default to their FLIGHT values (`imu_bias_process_var
     = 0`) or to the current-port value (`contact_meas_var = 0`); see the module
@@ -533,9 +485,8 @@ def build_fused_estimator(
     foot_site_ords = np.array([site_names.index(s) for s in foot_sites], dtype=int)
     contact_site_ords = np.array([site_names.index(s) for s in contact_sites], dtype=int)
 
-    # R_mount = ᴮR_S at qpos0. When base_body_site is the IMU site (synthetic case)
-    # this is exactly I. When it is the pelvis body (real Alex) it carries the
-    # +90° mount yaw. Auto-computed from FK unless the caller pins it.
+    # R_mount = ᴮR_S at qpos0: exactly I when base_body_site is the IMU site, the
+    # +90° mount yaw when it is the pelvis body.
     #
     # Computed with plain MuJoCo, NOT `model.site_poses` (MJX): it is a build-time
     # constant, and running it through MJX would trace `mjx.kinematics` over the
@@ -588,8 +539,8 @@ def _aux_joint_tables(model: MjxModel, build: JointKFBuild) -> tuple[np.ndarray,
     """`qpos` indices and encoder variances of the anchor chain's off-path joints.
 
     Resolved by NAME through the same per-joint table the filtered encoders use
-    (`encoder_var_for_name`), so an ankle with no measured value falls back loudly
-    exactly as a filtered joint would.
+    (`encoder_var_for_name`), so an ankle with no measured value falls back
+    loudly exactly as a filtered joint would.
     """
     import mujoco
 
@@ -606,10 +557,6 @@ def _aux_joint_tables(model: MjxModel, build: JointKFBuild) -> tuple[np.ndarray,
     return np.array(qpos, dtype=int), np.array(var, dtype=float)
 
 
-# ---------------------------------------------------------------------------
-# Contact FK closure — base->foot vectors in the InEKF body frame
-# ---------------------------------------------------------------------------
-
 def _make_contact_kinematics(
     model: MjxModel, base_body_site: int, foot_site_ords: np.ndarray,
     aux_qpos: np.ndarray | None = None, n_filtered: int | None = None,
@@ -621,8 +568,12 @@ def _make_contact_kinematics(
     `base_body_site` frame directly (the pelvis/root body), so its origin is `p_B`
     and its rotation is `ᵂR_B` — no `R_mount` here: the mount rotation is a
     *sensor* concern (the boundary), not a kinematics one. `J = ∂y/∂q` by
-    forward-mode autodiff; `J_dot = 0` (a port TODO shared with the Tier-2 replay —
-    the velocity-noise term is deferred, `inEKF/filter.py`).
+    forward-mode autodiff.
+
+    `J_dot = 0` is **not an open TODO**: the filter has no velocity-level contact
+    measurement, so `J_Ċ` has no consumer. `inEKF/filter.contact_velocity_noise`
+    was corrected on 2026-07-29 to use the *position* Jacobian and has zero call
+    sites; nothing downstream reads this field.
 
     Off-path joints (`aux_qpos`)
     ----------------------------
@@ -665,10 +616,6 @@ def _make_contact_kinematics(
     return kinematics
 
 
-# ---------------------------------------------------------------------------
-# The fused scan body
-# ---------------------------------------------------------------------------
-
 class ContactNetSeam(NamedTuple):
     """A trained ContactNet, reduced to what `fused_step` needs.
 
@@ -688,25 +635,17 @@ def with_contactnet(fused: FusedEstimator, params, cfg, constants,
                     subchain) -> FusedEstimator:
     r"""Attach a trained ContactNet to a built estimator.
 
-    Everything the provider needs that the estimator already knows — the contact
-    kinematics and the base-IMU ordinal — is taken from `fused`, so the two
-    cannot disagree about which IMU or which FK the features were built on.  That
-    matters: the network was trained on `features.make_contact_channels` closed
-    over exactly these, and a mismatch would silently move the input
-    distribution rather than raise.
+    The contact kinematics and base-IMU ordinal come from `fused`, so the two
+    cannot disagree about which IMU or which FK the features were built on: the
+    network was trained on `features.make_contact_channels` closed over exactly
+    these, and a mismatch would silently move the input distribution rather than
+    raise.
 
-    Parameters
-    ----------
-    params : contactnet.network.ContactNetParams
-        Trained weights (`contactnet.train.load_params`).
-    cfg : contactnet.config.ContactNetConfig
-        Must be the config the weights were trained under — `H`, `stride` and
-        `F` define the window geometry the weights expect.
-    constants : contactnet.normalize.NormConstants
-        The **frozen** training constants.  Re-fitting on deployment data would
-        shift the input distribution; `data/norm_constants.npz` is the artifact.
-    subchain : (N_c, J_sub) int array
-        From `contactnet.features.build_subchain_indices`.
+    `cfg` must be the `ContactNetConfig` the weights were trained under (`H`,
+    `stride`, `F` define the window geometry the weights expect) and `constants`
+    the **frozen** training `NormConstants` (`data/norm_constants.npz`) —
+    re-fitting on deployment data would shift the input distribution.  `subchain`
+    is `(N_c, J_sub)` from `contactnet.features.build_subchain_indices`.
     """
     from ..contactnet import online as cn_online
 
@@ -757,7 +696,7 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
 
         # -- (a) MJX eval at the PREVIOUS q̂ (the EKF linearisation point) -------
         # One position-level FK pass; R_rel is derived from site rotations rather
-        # than re-running `measure.pair_frames` (guide §G9.2: one FK per tick).
+        # than re-running `measure.pair_frames` — one FK per tick.
         q_prev = jkf_carry.state.x[:n]
         ev = model.evaluate(q_prev)
         R_pair = ev.site_rot[pair_sites]                          # (n_pairs,2,3,3)
@@ -780,17 +719,17 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
         sigma_q = jkf_carry.state.P[:n, :n]
         sigma_qd = jkf_carry.state.P[n:2 * n, n:2 * n]
 
-        # -- (c) the boundary: bias-correct + frame the base IMU (I1, G9.3) ----
+        # -- (c) the boundary: bias-correct + frame the base IMU (I1) ----------
         inekf_inputs = _boundary(
             sensors, bias, base_imu, R_mount, q_hat, qd_hat, sigma_q, sigma_qd,
             contact_meas_var, aux_encoder_var, aux_qd_var,
         )
 
         # The touchdown latch needs this tick's contact probability, and it is the
-        # ONLY thing in the InEKF that reads it — the contact update itself still
-        # has no per-foot mask (see the DECISION note above; contact condition
-        # rides in the process Σ_C). Left empty when the re-seed is off, so the
-        # field contributes no leaf and the default path is unchanged.
+        # ONLY thing in the InEKF that reads it — the contact update itself has no
+        # per-foot mask; contact condition rides in the process Σ_C. Left empty
+        # when the re-seed is off, so the field contributes no leaf and the
+        # default path is unchanged.
         if reseeding:
             inekf_inputs = inekf_inputs._replace(contact_prob=sensors.contact)
 
@@ -883,10 +822,6 @@ def _boundary(
     )
 
 
-# ---------------------------------------------------------------------------
-# Initialisation and the trajectory driver
-# ---------------------------------------------------------------------------
-
 def init_fused_carry(
     fused: FusedEstimator,
     q0: Array,
@@ -956,10 +891,7 @@ def init_fused_carry(
 
 
 def run_fused(fused: FusedEstimator, carry, sensors: FusedSensors):
-    """Scan `fused_step` over a trajectory.
-
-    `sensors` is a `FusedSensors` whose every field carries a leading time axis of
-    length `T`. Returns `(final_carry, FusedOutputs)` with outputs stacked over
-    time. The compiled graph is one tick regardless of `T` (I7).
-    """
+    """Scan `fused_step` over a trajectory: every `sensors` field carries a leading
+    time axis `T`, outputs come back stacked over it, and the compiled graph is one
+    tick regardless of `T` (I7)."""
     return jax.lax.scan(make_fused_step(fused), carry, sensors)

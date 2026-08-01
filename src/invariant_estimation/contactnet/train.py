@@ -9,30 +9,24 @@ import optax
 from .network import ContactNetParams
 
 class Metrics(NamedTuple):
-    """
-    Per-step scalars, reduced *inside* the JIT loop.
+    """Per-step scalars, reduced *inside* the JIT loop.
 
     `aux` from the rollout is the full `InEKFOutputs` -- `state.P` alone is
-    (B, L, 3N+9, 3N+9), ~7 MB at B=32, L=128, N=2. Returning it whole forces a
-    device-to-host transfer every iteration. Reduce here, and just give the scalar.
+    (B, L, 3N+9, 3N+9), ~7 MB at B=32, L=128, N=2, and returning it whole forces
+    a device-to-host transfer every iteration.
 
-    Attributes
-    ----------
-    loss: Array, scalar
-        For `l2_velocity` this is a progress metric. For `beta_nll` it is NOT.
-    grad_norm: Array, scalar
-        Global L2 norm of the gradient *prior* to clamping. Logged, as clipping is the
-        stability "lever" and cannot be tuned against an unobserved number. Always under 
-        `max_norm` => the clip is inert; always over => learning rate is the problem, not clipping.
-    nis_over_dof: Array, scalar
-        Mean NIS over the measurement dimension. The contact update is the stacked 3N vector,
-        so NIS ~ chi^2(3N) and a *calibrated* filter sits at 1.0; above is overconfident, below
-        is conservative. This is beta-NLL's real progress metric.
-    applied_frac: Array, scalar
-        Fraction of ticks whose update passed the cond(S) gate. Below 1.0 means updates are being
-        skipped and the loss is scoring innovations that never corrected the state at all.
-    cond_proxy_max: Array, scalar
-        Worst conditioning proxy in the batch, against `cond_max`.
+    * ``loss`` -- a progress metric for `l2_velocity`; for `beta_nll` it is NOT.
+    * ``grad_norm`` -- global L2 norm *prior* to clipping. Clipping is the
+      stability lever and cannot be tuned against an unobserved number: always
+      under `max_norm` => the clip is inert; always over => the learning rate is
+      the problem, not the clipping.
+    * ``nis_over_dof`` -- the contact update is the stacked 3N vector, so
+      NIS ~ chi^2(3N) and a *calibrated* filter sits at 1.0; above is
+      overconfident, below is conservative. beta-NLL's real progress metric.
+    * ``applied_frac`` -- fraction of ticks whose update passed the cond(S) gate.
+      Below 1.0 means the loss is scoring innovations that never corrected the
+      state at all.
+    * ``cond_proxy_max`` -- worst conditioning proxy in the batch, against `cond_max`.
     """
     loss: Array
     grad_norm: Array
@@ -41,12 +35,11 @@ class Metrics(NamedTuple):
     cond_proxy_max: Array
 
 def decay_mask(params: ContactNetParams):
-    """
-    True where weight decay applies - in the trunk only.
+    """True where weight decay applies -- the trunk only.
 
-    Decay on the head drags `Sigma` back toward the initialization and fights
-    the `ln det` term that does the calibration for beta-NLL. `head` is a subtree,
-    so `_replace` does this directly, without using strings.
+    Decay on the head drags `Sigma` back toward the initialization and fights the
+    `ln det` term that does the calibration for beta-NLL. `head` is a subtree, so
+    `_replace` masks it directly, without strings.
     """
     return jax.tree.map(lambda _: True, params)._replace(
         head=jax.tree.map(lambda _: False, params.head)
@@ -59,16 +52,18 @@ def make_optimizer(
     max_norm=1.0,
     weight_decay=0.0
 ):
-    """
-    The order here is important: `clip_by_global_norm` runs **first**, on the raw gradient.
-    `optax.chain` applies left to right, and clipping *after* Adam would clip already normalized
-    updates -- Adam's output is roughly unit scale per parameter by construction, so that clip would
-    do nothing.
+    """Clip-then-AdamW, with a warmup-cosine schedule.
 
-    Warmup is required. At the initialization, the head weights are *zero*, so the trunk's gradient
-    is *exactly* zero and only the head moves first. Adam normalizes per parameter, so that first head
-    update has magnitude ~lr no matter how small the gradient is, and a full size first step discards the
-    "refinement from a known good point" that we want to use.
+    The order matters: `optax.chain` applies left to right, so
+    `clip_by_global_norm` runs **first**, on the raw gradient. Clipping *after*
+    Adam would clip already-normalized updates -- Adam's output is roughly unit
+    scale per parameter by construction -- and do nothing.
+
+    Warmup is required. At initialization the head weights are *zero*, so the
+    trunk's gradient is exactly zero and only the head moves first. Adam
+    normalizes per parameter, so that first head update has magnitude ~lr no
+    matter how small the gradient is, and a full-size first step discards the
+    "refinement from a known good point" the initialization exists to give.
     """
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0, peak_value=peak_lr,
@@ -81,17 +76,8 @@ def make_optimizer(
     )
 
 def make_train_step(batch_loss, tx, dof: int):
-    """
-    Build the JIT train step.
-
-    Parameters
-    ----------
-    batch_loss: callable
-        `(params, batch) -> (lOss, aux)` from `rollout.make_batch_loss`
-    tx: optax.GradientTransformation
-    dof: int
-        Measurement dimension `3 * N_contacts`, for `nis_over_dof`.
-    """
+    """Build the JIT train step from `rollout.make_batch_loss`'s ``batch_loss``, an
+    optax transformation, and the measurement dimension ``dof = 3 * N_contacts``."""
     @jax.jit
     def train_step(params, opt_state, batch, carry0=None):
         #has_aux=True nests as ((loss, aux),grads)
@@ -118,8 +104,7 @@ def make_train_step(batch_loss, tx, dof: int):
     return train_step
 
 def save_params(path: str, params: ContactNetParams) -> None:
-    """
-    Training checkpoint - **not** the Java artifact.
+    """Training checkpoint -- **not** the Java artifact.
 
     Leaves go in `jax.tree.leaves` order, which is structural and stable for a
     NamedTuple, so `load_params` can rebuild the tree from just a reference.
@@ -127,9 +112,7 @@ def save_params(path: str, params: ContactNetParams) -> None:
     np.savez(path, *[np.asarray(x) for x in jax.tree.leaves(params)])
 
 def load_params(path: str, like: ContactNetParams) -> ContactNetParams:
-    """
-    Rebuild params from a checkpoint, taking tree structure from `like`.
-    """
+    """Rebuild params from a checkpoint, taking tree structure from `like`."""
     with np.load(path) as z:
         leaves = [jnp.asarray(z[k], dtype=jnp.float64) for k in z.files]
     return jax.tree.unflatten(jax.tree.structure(like), leaves)
@@ -148,10 +131,8 @@ def train(
     dof=6,
     log_every=10
 ):
-    """
-    Run the training loop.
-
-    Two modes, and the difference is the error distribution each segment starts from:
+    """Run the training loop.  Two modes, differing in the error distribution each
+    segment starts from:
 
     * ``batches`` — an iterable of `rollout.Segment` pytrees with a leading batch
       axis, each re-seeded from ground truth (run 1).  This module deliberately

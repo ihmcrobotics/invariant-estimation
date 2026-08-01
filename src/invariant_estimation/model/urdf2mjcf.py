@@ -1,35 +1,18 @@
-r"""
-model/urdf2mjcf.py
-==================
-Convert the IHMC robot description that ships **inside every SCS2 log directory**
-(`model.sdf` -- despite the extension it is plain URDF: ``<robot>`` with
-``<link>``/``<joint>`` and a few Gazebo sensor blocks) into an MJCF that MuJoCo
-can compile.
+r"""Convert the IHMC robot description that ships **inside every SCS2 log
+directory** (`model.sdf` -- despite the extension it is plain URDF) into MJCF.
 
-Why convert the log's own model rather than use a vendored Alex MJCF
--------------------------------------------------------------------
-The parity harness (`replay/`) compares this port against the Java estimator's
-*logged* output from a specific hardware run.  Any difference in link inertia,
-joint origin or IMU mount between the model the Java filter used and the model
-the Python filter uses shows up as a parity failure that has nothing to do with
-the port.  `model.sdf` is, by construction, the exact description that ran --
-the logger writes it alongside the data.  Using it removes an entire class of
-false negatives, at the cost of this file.
+The log's own model, not a vendored Alex MJCF: the parity harness (`replay/`)
+compares this port against the Java estimator's *logged* output from a specific
+hardware run, so any difference in link inertia, joint origin or IMU mount would
+show up as a parity failure that has nothing to do with the port.
 
-What is deliberately dropped
-----------------------------
-Only what cannot affect ``mj_kinematics`` / ``mj_crb``:
-
-* ``<visual>`` and ``<collision>`` -- meshes live in ``resources.zip`` and would
-  make the converter depend on unpacking it.  The estimator never queries
-  geometry: it needs FK, site Jacobians and ``M(q)``, none of which read geoms.
-* ``<gazebo>`` sensor noise blocks -- the filter's noise model comes from
-  `config/filter_cfg.yaml`, not the description.
-* Joint ``<limit>`` **ranges** -- ``mj_kinematics`` does not clamp ``qpos``, so a
-  range can only change behaviour by accident.  The ``effort`` limit *is* kept,
-  but returned as data (`AlexModelSpec.effort_limits`) rather than written into
-  the MJCF, because that is how the filter consumes it: ``sigma_tau,i =
-  alpha_i * tau_max,i`` (invariant I9).
+Dropped -- only what cannot affect ``mj_kinematics`` / ``mj_crb``: ``<visual>`` /
+``<collision>`` (meshes live in ``resources.zip``; the estimator never queries
+geometry), ``<gazebo>`` sensor noise (the filter's noise comes from
+`config/filter_cfg.yaml`), and joint ``<limit>`` **ranges** (``mj_kinematics``
+does not clamp ``qpos``).  The ``effort`` limit is kept, but returned as data
+(`AlexModelSpec.effort_limits`) rather than written into the MJCF, because that
+is how the filter consumes it: ``sigma_tau,i = alpha_i * tau_max,i`` (I9).
 
 Two conventions that are easy to get wrong
 ------------------------------------------
@@ -47,8 +30,6 @@ Two conventions that are easy to get wrong
    carries ``pos``/``quat`` and the ``<joint>`` sits at the body origin.  So the
    mapping is body-pos := joint-origin, joint-pos := 0, axis unchanged.
 
-Armature
---------
 Reflected rotor inertia is written as the MJCF ``armature`` attribute, resolved
 from `config/filter_cfg.yaml`'s substring table.  This is the *only* place rotor
 inertia enters: MuJoCo folds ``armature`` into ``qM`` before the Schur complement
@@ -89,28 +70,21 @@ class AlexModelSpec:
     imu_sites: dict[str, str] = field(default_factory=dict)
     """``log sensor name -> MJCF site name``, e.g. ``pelvis_imu -> pelvis_imu``.
 
-    Derived from the ``*_IMU_JOINT`` fixed joints, lowercased to match the
-    ``gyroscope_<name>{X,Y,Z}`` variables in the log.  This is the join key
-    between the description and the log, so it is data, not a naming convention
-    buried in a helper.
+    Lowercased to match the log's ``gyroscope_<name>{X,Y,Z}``.  This is the join
+    key between the description and the log, so it is data, not a naming
+    convention buried in a helper.
     """
 
     root_body: str = ""
     """Name of the floating-base link (the one no joint has as a child)."""
 
 
-# ---------------------------------------------------------------------------
-# rotations
-# ---------------------------------------------------------------------------
-
-
 def _rpy_to_quat(rpy: Iterable[float]) -> tuple[float, float, float, float]:
-    """URDF fixed-axis ``rpy`` -> MJCF ``(w, x, y, z)``.
+    """URDF fixed-axis ``rpy`` -> MJCF ``(w, x, y, z)``, ``R = Rz(y) Ry(p) Rx(r)``.
 
-    ``R = Rz(y) Ry(p) Rx(r)``. Written out rather than delegated to a rotation
-    library so the convention is auditable at the point of use -- this is the
-    conversion that silently breaks IMU mounts if taken from the wrong library
-    default.
+    Written out rather than delegated to a rotation library so the convention is
+    auditable at the point of use -- this is the conversion that silently breaks
+    IMU mounts if taken from the wrong library default.
     """
     r, p, y = (float(v) for v in rpy)
     cr, sr = math.cos(r / 2), math.sin(r / 2)
@@ -152,16 +126,13 @@ def _quat_to_mat(quat: Iterable[float]) -> np.ndarray:
 
 
 def _rotate_inertia(inertia: ET.Element, quat: Iterable[float]) -> np.ndarray:
-    r"""URDF ``<inertia>`` expressed in the inertial-origin frame -> body axes.
+    r"""URDF ``<inertia>`` (inertial-origin frame) -> ``I_body = R I_urdf R^T``.
 
-    URDF states the tensor in the frame defined by the inertial ``<origin>``'s
-    *rotation*; MJCF's ``fullinertia`` is stated in the **body** frame (it refuses
-    to accept an orientation alongside, which is what forces this rotation to be
-    explicit).  So emit ``I_body = R I_urdf R^T``.
-
-    Doing the rotation here rather than handing MuJoCo a ``quat`` +
-    ``diaginertia`` avoids an eigendecomposition whose eigenvector sign/order
-    conventions are unspecified -- a congruence is exact and has no branch.
+    MJCF's ``fullinertia`` is stated in the **body** frame and refuses an
+    orientation alongside, which is what forces this rotation to be explicit.
+    Doing it here rather than handing MuJoCo a ``quat`` + ``diaginertia`` avoids
+    an eigendecomposition whose eigenvector sign/order conventions are
+    unspecified -- a congruence is exact and has no branch.
     """
     ixx = float(inertia.get("ixx"))
     iyy = float(inertia.get("iyy"))
@@ -179,11 +150,6 @@ def _fmt(values: Iterable[float]) -> str:
     millimetre-level FK error, which is the same order as the contact residuals
     the InEKF is trying to resolve."""
     return " ".join(repr(float(v)) for v in values)
-
-
-# ---------------------------------------------------------------------------
-# rotor inertia
-# ---------------------------------------------------------------------------
 
 
 def _armature_for(joint_name: str, table: dict[str, float], default: float) -> float:
@@ -207,11 +173,6 @@ def _armature_for(joint_name: str, table: dict[str, float], default: float) -> f
         if key.upper() in upper:
             return float(value)
     return float(default)
-
-
-# ---------------------------------------------------------------------------
-# conversion
-# ---------------------------------------------------------------------------
 
 
 def urdf_to_mjcf(
@@ -299,11 +260,7 @@ def urdf_to_mjcf(
     ]
 
     def emit_link(link_name: str, joint: ET.Element | None, depth: int) -> None:
-        """Depth-first emit of one body and its subtree.
-
-        Recursive rather than iterative: Alex's tree is 49 links and ~8 deep, so
-        the recursion cost is nil and the nesting reads like the MJCF it writes.
-        """
+        """Depth-first emit of one body and its subtree (Alex: 49 links, ~8 deep)."""
         pad = "  " * (depth + 2)
         link = links[link_name]
 

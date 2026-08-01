@@ -10,37 +10,22 @@ from .losses import beta_nll_from_diagnostics, l2_velocity
 from .network import ContactNetParams, forward
 
 class Segment(NamedTuple):
-    """
-    One training sample, for `L` consecutive filter ticks.
+    """One training sample: `L` consecutive filter ticks.
 
-    A segment is a *trajectory*, not a window. `H` (history per evaluation) 
-    and `L` are independent axes - don't mix them up!
+    A segment is a *trajectory*, not a window. `H` (history per evaluation) and
+    `L` are independent axes -- don't mix them up.
 
-    Attributes
-    ----------
-    inputs : InEKFInputs
-        Every leaf carries a leading time axis of length ``L``. Its
-        ``contact_chol`` field -- the *stance anchor* process noise -- is a
-        **placeholder**: `segment_loss` overwrites it with the network's actual
-        output. Its recorded value is the analytic Schmitt-switched heuristic.
+    ``inputs`` carries a leading time axis of length ``L`` on every leaf. Its
+    ``contact_chol`` field -- the *stance anchor* process noise -- is a
+    **placeholder**: `segment_loss` overwrites it with the network's output, and
+    its recorded value is the analytic Schmitt-switched heuristic.
+    ``contact_meas_chol`` is not driven by anything and stays at the recorded
+    zeros, i.e. the shipped filter's ``N = J Σ_q Jᵀ``.
 
-        ``contact_meas_chol`` is not driven by anything and stays at the
-        recorded zeros, i.e. the shipped filter's ``N = J Σ_q Jᵀ``.
-
-    windows: Array, shape (L, N_c, H, F)
-        Per-tick, per-contact normalized feature windows.
-
-    state0: InEKFState
-        Filter state at segment start, reseeded from ground truth.
-
-    v_true: Array, shape (L, 3)
-        Ground-truth base velocity, **world frame** (`SimSensorReader.truth()["v"]`
-        already is), for the L2 baseline objective.
-
-    R_true: Array, shape (L, 3, 3)
-        Ground-truth attitude. Needed because `losses.l2_velocity` compares in
-        each side's OWN body frame -- with a single shared rotation the whole
-        conversion would cancel and be a no-op. See that docstring.
+    ``windows`` is ``(L, N_c, H, F)`` normalized feature windows; ``state0`` the
+    filter state at segment start; ``v_true`` ``(L, 3)`` ground-truth base
+    velocity in **world frame**; ``R_true`` ``(L, 3, 3)`` ground-truth attitude,
+    needed because `losses.l2_velocity` compares in each side's OWN body frame.
     """
     inputs: InEKFInputs
     windows: Array
@@ -49,17 +34,15 @@ class Segment(NamedTuple):
     R_true: Array
 
 def contact_factors(params: ContactNetParams, windows: Array, eps: float) -> Array:
-    """
-    Network over every tick and contact at once: (L, N_c, H, F) -> (L, N_c, 3, 3)
+    """Network over every tick and contact at once: ``(L, N_c, H, F) -> (L, N_c, 3, 3)``.
 
-    The network only sees sensor history, never the actual filter state, so nothing
-    depends on the scan carry and the whole time axis evaluates in one batched pass, 
-    rather than `L` sequential ones.
+    The network only sees sensor history, never the filter state, so nothing
+    depends on the scan carry and the whole time axis evaluates in one batched
+    pass rather than `L` sequential ones.
 
-    The flatten is ``(H, F) -> H * F`` row major, i.e. **H-major**: history index
-    outer, channel inner. That ordering is a convention that is shared with the Java
-    port and a few files of the python port here, namely `features.py, normalize.py`,
-    and `export.py`.
+    The flatten is ``(H, F) -> H * F`` row-major, i.e. **H-major**: history index
+    outer, channel inner. That convention is shared with the Java port and with
+    `features.py`, `normalize.py` and `export.py`.
     """
     L, N_c = windows.shape[0], windows.shape[1]
     flat = windows.reshape(L, N_c, -1) # (L, N_c, D_in)
@@ -68,22 +51,16 @@ def contact_factors(params: ContactNetParams, windows: Array, eps: float) -> Arr
     return over_time(params, flat, eps)
 
 def make_segment_loss(ekf, kinematics, eps, beta = 0.5, objective="beta_nll", remat=True):
-    """
-    Build the per-segment loss.
+    """Build the per-segment loss: ``(params, segment) -> (loss, (outputs, carry))``.
 
-    A "factory", matching `make_step`: `ekf`, `kinematics` and the scalars are all static
-    and get closed over, so the callable only takes ``(params, segment)`` -- this is
-    differentiable in `params` and vmappable over segments.
+    A factory matching `make_step`: `ekf`, `kinematics` and the scalars are static
+    and closed over, so the callable is differentiable in `params` and vmappable
+    over segments.
 
-    Parameters
-    ----------
-    objective : {"beta_nll", "l2_velocity"}
-        Run 1 reproduces the original CoCo-InEKF work with ``l2_velocity``; run 2 onward
-        uses the new beta_nll. This is selected at build time, and doesn't put a branch in
-        the computation graph, and stays outside the JIT-traced region.
-    remat : bool
-        Wrap the scan body in `jax.checkpoint`. ``prevent_cse=False`` is the
-        setting for a remat'd function under `scan`.
+    ``objective`` is selected at build time, outside the traced region, so it puts
+    no branch in the graph: run 1 reproduces CoCo-InEKF with ``l2_velocity``, run 2
+    onward uses ``beta_nll``.  ``remat`` wraps the scan body in `jax.checkpoint`
+    (``prevent_cse=False`` is the correct setting under `scan`).
     """
     if objective not in ("beta_nll", "l2_velocity"):
         raise ValueError(f"Unknown objective {objective!r}")
@@ -129,19 +106,17 @@ def make_warm_in(ekf, kinematics, sigma_0: float | None = None):
     its natural level before the chain contributes a gradient.
 
     ``sigma_0=None`` (the default) warms in on the recorded heuristic
-    ``inputs.contact_chol``, i.e. on the shipped filter. That is the right
-    default on the **process** socket for the same reason
-    `online.make_provider`'s fallback defers to the heuristic: this socket has no
-    "reproduces the shipped filter" constant to hold. A constant here is not a
-    harmless approximation — a constant at the *stance* value is
-    `freeze_contact_chol`, measured 10.2x worse in body-frame velocity than not
-    using contacts at all, and it would grow the chain's error under a filter the
-    trained network never runs inside.
+    ``inputs.contact_chol``, i.e. on the shipped filter, for the same reason
+    `online.make_provider`'s fallback defers to it: this socket has no
+    "reproduces the shipped filter" constant to hold, and a constant at the
+    *stance* value is `freeze_contact_chol` (see there for the measurement),
+    which would grow the chain's error under a filter the trained network never
+    runs inside.
 
     Passing a float restores the old behaviour, broadcasting ``σ₀·I₃`` over the
     warm-in slice. Note that `ContactNetConfig.sigma_0` is a **measurement**-socket
-    number (three orders below ``J Σ_q Jᵀ``); that argument does not transfer, so
-    reusing it here is a deliberate choice and not a default.
+    number; that argument does not transfer, so reusing it here is a deliberate
+    choice and not a default.
 
     Built here rather than in `dataset` so that module keeps its "no MJX, no
     estimator build" property.
@@ -159,13 +134,12 @@ def make_warm_in(ekf, kinematics, sigma_0: float | None = None):
     return warm_in
 
 def make_batch_loss(*args, **kwargs):
-    """
-    `make_segment_loss` vmapped over a batch of `B` segments.
+    """`make_segment_loss` vmapped over a batch of `B` segments.
 
     ``in_axes=(None, 0)``: one shared weight set, one independent trajectory per
-    batch element. A batch of `B` segments is`B * L * N_c` forward passes, but
-    only **B independent samples** - size the batch by this, not by the forward pass
-    count.
+    batch element. A batch of `B` segments is ``B * L * N_c`` forward passes but
+    only **B independent samples** -- size the batch by this, not by the forward
+    pass count.
     """
     segment_loss = make_segment_loss(*args, **kwargs)
 

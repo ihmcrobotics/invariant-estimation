@@ -1,30 +1,10 @@
-"""
-config.py
-=========
-Loader for ``config/filter_cfg.yaml`` — the single place every tuning number in
-the estimator lives.
+"""Loader for ``config/filter_cfg.yaml`` — where every tuning number lives.
 
-Modules do **not** hard-code tuning values.  Each `default_*_params` factory
-reads its defaults from here, so retuning is a YAML edit rather than a hunt
-through module globals.  Structural constants (tangent indices, block layouts,
-group sizes) deliberately stay in code: those change the math, not the tuning.
-
-Usage
------
-    from invariant_estimation.config import get_config, section
-
-    cfg = get_config()                 # whole tree, cached
-    inekf = section("inekf")           # one section
-    tau = section("gravity_leveling")["reference_tau"]
-
-Every factory also accepts explicit keyword overrides, so a test or a sweep can
-pass a value without touching the file::
-
-    default_gravity_params(pitch_var=0.5)
-
-`load_config(path)` reads an alternative file (e.g. a per-robot config) and
-`set_config` installs it process-wide; `get_config.cache_clear()`-style reloads
-are unnecessary because `load_config` is explicit.
+Each `default_*_params` factory reads its defaults from here, so retuning is a
+YAML edit rather than a hunt through module globals.  Structural constants
+(tangent indices, block layouts, group sizes) deliberately stay in code: those
+change the math, not the tuning.  Every factory also takes keyword overrides, so
+a test or a sweep can pass a value without touching the file.
 """
 from functools import lru_cache
 from pathlib import Path
@@ -40,18 +20,7 @@ _OVERRIDE: dict[str, Any] | None = None
 
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
-    """Read and parse a filter config file (uncached).
-
-    Parameters
-    ----------
-    path : str or Path, optional
-        Defaults to ``config/filter_cfg.yaml`` at the repo root.
-
-    Returns
-    -------
-    dict
-        The parsed YAML tree.
-    """
+    """Read and parse a filter config file (uncached); default ``config/filter_cfg.yaml``."""
     path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
     if not path.is_file():
         raise FileNotFoundError(f"filter config not found: {path}")
@@ -111,14 +80,8 @@ def set_config(config: dict[str, Any] | None) -> None:
 
 
 def section(name: str) -> dict[str, Any]:
-    """One top-level section of the active config.
-
-    Raises
-    ------
-    KeyError
-        If the section is missing — a typo should fail loudly at build time
-        rather than silently fall back to a hard-coded number.
-    """
+    """One top-level section of the active config; `KeyError` on a typo, loudly at
+    build time rather than a silent fall back to a hard-coded number."""
     config = get_config()
     if name not in config:
         raise KeyError(
@@ -129,11 +92,8 @@ def section(name: str) -> dict[str, Any]:
 
 
 def resolve(overrides: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
-    """Merge explicit keyword overrides over config defaults, dropping ``None``.
-
-    The pattern every `default_*_params` factory uses: keyword arguments default
-    to ``None`` meaning "take it from the config".
-    """
+    """Merge keyword overrides over config defaults, dropping ``None`` (= "take it
+    from the config") — the pattern every `default_*_params` factory uses."""
     merged = dict(defaults)
     merged.update({k: v for k, v in overrides.items() if v is not None})
     return merged

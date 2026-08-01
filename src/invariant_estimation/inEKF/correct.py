@@ -1,59 +1,40 @@
-r"""
-inEKF/correct.py
-================
-Correction (measurement-update) step of the world-centric, right-invariant
-contact-aided InEKF on ``SE_{N+2}(3)`` (CLAUDE.md §4).
+r"""Correction (measurement-update) step of the InEKF on ``SE_{N+2}(3)``.
 
 Forward kinematics gives the body-frame vector base→contact,
 ``y_i = h_{p,i}(q̂) = {}^{B}p_{BC_i}``.  In the world-centric state this is a
 **right-invariant observation** (``Y = X⁻¹ b + V``), which is exactly why the
 observation matrix ``H`` is *state-independent* and can be precomputed once
-(`state.build_H`, invariant 6) — the corner chosen in §0.
+(`state.build_H`).
 
-Per-contact observation (§4.1)
-------------------------------
-With ``b`` the homogeneous selector ``[0_3 ; 0 ; 1 ; −1]`` (the ``+1`` in the
-``p`` slot, the ``−1`` in this contact's ``d_i`` slot) and the state's own
-prediction ``h_pred_i = R̄ᵀ(d̄_i − p̄)``, the right-invariant innovation mapped
-into the world frame is (§4.3)
+With ``b`` the homogeneous selector ``[0_3 ; 0 ; 1 ; −1]`` (the ``+1`` in the ``p``
+slot, the ``−1`` in this contact's ``d_i`` slot) and the state's own prediction
+``h_pred_i = R̄ᵀ(d̄_i − p̄)``, the right-invariant innovation mapped into the world
+frame is
 
     \nu_i = Π(X̄ Y_i) = R̄ y_i − (d̄_i − p̄) = R̄ (y_i − h_pred_i)  (measurement − model).
 
-**Sign convention (CLAUDE.md I5).**  The precomputed ``H`` (`state.build_H`) is
-``H_i = [0  0  +I  …  −I(col d_i)  …]`` ⟹ ``H_i ξ = ξ_p − ξ_{d_i}``, matching the
-Java `ContactUpdater.computeJacobian` element-for-element.  The innovation
-linearises the *same* way, ``\nu_i ≈ ξ_p − ξ_{d_i} = +H_i ξ``, so ``ξ⁺ = K \nu``
-estimates the error and is removed by ``X̂⁺ = exp(−(Kν)^∧) X̂``.  Then
-``ξ_err⁺ = (I − KH) ξ_err`` (error reduces) and the Joseph form is exact.
+**Sign convention (I5).**  ``H_i = [0  0  +I  …  −I(col d_i)  …]`` ⟹
+``H_i ξ = ξ_p − ξ_{d_i}``, matching the Java `ContactUpdater.computeJacobian`
+element-for-element.  The innovation linearises the *same* way,
+``\nu_i ≈ ξ_p − ξ_{d_i} = +H_i ξ``, so ``ξ⁺ = K \nu`` estimates the error and is
+removed by ``X̂⁺ = exp(−(Kν)^∧) X̂``.  Then ``ξ_err⁺ = (I − KH) ξ_err`` (error
+reduces) and the Joseph form is exact.
 
-Measurement noise (§4.2)
-------------------------
-The position FK noise ``N^p_i = J_{C_i}(q̂) Σ_q J_{C_i}ᵀ`` is routed in **already
-assembled** as ``Np`` (shape ``(N, 3, 3)``): the kinematic Jacobian ``J_{C_i}``
-(from ``robot/``) and the filtered joint covariance ``Σ_q`` (from ``joint_kf``)
-are multiplied upstream — this module imports neither, mirroring how
-`propagate.py` consumes the already-digested ``sigma_c``.  The boundary contract
-(§6) is honoured: joint-KF outputs reach the filter only here, on the correction
-side, always pre-multiplied by a kinematic Jacobian.
+The position FK noise ``N^p_i = J_{C_i}(q̂) Σ_q J_{C_i}ᵀ`` arrives **already
+assembled** as ``Np`` ``(N, 3, 3)``: the kinematic Jacobian (from ``robot/``) and the
+filtered joint covariance (from ``joint_kf``) are multiplied upstream, so this
+module imports neither.  Joint-KF outputs reach the filter only here, on the
+correction side, always pre-multiplied by a kinematic Jacobian.
 
-    # TODO(N^v / zero-velocity): the contact zero-velocity constraint with its
-    # own noise N^v_i = J_{Ċ_i} Σ_q̇ J_{Ċ_i}ᵀ (§4.2) is a *separate* measurement
-    # block, never folded into N^p.  Deferred for v1 (§10); when it lands it
-    # stacks below the position block with its own H rows and its own Np-like
-    # input — it does not mix into this Jacobian.
+Gain + update (§4.3)::
 
-Gain + update (§4.3)
---------------------
     S  = H P Hᵀ + N
     K  = P Hᵀ S⁻¹                         (via cho_solve — never `inv`)
     ξ⁺ = K \nu
     P⁺ = (I − K H) P (I − K H)ᵀ + K N Kᵀ  (Joseph form — mandatory)
     X̂⁺ = exp(−ξ⁺) X̂                       (right-invariant: exp on the LEFT, I5)
 
-Everything is ``jax.jit``-able and differentiable (§8): per-contact work is
-vectorised (no Python loop over contacts), ``S⁻¹`` is a Cholesky solve, and the
-covariance is kept symmetric.  ``N`` is static, so the ``N = 0`` (no candidates)
-case is a plain early return.
+``N`` is static, so the ``N = 0`` (no candidates) case is a plain early return.
 """
 from typing import NamedTuple
 
@@ -72,46 +53,22 @@ from .state import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Observation model (§4.1)
-# ---------------------------------------------------------------------------
-
 def predicted_contact(state: InEKFState) -> Array:
-    r"""State-predicted body-frame FK vectors ``h_pred_i = R̄ᵀ(d̄_i − p̄)`` (§4.1).
+    r"""State-predicted body-frame FK vectors ``h_pred_i = R̄ᵀ(d̄_i − p̄)``, ``(N, 3)``.
 
     The model counterpart of the measured ``y_i = h_{p,i}(q̂)``; also a natural
-    ContactNet trust feature.  Vectorised over the ``N`` contacts.
-
-    Parameters
-    ----------
-    state : InEKFState
-
-    Returns
-    -------
-    Array, shape (N, 3)
-        Predicted base→contact vectors in the body frame.
+    ContactNet trust feature.
     """
     rel = state.d - state.p                       # (N, 3): d̄_i − p̄ in world
     return rel @ state.R                          # (R̄ᵀ rel_i) stacked = rel @ R
 
 
 def innovation(state: InEKFState, y: Array) -> Array:
-    r"""Right-invariant innovation stacked over contacts (§4.1), shape ``(3N,)``.
+    r"""Right-invariant innovation ``\nu_i = R̄ y_i − (d̄_i − p̄)`` stacked over contacts, ``(3N,)``.
 
-    ``\nu_i = Π(X̄ Y_i) = R̄ y_i − (d̄_i − p̄)`` (measurement − model, world frame);
-    it linearises to ``ξ_p − ξ_{d_i} = +H_i ξ``, so ``ξ⁺ = K \nu`` is the error
-    estimate and is applied as ``exp(−ξ⁺)`` (I5).
-
-    Parameters
-    ----------
-    state : InEKFState
-    y : Array, shape (N, 3)
-        Measured body-frame FK vectors ``h_{p,i}(q̂)`` from ``robot/`` FK.
-
-    Returns
-    -------
-    Array, shape (3N,)
-        ``[\nu_1 ; … ; \nu_N]`` in the same block order as ``H``.
+    ``y`` is ``(N, 3)`` measured body-frame FK vectors; the result is world-frame and
+    in the same block order as ``H``.  It linearises to ``ξ_p − ξ_{d_i} = +H_i ξ``, so
+    ``ξ⁺ = K \nu`` is the error estimate and is applied as ``exp(−ξ⁺)`` (I5).
     """
     rel = state.d - state.p                       # (N, 3): d̄_i − p̄
     nu = y @ state.R.T - rel                       # (N, 3): R̄ y_i − (d̄_i − p̄)
@@ -119,11 +76,10 @@ def innovation(state: InEKFState, y: Array) -> Array:
 
 
 def _block_diag(blocks: Array) -> Array:
-    """Block-diagonal ``(3N, 3N)`` from a ``(N, 3, 3)`` stack (vectorised).
+    """``(N,3,3)`` stack → block-diagonal ``(3N, 3N)``, vectorised; handles ``N = 0``.
 
-    Block ``(i, i)`` is ``blocks[i]``; every off-diagonal block is zero.  Handles
-    ``N = 0`` (returns ``(0, 0)``).  Same construction as `propagate`'s contact
-    assembly — kept local so `correct.py` stays decoupled.
+    Same construction as `propagate`'s contact assembly — kept local so `correct.py`
+    stays decoupled.
     """
     N = blocks.shape[0]
     selector = jnp.einsum("ij,ikl->ijkl", jnp.eye(N), blocks)   # δ_ij blocks[i]
@@ -131,48 +87,15 @@ def _block_diag(blocks: Array) -> Array:
 
 
 def measurement_noise(Np: Array) -> Array:
-    r"""Stacked FK measurement noise ``N`` (block-diagonal), shape ``(3N, 3N)``.
-
-    The per-contact position noises ``N^p_i = J_{C_i} Σ_q J_{C_i}ᵀ`` (§4.2) are
-    independent across contacts, so the stacked noise is block-diagonal.
-
-    Parameters
-    ----------
-    Np : Array, shape (N, 3, 3)
-        Per-contact position FK covariances (pre-assembled upstream).
-
-    Returns
-    -------
-    Array, shape (3N, 3N)
-    """
+    r"""``(N,3,3)`` per-contact ``N^p_i`` → stacked ``(3N, 3N)`` noise, block-diagonal because contacts are independent."""
     return _block_diag(Np)
 
 
-# ---------------------------------------------------------------------------
-# Gain and Joseph update (§4.3)
-# ---------------------------------------------------------------------------
-
 def kalman_gain(P: Array, H: Array, N: Array) -> tuple[Array, Array]:
-    r"""Right-invariant Kalman gain ``K = P Hᵀ S⁻¹`` with ``S = H P Hᵀ + N``.
+    r"""``(K, S)`` with ``K = P Hᵀ S⁻¹``, ``S = H P Hᵀ + N`` — the innovation covariance is returned for NIS.
 
-    ``S⁻¹`` is applied through a Cholesky solve (``S`` is SPD: ``H`` is full row
-    rank and ``P`` SPD ⟹ ``H P Hᵀ`` SPD, ``N`` PSD) — never an explicit inverse
-    (invariant 7).
-
-    Parameters
-    ----------
-    P : Array, shape (3N+9, 3N+9)
-        Predicted covariance.
-    H : Array, shape (3N, 3N+9)
-        Constant FK observation (`InEKFParams.H`).
-    N : Array, shape (3N, 3N)
-        Measurement noise (`measurement_noise`).
-
-    Returns
-    -------
-    K : Array, shape (3N+9, 3N)
-    S : Array, shape (3N, 3N)
-        Innovation covariance (returned for downstream NIS / consistency checks).
+    ``S⁻¹`` is applied through a Cholesky solve (``S`` is SPD: ``H`` full row rank and
+    ``P`` SPD ⟹ ``H P Hᵀ`` SPD, ``N`` PSD) — never an explicit inverse.
     """
     PHt = P @ H.T                                 # (3N+9, 3N)
     S = H @ PHt + N                               # (3N, 3N)
@@ -183,22 +106,10 @@ def kalman_gain(P: Array, H: Array, N: Array) -> tuple[Array, Array]:
 
 
 def joseph_update(P: Array, K: Array, H: Array, N: Array) -> Array:
-    r"""Joseph-form covariance update ``P⁺ = (I−KH) P (I−KH)ᵀ + K N Kᵀ`` (§4.3).
+    r"""Joseph-form covariance update ``P⁺ = (I−KH) P (I−KH)ᵀ + K N Kᵀ``, symmetrised.
 
-    Joseph form is mandatory: ``K`` comes from a linearised ``H`` and is never
-    exactly optimal, so the short ``(I−KH)P`` is not guaranteed PSD; the Joseph
-    form is.  The result is symmetrised (invariant 7).
-
-    Parameters
-    ----------
-    P : Array, shape (3N+9, 3N+9)
-    K : Array, shape (3N+9, 3N)
-    H : Array, shape (3N, 3N+9)
-    N : Array, shape (3N, 3N)
-
-    Returns
-    -------
-    Array, shape (3N+9, 3N+9)
+    Joseph form is mandatory: ``K`` comes from a linearised ``H`` and is never exactly
+    optimal, so the short ``(I−KH)P`` is not guaranteed PSD; the Joseph form is.
     """
     IKH = jnp.eye(P.shape[0]) - K @ H
     Pp = IKH @ P @ IKH.T + K @ N @ K.T
@@ -206,29 +117,16 @@ def joseph_update(P: Array, K: Array, H: Array, N: Array) -> Array:
 
 
 def apply_correction(state: InEKFState, xi: Array) -> InEKFState:
-    r"""Apply the tangent correction ``X̂⁺ = exp(−ξ⁺) X̂`` (left multiply, I5).
+    r"""Apply the tangent correction ``X̂⁺ = exp(−ξ⁺) X̂`` (left multiply, I5); ``P`` unchanged.
 
-    Right-invariant ⟹ ``exp`` multiplies on the **left** of ``X̂``, so base *and*
-    every contact move consistently — the off-diagonal covariance coupling is
-    what lets a foot measurement sharpen the base and vice versa.
+    Right-invariant ⟹ ``exp`` multiplies on the **left** of ``X̂``, so base *and* every
+    contact move consistently — the off-diagonal covariance coupling is what lets a
+    foot measurement sharpen the base and vice versa.
 
-    **Sign** — with the Java/I5 ``H`` (`state.build_H`) the residual linearises
-    to ``ν ≈ +H ξ``, so ``ξ⁺ = Kν`` is an estimate *of the error itself* and must
-    be subtracted: hence ``exp(−ξ⁺)``, CLAUDE.md I5 verbatim. Getting this
-    backwards passes the easy tests and diverges under transients (§6).
-
-    Parameters
-    ----------
-    state : InEKFState
-        Predicted state (covariance left untouched here; updated separately).
-    xi : Array, shape (3N+9,)
-        Correction ``ξ⁺ = K \nu`` in the fixed ``[ξ_R ; ξ_v ; ξ_p ; ξ_{d_i}]``
-        order.  Applied as ``exp(−ξ⁺)``.
-
-    Returns
-    -------
-    InEKFState
-        State with corrected ``(R, v, p, d)``; ``P`` unchanged.
+    **Sign** — with the Java/I5 ``H`` the residual linearises to ``ν ≈ +H ξ``, so
+    ``ξ⁺ = Kν`` is an estimate *of the error itself* and must be subtracted: hence
+    ``exp(−ξ⁺)``.  Getting this backwards passes the easy tests and diverges under
+    transients.
     """
     N = state.N
     Xi = exp_SEn3(-xi, N)                         # (N+5, N+5) — I5 sign
@@ -241,18 +139,9 @@ def apply_correction(state: InEKFState, xi: Array) -> InEKFState:
     )
 
 
-# ---------------------------------------------------------------------------
-# Generic linear update (Java `InvariantUpdater`)
-# ---------------------------------------------------------------------------
-
 class UpdateDiagnostics(NamedTuple):
-    """Published per-update diagnostics.
-
-    These are the Java `InvariantUpdater` / `InvariantEKF` introspection getters
-    (`getNormalizedInnovationSquared`, `wasLastUpdateApplied`,
-    `getLastConditionProxy`, `getLastCorrectionRotationNorm`).  CLAUDE.md §4:
-    diagnostics are part of the seam surface, not optional logging — the ported
-    tests read them.
+    """Published per-update diagnostics — the Java `InvariantUpdater` / `InvariantEKF`
+    introspection getters, and part of the seam surface (I10), not optional logging.
 
     Attributes
     ----------
@@ -260,21 +149,19 @@ class UpdateDiagnostics(NamedTuple):
         1.0 if the gain was applied, 0.0 if gated out.  A gated update leaves
         ``(X̂, P)`` bit-for-bit unchanged (masked ``K``, never a Python branch).
     nis : Array, scalar
-        Normalised innovation squared ``rᵀ S⁻¹ r``, computed on the **prior**
-        ``P`` and the **prior** residual (§6 trap).  NaN before any update.
+        ``rᵀ S⁻¹ r``, computed on the **prior** ``P`` and the **prior** residual — do
+        not compute it on the posterior.  NaN before any update.
     condition_proxy : Array, scalar
         ``(max L_ii / min L_ii)²`` from the Cholesky of ``S`` — the §4 gate proxy.
     correction_rotation_norm : Array, scalar
         ``‖(Kν)_rotation‖``; zero-release checks read this.
     logdet_S : Array, scalar
         ``log det S`` on the **prior** ``P``, from the same Cholesky factor that
-        produces ``nis`` — so the pair ``(nis, logdet_S)`` is a complete Gaussian
-        NLL, ``0.5 (nis + logdet_S)``, with no second numerical path.
-
-        Exposed for ContactNet's β-NLL training objective, which needs the
-        ``logdet`` term to constrain the *absolute* scale of ``S``; the quadratic
-        term alone (``nis``) fixes only ratios.  NaN before any update, like
-        ``nis``.
+        produces ``nis`` — so the pair ``(nis, logdet_S)`` is a complete Gaussian NLL,
+        ``0.5 (nis + logdet_S)``, with no second numerical path.  Exposed for
+        ContactNet's β-NLL objective, which needs the ``logdet`` term to constrain the
+        *absolute* scale of ``S``; the quadratic term alone fixes only ratios.  NaN
+        before any update, like ``nis``.
     """
     applied: Array
     nis: Array
@@ -286,8 +173,8 @@ class UpdateDiagnostics(NamedTuple):
 def no_update_diagnostics() -> UpdateDiagnostics:
     """Diagnostics before any update has run — ``nis`` is **NaN**.
 
-    Java initialises NIS to NaN so a never-updated value cannot read as
-    "in-band"; `testNormalizedInnovationSquaredIsNaNBeforeAnyUpdate` locks it.
+    Java initialises NIS to NaN so a never-updated value cannot read as "in-band";
+    `testNormalizedInnovationSquaredIsNaNBeforeAnyUpdate` locks it.
     """
     return UpdateDiagnostics(
         applied=jnp.array(0.0),
@@ -308,37 +195,23 @@ def linear_update(
 ) -> tuple[InEKFState, UpdateDiagnostics]:
     r"""Generic linear measurement update — Java ``InvariantUpdater.update``.
 
-    The one code path every update in the filter goes through (contact FK,
-    gravity leveling, and anything the orchestrator adds), so they cannot drift
-    apart::
+    The one code path every update in the filter goes through (contact FK, gravity
+    leveling, and anything the orchestrator adds), so they cannot drift apart::
 
         S  = H P Hᵀ + R                       (symmetrised)
         K  = P Hᵀ S⁻¹                         (Cholesky solve — never `inv`)
         X̂⁺ = exp(−(Kν)^∧) X̂                   (I5)
         P⁺ = (I − KH) P (I − KH)ᵀ + K R Kᵀ    (Joseph — mandatory)
 
-    Gating (§4): the conditioning proxy ``(max L_ii / min L_ii)²`` of ``S`` and
-    the caller's ``gate`` multiply into ``K``.  A gated update therefore leaves
-    ``(X̂, P)`` **bit-for-bit unchanged** rather than latching a bad correction —
-    which is what `testSingularInnovationIsSkippedNotLatched` requires — and it
-    does so without a data-dependent Python branch (I7).
+    ``H`` is ``(z, 3N+9)``, ``residual`` ``(z,)``, ``R`` ``(z, z)`` in the same frame as
+    the residual.  ``cond_max`` defaults to ``inekf.cond_max`` in the config; ``gate``
+    is an external mask (e.g. a quasi-static gate).
 
-    Parameters
-    ----------
-    state : InEKFState
-    H : Array, shape (z, 3N+9)
-    residual : Array, shape (z,)
-    R : Array, shape (z, z)
-        Measurement covariance, in the same frame as ``residual``.
-    cond_max : float, optional
-        Conditioning threshold; ``None`` takes ``inekf.cond_max`` from the config.
-    gate : Array or float
-        External mask (e.g. a quasi-static gate), multiplied into ``K``.
-
-    Returns
-    -------
-    state : InEKFState
-    diagnostics : UpdateDiagnostics
+    Gating: the conditioning proxy ``(max L_ii / min L_ii)²`` of ``S`` and the
+    caller's ``gate`` multiply into ``K``.  A gated update therefore leaves ``(X̂, P)``
+    **bit-for-bit unchanged** rather than latching a bad correction — which is what
+    `testSingularInnovationIsSkippedNotLatched` requires — and it does so without a
+    data-dependent Python branch (I7).
     """
     if cond_max is None:
         cond_max = section("inekf")["cond_max"]
@@ -377,34 +250,18 @@ def linear_update(
     )
 
 
-# ---------------------------------------------------------------------------
-# ContactUpdater seams (Java `ContactUpdater`, ported suite)
-#
-# The per-contact views of the machinery above.  `correct` is the vectorised
-# hot path over all N contacts; these are the single-contact entry points the
-# Java class exposes and the ported `ContactUpdaterTest` exercises directly
-# (CLAUDE.md I10 — the test seams ARE the public surface).
-# ---------------------------------------------------------------------------
+# ContactUpdater seams (Java `ContactUpdater`): the single-contact entry points the
+# Java class exposes and the ported `ContactUpdaterTest` exercises directly (I10 —
+# the test seams ARE the public surface).  `correct` is the vectorised hot path.
 
 def contact_jacobian(N: int, contact_index: int) -> Array:
-    r"""Single-contact observation Jacobian ``H_i``, shape ``(3, 3N+9)``.
+    r"""Single-contact observation Jacobian ``H_i = [ 0_{3x6} | +I_3 | … −I_3 (own d_i block) … ]``, ``(3, 3N+9)``.
 
-    ``H_i = [ 0_{3x6} | +I_3 | … −I_3 (own d_i block) … ]`` — Java
-    `ContactUpdater.computeJacobian`.  **State-independent by construction**:
-    the argument is the contact *index*, not the state, which is exactly the
-    property `testJacobianStructureAndStateIndependence` asserts (it calls the
-    Java form with two different random states and demands bit-equality).
-
-    Parameters
-    ----------
-    N : int
-        Number of contact candidates (static).
-    contact_index : int
-        Which contact; `IndexError` if out of range.
-
-    Returns
-    -------
-    Array, shape (3, 3N+9)
+    **State-independent by construction**: the argument is the contact *index*, not
+    the state, which is exactly the property
+    `testJacobianStructureAndStateIndependence` asserts (it calls the Java form with
+    two different random states and demands bit-equality).  `IndexError` if the index
+    is out of range.
     """
     _check_contact_index(contact_index, N)
     H = jnp.zeros((3, 3 * N + 9))
@@ -414,41 +271,24 @@ def contact_jacobian(N: int, contact_index: int) -> Array:
 
 
 def contact_residual(state: InEKFState, contact_index: int, y: Array) -> Array:
-    r"""Single-contact world residual ``r = R̂ y − (d̂_i − p̂)``, shape ``(3,)``.
-
-    Java `ContactUpdater.computeResidual`.  The per-contact slice of
-    `innovation`; ``y`` is the measured body-frame FK vector.
-    """
+    r"""Single-contact world residual ``r = R̂ y − (d̂_i − p̂)``, ``(3,)`` — the per-contact slice of `innovation`."""
     _check_contact_index(contact_index, state.N)
     return state.R @ y - (state.d[contact_index] - state.p)
 
 
 def rotate_measurement_covariance(state: InEKFState, body_cov: Array) -> Array:
-    r"""Rotate a body-frame measurement covariance to world: ``R̂ N R̂ᵀ``.
+    r"""Body-frame measurement covariance → world: ``R̂ N R̂ᵀ``.
 
-    Java `ContactUpdater.computeMeasurementCovariance`.  The residual lives in
-    the world frame (`contact_residual`), so the body-frame FK noise must be
-    conjugated by the estimated attitude before it enters ``S``.
+    The residual lives in the world frame (`contact_residual`), so the body-frame FK
+    noise must be conjugated by the estimated attitude before it enters ``S``.
     """
     return state.R @ body_cov @ state.R.T
 
 
 def map_encoder_noise(contact_jac: Array, joint_cov: Array) -> Array:
-    r"""Encoder noise through the kinematics: ``N = J Σ_q Jᵀ`` (§4.2).
+    r"""``(3, n)`` contact Jacobian at ``q̂`` and ``(n, n)`` joint covariance → ``(3,3)`` **body-frame** FK noise ``J Σ_q Jᵀ``.
 
-    Java `ContactUpdater.mapEncoderNoise` (static).  ``J`` is the contact-point
-    position Jacobian at ``q̂`` and ``Σ_q`` the filtered joint covariance from the
-    joint KF; the result is the **body-frame** FK covariance, which
-    `rotate_measurement_covariance` then takes to world.
-
-    Parameters
-    ----------
-    contact_jac : Array, shape (3, n_joints)
-    joint_cov : Array, shape (n_joints, n_joints)
-
-    Returns
-    -------
-    Array, shape (3, 3)
+    `rotate_measurement_covariance` then takes it to world.
     """
     return contact_jac @ joint_cov @ contact_jac.T
 
@@ -459,33 +299,16 @@ def contact_update(
     measurement: Array,
     body_covariance: Array,
     learned: bool = False,
-) -> tuple[InEKFState, Array]:
-    r"""One single-contact FK update — Java `InvariantUpdater.update(...)`.
+) -> tuple[InEKFState, Array, UpdateDiagnostics]:
+    r"""One single-contact FK update: residual → rotate noise to world → `linear_update`.
 
-    Composes the seams above: residual → rotate noise to world → `linear_update`.
-    Going through the shared update path is what makes the EKF-delegation tests
-    bit-exact — there is only one implementation of the gain/Joseph/gate logic.
+    ``measurement`` ``(3,)`` is the body-frame FK vector ``y_i``; ``body_covariance``
+    ``(3,3)`` its body-frame covariance (e.g. from `map_encoder_noise`).  Returns
+    ``(state, prior residual, diagnostics)``.  Going through the shared update path is
+    what makes the EKF-delegation tests bit-exact.
 
-    Parameters
-    ----------
-    state : InEKFState
-    contact_index : int
-        Which contact; `IndexError` if out of range.
-    measurement : Array, shape (3,)
-        Measured body-frame FK vector ``y_i = h_{p,i}(q̂)``.
-    body_covariance : Array, shape (3, 3)
-        Body-frame measurement covariance (e.g. from `map_encoder_noise`).
-    learned : bool
-        The learned-measurement branch.  Raises `NotImplementedError` while
-        ContactNet is unlanded — the Java contract raises
-        `NotImplementedException` and the ported test asserts it (§7).
-
-    Returns
-    -------
-    state : InEKFState
-    residual : Array, shape (3,)
-        The **prior** residual actually used.
-    diagnostics : UpdateDiagnostics
+    ``learned=True`` raises `NotImplementedError` while ContactNet is unlanded — the
+    Java contract raises `NotImplementedException` and the ported test asserts it.
     """
     if learned:
         raise NotImplementedError(
@@ -502,40 +325,19 @@ def contact_update(
     return updated, residual, diagnostics
 
 
-# ---------------------------------------------------------------------------
-# Full correction step
-# ---------------------------------------------------------------------------
-
 def correct(
     state: InEKFState,
     y: Array,
     Np: Array,
     params: InEKFParams,
 ) -> tuple[InEKFState, Array]:
-    r"""One full FK measurement update (§4): innovation → gain → Joseph → exp.
+    r"""One full FK measurement update: innovation → gain → Joseph → exp.
 
-    The observation matrix ``H`` is the precomputed constant (`InEKFParams.H`);
-    nothing here is rebuilt per step.  With ``N = 0`` candidates there is no
-    measurement, so this is a static early return (``N`` is not traced).
-
-    Parameters
-    ----------
-    state : InEKFState
-        Predicted (post-propagation) state.
-    y : Array, shape (N, 3)
-        Measured body-frame FK vectors ``h_{p,i}(q̂)`` (from ``robot/`` FK).
-    Np : Array, shape (N, 3, 3)
-        Per-contact position FK covariances ``J_{C_i} Σ_q J_{C_i}ᵀ`` (§4.2),
-        assembled upstream.
-    params : InEKFParams
-        Carries the constant ``H``.
-
-    Returns
-    -------
-    state : InEKFState
-        Corrected state ``(R⁺, v⁺, p⁺, d⁺, P⁺)``.
-    nu : Array, shape (3N,)
-        The innovation, emitted for the filter outputs (NIS / ContactNet feature).
+    ``y`` ``(N, 3)`` measured body-frame FK vectors, ``Np`` ``(N, 3, 3)`` the
+    per-contact position FK covariances assembled upstream.  Returns the corrected
+    state and the ``(3N,)`` innovation (emitted for NIS / ContactNet features).
+    ``H`` is the precomputed constant (`InEKFParams.H`); nothing here is rebuilt per
+    step.  With ``N = 0`` this is a static early return (``N`` is not traced).
     """
     if state.N == 0:                              # static: no contacts, no update
         return state, jnp.zeros(0)

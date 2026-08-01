@@ -1,0 +1,74 @@
+# config/collect_perfect.yaml -- the CONTROL dataset: flat ground, near-perfect friction.
+#
+# Every other config in this directory adds variation. This one removes all of it. The question it
+# exists to answer is not "can the network handle hard contact" but the prior one:
+#
+#     when contact is as close to ideal as MuJoCo will make it, does the pipeline work at all?
+#
+# If the filter still drifts here, the drift is STRUCTURAL -- release timing, unmodelled bias,
+# lever arm -- and no Sigma_C can reach it. If the filter is clean here and the network still fails
+# to beat a constant, the problem is the network/features, not the estimator. Runs 7 and 8 could
+# not separate those two, because every dataset so far varied friction, terrain, pushes AND
+# commands at once.
+#
+# What is turned off, and why each one:
+#
+#   friction     mu = 3.0 on every geom. Measured on the friction sweep
+#                (`experiments/friction_feasibility.py`): cone saturation falls monotonically with
+#                mu -- 30.15% at 0.15, 1.23% at 1.0, 0.62% at 1.40, the lowest tested. 3.0 is past
+#                the end of that sweep and should put slip near zero; `slip.record` is on
+#                precisely so "almost perfect" is MEASURED and not assumed.
+#                The policy's own DR range is [0.8, 1.4], so 3.0 is out of distribution -- on the
+#                EASY side. It walked at mu = 0.15, far further out the other way.
+#   push         off. A 400 N shove is exactly the transient the network cannot see coming.
+#   command      off, so vx is the collector default 0.4 m/s throughout. One gait, one speed --
+#                which makes Sigma_C's ideal value very nearly a CONSTANT, and that constant is
+#                already an arm of `experiments/process_socket_ablation.py` (arm I). A network
+#                that cannot match a constant on this data is not being held back by the data.
+#   terrain      flat only.
+#   slope_fric   off (it is a stone-terrain lever and there are no stone terrains here).
+#
+# Deliberately the same shape as `data/control4` (flat, 3 seeds, 60 s, vx = 0.4, --toe-heel) so
+# the two differ in friction and slip recording and little else. Not bit-comparable: enabling the
+# DR machinery at all consumes RNG that a no-DR run does not, so treat control4 as a companion
+# measurement rather than a paired control.
+#
+#     uv run python -m invariant_estimation.sim.collect --toe-heel --record-slip \
+#         --dr config/collect_perfect.yaml
+
+run:
+  terrains: [flat]
+  seeds: [0, 1, 2]
+  seconds: 60.0
+  settle_s: 2.0
+  chunk_ticks: 10000
+  out_dir: data/perfect
+
+dr:
+  seed: 20260801
+
+  friction:
+    enabled: true
+    # `range` is still read for the (discarded) i.i.d. draw -- see `DomainRandomization.
+    # friction_grid_by_terrain`. The grid is what actually lands on the model.
+    range: [3.0, 3.0]
+    # One entry, so `grid[seed % 1]` gives every seed the same mu. That is the point: this set has
+    # no friction variation to learn from, by construction.
+    grid_by_terrain:
+      flat: [3.0]
+
+  push:
+    enabled: false
+
+  command:
+    enabled: false
+
+  slope_friction:
+    enabled: false
+
+  slip:
+    # ON, even though the expectation is ~zero. A near-zero measured slip fraction is the
+    # VERIFICATION that this dataset is what it claims to be; without it "near-perfect friction"
+    # is an assumption sitting under every conclusion drawn from the run.
+    record: true
+    normal_force_min_n: 5.0

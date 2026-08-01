@@ -1,32 +1,20 @@
-"""
-inEKF/propagate.py
-==================
-Propagation (prediction) step of the world-centric, right-invariant contact-aided
-InEKF on ``SE_{N+2}(3)`` (CLAUDE.md §3).
+r"""Propagation (prediction) step of the InEKF on ``SE_{N+2}(3)``.
 
-The step is the textbook split: a **nonlinear mean** propagated on the group, and
-a **linear covariance** propagated in the tangent.  What makes the right-invariant
-+ world-centric corner special is that the covariance side is *state-independent*:
+The textbook split: a **nonlinear mean** propagated on the group, and a **linear
+covariance** propagated in the tangent.  What makes the right-invariant +
+world-centric corner special is that the covariance side is *state-independent*:
+the transition ``Φ`` is the precomputed constant of `state.build_Phi`, so ``expm``
+is never called in the loop.
 
-* the transition ``Φ`` is the precomputed constant of `state.build_Phi` (§3.2) —
-  ``expm`` is never called in the loop;
-* the process noise ``Q̄_d`` is the **exact closed-form** integral of the constant
-  nilpotent error dynamics (§3.3), not the ``Φ Q̄ Φᵀ dt`` approximation (which
-  over-counts the cross terms and corrupts NEES).
+Inputs: ``ω̃, ã`` are the **bias-corrected** IMU (the pelvis-IMU bias is removed
+upstream by the joint KF and is never in this state, I1); ``Σ_c`` are the
+per-contact noise densities in the **body/contact** frame, ``(N, 3, 3)`` — the
+``Ad_X̂`` conjugation in `build_Qd` is what rotates them to world, so do not
+pre-rotate them (see `contact.py`).
 
-Inputs
-------
-* ``ω̃, ã`` — the **bias-corrected** IMU (the pelvis-IMU bias is removed upstream
-  by the joint-KF / Mahony pre-filter; it is *never* in this state — invariant 2).
-* ``Σ_c`` — the per-contact noise **densities already in world frame** (i.e.
-  ``R̄ Σ_{C_i} R̄ᵀ``), shape ``(N, 3, 3)``.  The Cholesky digest, noise floor and
-  rotate-to-world that produce them live in `inekf/contact.py` (§5); propagation
-  only multiplies them by ``dt`` to form the ``Q̄_d`` contact blocks.
-
-Everything here is ``jax.jit``-able and differentiable (§8): the mean uses the
-``Γ`` closed forms from `group.py` (branch-free near ``θ→0``), and the per-contact
-``Q̄_d`` blocks are assembled by a single vectorised scatter rather than a Python
-loop over the contacts.
+Everything is jit-able and differentiable: the mean uses the ``Γ`` closed forms
+from `group.py` (branch-free near ``θ→0``), and the per-contact ``Q̄_d`` blocks are
+assembled by a single vectorised scatter rather than a Python loop.
 
 Mean (exact under constant IMU over ``dt``, §3.1)::
 
@@ -47,38 +35,18 @@ from .group import Adjoint, Gamma0, Gamma1, Gamma2
 from .state import InEKFState, InEKFParams
 
 
-# ---------------------------------------------------------------------------
-# Mean propagation (§3.1)
-# ---------------------------------------------------------------------------
-
 def propagate_mean(
     state: InEKFState,
     omega: Array,
     accel: Array,
     params: InEKFParams,
 ) -> InEKFState:
-    r"""Propagate the group mean ``(R̄, v̄, p̄, d̄)`` one step (§3.1).
+    r"""Propagate the group mean ``(R̄, v̄, p̄, d̄)`` one step on bias-corrected ``ω̃`` [rad/s], ``ã`` [m/s²].
 
-    Exact integration under the constant-IMU-over-``dt`` assumption: ``Γ_1`` and
-    ``Γ_2`` are the once/twice integrals of the rotating accelerometer signal, so
-    this is *not* an Euler step.  Contact means are unchanged (their dynamics is
-    all noise, §3.3).  The covariance ``P`` is carried through untouched.
-
-    Parameters
-    ----------
-    state : InEKFState
-        Prior state.
-    omega : Array, shape (3,)
-        Bias-corrected gyro measurement ``ω̃`` [rad/s].
-    accel : Array, shape (3,)
-        Bias-corrected accelerometer measurement ``ã`` [m/s²].
-    params : InEKFParams
-        Carries ``g`` and ``dt``.
-
-    Returns
-    -------
-    InEKFState
-        State with updated ``(R, v, p)``; ``d`` and ``P`` unchanged.
+    Exact under the constant-IMU-over-``dt`` assumption — ``Γ_1`` and ``Γ_2`` are the
+    once/twice integrals of the rotating accelerometer signal, so this is *not* an
+    Euler step.  Contact means are unchanged (their dynamics is all noise, §3.3) and
+    ``P`` is carried through untouched.
     """
     dt = params.dt
     g = params.g
@@ -97,28 +65,17 @@ def propagate_mean(
     return state._replace(R=R_next, v=v_next, p=p_next)
 
 
-# ---------------------------------------------------------------------------
-# Process noise Q̄_d — exact closed form (§3.3)
-# ---------------------------------------------------------------------------
-
 def continuous_Qc(sigma_c: Array, params: InEKFParams) -> Array:
-    r"""Continuous **body-frame** error density ``Q_c``, shape ``(3N+9, 3N+9)``.
+    r"""``(N,3,3)`` body-frame ``Σ_{C_i}`` → continuous body-frame error density ``Q_c``, ``(3N+9, 3N+9)``.
 
     Block-diagonal in the tangent ordering ``[R, v, p, d_1 … d_N]``::
 
         Q_c = blkdiag( gyro_var·I₃ , accel_var·I₃ , 0₃ , Σ_{C_1} … Σ_{C_N} )
 
     The position block is zero: position picks up noise only through the
-    ``A``-coupling from velocity, which the ``Φ`` conjugation in `build_Qd`
-    supplies.  Contact covariances enter in the **body / contact frame** — the
-    ``Ad_X̂`` conjugation rotates them to world (see `build_Qd`).
-
-    Parameters
-    ----------
-    sigma_c : Array, shape (N, 3, 3)
-        Per-contact body-frame covariances ``Σ_{C_i}`` (§5 digest).
-    params : InEKFParams
-        Carries the IMU variance densities.
+    ``A``-coupling from velocity, which the ``Φ`` conjugation in `build_Qd` supplies.
+    Contact covariances enter in the **body / contact** frame — the ``Ad_X̂``
+    conjugation rotates them to world (see `build_Qd`).
     """
     N = sigma_c.shape[0]
     I3 = jnp.eye(3)
@@ -131,11 +88,7 @@ def continuous_Qc(sigma_c: Array, params: InEKFParams) -> Array:
 
 
 def _block_diag_from_stack(blocks: Array) -> Array:
-    """Block-diagonal ``(3N, 3N)`` matrix from a ``(N, 3, 3)`` stack.
-
-    Vectorised (no Python loop over contacts): block ``(i, i)`` is ``blocks[i]``
-    and every off-diagonal block is zero.  Handles ``N = 0`` (returns ``(0, 0)``).
-    """
+    """``(N,3,3)`` stack → block-diagonal ``(3N, 3N)``, vectorised; handles ``N = 0``."""
     N = blocks.shape[0]
     # selector[i, j] = δ_ij · blocks[i]  → (N, N, 3, 3); regroup to (3N, 3N).
     selector = jnp.einsum("ij,ikl->ijkl", jnp.eye(N), blocks)
@@ -143,14 +96,17 @@ def _block_diag_from_stack(blocks: Array) -> Array:
 
 
 def build_Qd(sigma_c: Array, Ad: Array, params: InEKFParams) -> Array:
-    r"""Discrete process noise ``Q_d = Φ Ad_X̂ Q_c Ad_X̂ᵀ Φᵀ Δt`` (paper Eq. 38).
+    r"""Discrete process noise ``Q_d = Φ Ad_X̂ Q_c Ad_X̂ᵀ Φᵀ Δt`` (paper Eq. 38), ``(3N+9, 3N+9)``, symmetric PSD.
 
-    This is CLAUDE.md **I3** verbatim: the ``Ad_X̂`` conjugation stays.  IMU noise
-    is measured in the *body* frame, so the right-invariant error picks it up as
-    ``Ad_X̂ w``; dropping the adjoint to match Hartley's convention is the named
-    trap of §6.  Note this is *not* trivial even for isotropic ``Q_g, Q_a``:
-    ``Ad_X̂`` carries ``(v)_× R̂`` and ``(p)_× R̂`` in its first block-column, so the
-    conjugation generates genuine cross terms.
+    ``sigma_c`` is ``(N,3,3)`` **body-frame** ``Σ_{C_i}``; ``Ad`` is ``Ad_X̂`` at the
+    current estimate (`group.Adjoint`).
+
+    This is **I3** verbatim: the ``Ad_X̂`` conjugation stays.  IMU noise is measured
+    in the *body* frame, so the right-invariant error picks it up as ``Ad_X̂ w``;
+    dropping the adjoint to match Hartley's convention is a named trap.  It is not
+    trivial even for isotropic ``Q_g, Q_a``: ``Ad_X̂`` carries ``(v)_× R̂`` and
+    ``(p)_× R̂`` in its first block-column, so the conjugation generates genuine
+    cross terms.
 
     ``Q_d`` is therefore **state-dependent but error-independent** — it depends on
     the estimate ``X̂`` through ``Ad_X̂``, never on the error ``ξ``, which is exactly
@@ -162,20 +118,6 @@ def build_Qd(sigma_c: Array, Ad: Array, params: InEKFParams) -> Array:
     NEES/NIS at G10 shows the cross terms are overstated — ``A`` is nilpotent, so
     the integrand is a degree-≤4 polynomial in ``s`` and the integral is
     closed-form.  Deliberately not done for v1: the Java reference does not.
-
-    Parameters
-    ----------
-    sigma_c : Array, shape (N, 3, 3)
-        Per-contact **body-frame** covariances ``Σ_{C_i}``.
-    Ad : Array, shape (3N+9, 3N+9)
-        Adjoint ``Ad_X̂`` of the current estimate (`group.Adjoint`).
-    params : InEKFParams
-        Carries ``Φ``, ``dt`` and the IMU variance densities.
-
-    Returns
-    -------
-    Array, shape (3N+9, 3N+9)
-        Symmetric PSD discrete process noise.
     """
     Qc = continuous_Qc(sigma_c, params)
     M = params.Phi @ Ad
@@ -183,38 +125,16 @@ def build_Qd(sigma_c: Array, Ad: Array, params: InEKFParams) -> Array:
     return 0.5 * (Qd + Qd.T)
 
 
-# ---------------------------------------------------------------------------
-# Covariance propagation (§3.2)
-# ---------------------------------------------------------------------------
-
 def propagate_cov(P: Array, sigma_c: Array, Ad: Array, params: InEKFParams) -> Array:
-    r"""Right-invariant covariance step ``P⁺ = Φ P Φᵀ + Q_d``.
+    r"""Right-invariant covariance step ``P⁺ = Φ P Φᵀ + Q_d``, symmetrised.
 
-    ``Φ`` is the precomputed constant transition (`InEKFParams.Phi`); ``Q_d`` is
-    Eq. 38 (`build_Qd`).  The result is symmetrised for numerical hygiene.
-
-    Parameters
-    ----------
-    P : Array, shape (3N+9, 3N+9)
-        Prior covariance.
-    sigma_c : Array, shape (N, 3, 3)
-        Per-contact body-frame covariances (see `build_Qd`).
-    Ad : Array, shape (3N+9, 3N+9)
-        Adjoint of the **prior** estimate.
-    params : InEKFParams
-
-    Returns
-    -------
-    Array, shape (3N+9, 3N+9)
+    ``Φ`` is the precomputed constant (`InEKFParams.Phi`); ``Q_d`` is Eq. 38
+    (`build_Qd`).  ``Ad`` is the adjoint of the **prior** estimate.
     """
     Phi = params.Phi
     Pn = Phi @ P @ Phi.T + build_Qd(sigma_c, Ad, params)
     return 0.5 * (Pn + Pn.T)
 
-
-# ---------------------------------------------------------------------------
-# Full propagation step
-# ---------------------------------------------------------------------------
 
 def propagate(
     state: InEKFState,
@@ -225,20 +145,8 @@ def propagate(
 ) -> InEKFState:
     r"""One full InEKF prediction step: mean (§3.1) then covariance (§3.2-3.3).
 
-    Parameters
-    ----------
-    state : InEKFState
-        Prior state.
-    omega, accel : Array, shape (3,)
-        Bias-corrected IMU ``(ω̃, ã)``.
-    sigma_c : Array, shape (N, 3, 3)
-        Per-contact **body-frame** covariances ``Σ_{C_i}`` (§5 digest).
-    params : InEKFParams
-
-    Returns
-    -------
-    InEKFState
-        Predicted state ``(R̄⁺, v̄⁺, p̄⁺, d̄, P⁺)``.
+    ``omega, accel`` ``(3,)`` are the bias-corrected IMU; ``sigma_c`` ``(N,3,3)`` the
+    per-contact **body-frame** ``Σ_{C_i}`` from `contact.digest`.
     """
     mean = propagate_mean(state, omega, accel, params)
     # Ad of the PRIOR estimate: Q_d is evaluated at the state entering the step,

@@ -13,8 +13,10 @@ fused `lax.scan` without breaking I7.
 
 **The property that matters is agreement with the training path.**  If the
 window a deployed network sees differs from the window it was trained on, the
-input distribution has silently shifted and the measured gain (run 2: 3.3x in
-velocity, 8.5x in height) evaporates with nothing raising.
+input distribution has silently shifted and the measured gain evaporates with
+nothing raising.  (Run 2's 3.3x in velocity / 8.5x in height were **in-sample**;
+out of sample the same net beats the analytic heuristic by velocity 25%,
+position 50%, height 62% — PORT_NOTES, "Run 2 transfers out of sample".)
 `tests/contactnet/test_online.py` asserts that agreement against
 `features.window` over a real rollout.
 
@@ -23,14 +25,12 @@ Two deliberate differences from training, both bounded and both tested:
 * **Not bit-identical, by construction.**  `features.boxcar` cumsums over the
   whole rollout; here it cumsums over a 400-tick buffer.  A difference of two
   large partial sums is not the same floating-point number as a difference of
-  two small ones — `dataset.prepare`'s docstring makes the same point about
-  slicing.  Agreement is ~1e-13 relative, not exact.
+  two small ones.  Agreement is ~1e-13 relative, not exact.
 * **A warm-up, instead of `window_indices`' clamp.**  Training segments are
   chosen past the lead-in so their windows never clamp (`make_segment` raises if
   they would), which means the clamped branch is a code path the network was
   never trained on.  Rather than reproduce it, `OnlineFeatures` reports
-  ``ready`` only once the buffer holds `span_ticks` real samples, and the caller
-  falls back to the analytic ``sigma_0**2 I`` until then.
+  ``ready`` only once the buffer holds `span_ticks` real samples.
 """
 
 from __future__ import annotations
@@ -49,18 +49,13 @@ from .network import ContactNetParams, forward
 class OnlineState(NamedTuple):
     r"""Ring buffer of normalized per-tick channels, plus what the FK diff needs.
 
-    Attributes
-    ----------
-    buf : Array, shape (span, N_c, F)
-        Normalized channels, oldest first.  ``span = (H-1)*stride + stride`` —
-        enough that the boxcar feeding the *oldest* gathered sample has its full
-        `stride` ticks of support.
-    prev_p : Array, shape (N_c, 3)
-        Previous tick's body-frame contact FK, for the causal first difference
-        that produces the ``B v`` channels.  Held separately because the buffer
-        stores the *normalized* value and the difference is taken on the raw one.
-    n : Array, scalar int
-        Ticks pushed so far, saturating.  Drives `ready`.
+    ``buf`` is ``(span, N_c, F)`` normalized channels, oldest first, with
+    ``span = (H-1)*stride + stride`` — enough that the boxcar feeding the
+    *oldest* gathered sample has its full `stride` ticks of support.  ``prev_p``
+    is ``(N_c, 3)``, the previous tick's body-frame contact FK for the causal
+    first difference producing the ``ᴮv`` channels; held separately because the
+    buffer stores the *normalized* value and the difference is taken on the raw
+    one.  ``n`` is the saturating count of ticks pushed, which drives `ready`.
     """
     buf: Array
     prev_p: Array
@@ -83,21 +78,15 @@ def init_state(cfg: ContactNetConfig, n_c: int) -> OnlineState:
 
 def make_online_features(subchain, base_imu: int, kinematics, cfg: ContactNetConfig,
                          constants: norm_mod.NormConstants):
-    r"""Factory → ``step(state, sensors) -> (state, window, ready)``.
+    r"""Factory → ``step(OnlineState, FusedSensors) -> (OnlineState, (N_c, H, F), ready)``.
 
-    A factory for the same reason `features.make_contact_channels` is: the graph
-    topology, the normalization constants and the window geometry are all static
-    and get closed over, so the returned callable takes only the carry and one
-    tick of `pipeline.main_estimator.FusedSensors`.
+    The graph topology, the normalization constants and the window geometry are
+    static and get closed over, so the returned callable takes only the carry and
+    one tick of sensors.
 
     Channel order is `features.make_contact_channels`' verbatim —
     ``(omega, accel, q_sub, tau_sub, p, v)`` — and must stay that way: it is the
     same ordering `normalize` and the trained weights were fitted under.
-
-    Returns
-    -------
-    callable
-        ``(OnlineState, FusedSensors) -> (OnlineState, (N_c, H, F), bool)``
     """
     subchain = jnp.asarray(subchain)
     n_c, _ = subchain.shape
@@ -160,22 +149,15 @@ def make_provider(subchain, base_imu: int, kinematics, cfg: ContactNetConfig,
     noise**, which is what reaches the contact blocks of ``Q_d``.
 
     Before the buffer is full this falls back to ``sensors.contact_chol``, the
-    Schmitt-switched heuristic the caller already holds.
+    Schmitt-switched heuristic the caller already holds, which keeps the warm-up
+    byte-for-byte on the shipped analytic filter until the first ready tick.
 
-    **The fallback inverted when the socket moved (2026-07-29) and the old value
-    is now dangerous.**  Until then this emitted zeros, because zeros in the
-    *measurement* socket reproduce the shipped filter exactly.  Zeros in the
-    *process* socket mean ``Σ_C = 0``: every anchor, including a foot in flight,
-    asserted perfectly world-static.  That is the run-1 failure mode
-    (`ContactNetConfig.freeze_contact_chol`, measured 10.2x worse in body-frame
-    velocity than not using contacts at all) applied to every contact for the
-    first ~400 ticks.
-
-    Deferring to the heuristic keeps the warm-up on the **shipped filter's**
-    behaviour, which is the same argument the old zero fallback made, evaluated
-    on the new socket.  It is no longer bit-identical to an unattached filter
-    only in the sense that it *is* one: during warm-up the filter is byte-for-byte
-    the analytic filter, and it stops being one on the first ready tick.
+    **The fallback inverted when the socket moved (2026-07-29).**  Until then this
+    emitted zeros, because zeros in the *measurement* socket reproduce the shipped
+    filter exactly.  Zeros in the *process* socket mean ``Σ_C = 0``: every anchor,
+    including a foot in flight, asserted perfectly world-static — the run-1
+    failure mode (see `ContactNetConfig.freeze_contact_chol`) applied to every
+    contact for the first ~400 ticks.
 
     The fallback is a `jnp.where`, not a branch, so the graph stays constant (I7).
     """

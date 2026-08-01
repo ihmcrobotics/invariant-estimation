@@ -37,16 +37,11 @@ __all__ = ["add_imu_sensors", "SimSensorReader", "ContactTrust", "EarlyRelease",
            "IMUNoise"]
 
 
-# ---------------------------------------------------------------------------
-# MJCF: put real IMUs on the estimator's sites
-# ---------------------------------------------------------------------------
-
 def add_imu_sensors(root: ET.Element, imu_sites: Sequence[str]) -> ET.Element:
     """Append a `<sensor>` block with a gyro + accelerometer on each IMU site.
 
-    Sensors are massless and stateless: adding them cannot change the dynamics,
-    so a model with and without them integrates identically (asserted by
-    `test_sensors_do_not_change_the_dynamics`).
+    Sensors are massless and stateless, so a model with and without them integrates identically
+    (`test_sensors_do_not_change_the_dynamics`).
     """
     sensor = root.find("sensor")
     if sensor is None:
@@ -57,10 +52,6 @@ def add_imu_sensors(root: ET.Element, imu_sites: Sequence[str]) -> ET.Element:
     return root
 
 
-# ---------------------------------------------------------------------------
-# Sensor corruption (optional)
-# ---------------------------------------------------------------------------
-
 @dataclass
 class IMUNoise:
     """Additive sensor corruption, so the filter has something to actually do.
@@ -70,17 +61,14 @@ class IMUNoise:
     measured per-joint values (~2e-4 rad), and a CONSTANT per-IMU gyro bias — the
     quantity the joint KF exists to estimate and hand to the InEKF (I1).
 
-    `torque_std` is the exception: it is **not** grounded in hardware. Plain AWGN
-    at 0.5 N·m, chosen so the ContactNet torque channel is not the one clean
-    signal in an otherwise-corrupted bundle. For scale, that is ~1% of Alex's
-    standing knee torque (measured: −50.9 N·m), against 0.02–0.5% relative noise
-    on the other channels — the same order, slightly noisier, which is the right
-    direction if Alex's torque is current-derived rather than directly sensed.
+    `torque_std` is the exception: **not** grounded in hardware. Plain AWGN at 0.5 N·m,
+    chosen so the ContactNet torque channel is not the one clean signal in an
+    otherwise-corrupted bundle. For scale that is ~1% of Alex's standing knee torque
+    (measured: −50.9 N·m), against 0.02–0.5% relative noise on the other channels.
 
-    Revisit before trusting any absolute ContactNet calibration result: the real
-    question is whether the logged `tau` is measured (a sensor, so this model is
-    the right shape) or commanded (a controller output, which carries no sensor
-    noise at all and would want a different treatment entirely).
+    Revisit before trusting any absolute ContactNet calibration result: is the logged
+    `tau` measured (a sensor, so this model is the right shape) or commanded (a
+    controller output, which carries no sensor noise at all)?
     """
 
     gyro_std: float = 1.0e-3          # [rad/s]
@@ -97,7 +85,7 @@ class IMUNoise:
         self._rng = np.random.default_rng(self.seed)
 
     def bias(self, n_imus: int) -> np.ndarray:
-        """The per-IMU constant gyro bias, `(m, 3)`. Drawn once, then frozen."""
+        """Per-IMU constant gyro bias, `(m, 3)`. Drawn once, then frozen."""
         if self._bias is None:
             self._bias = self.gyro_bias_std * self._rng.standard_normal((n_imus, 3))
         return self._bias
@@ -120,20 +108,14 @@ class IMUNoise:
         return tau + self.torque_std * self._rng.standard_normal(tau.shape)
 
 
-# ---------------------------------------------------------------------------
-# Contact trust
-# ---------------------------------------------------------------------------
-
 @dataclass
 class ContactTrust:
     """Schmitt trigger + on-ground dwell per foot (the Java thresholds).
 
-    `enter`/`stay` are `contact_trust.schmitt_enter` / `schmitt_stay` from the
-    config and act on a normalised load `p = f_n / (0.5·m·g)`; `dwell` is the
-    sustained-high time required before a foot is trusted. Release is immediate:
-    a foot that unloads must stop anchoring the same tick, whereas a foot that
-    lands must prove it (the asymmetry is the point of the debounce — a bouncing
-    touchdown that anchors early poisons the bias gauge).
+    `enter`/`stay` are `contact_trust.schmitt_enter` / `schmitt_stay` from the config and act
+    on a normalised load `p = f_n / (0.5·m·g)`; `dwell` is the sustained-high time required
+    before a foot is trusted. Release is immediate, entry must be earned — a bouncing
+    touchdown that anchors early poisons the bias gauge.
     """
 
     n_feet: int
@@ -170,77 +152,61 @@ class ContactTrust:
 class EarlyRelease:
     r"""Causal anchor early-release: loosen ``Sigma_C`` while the foot is still loaded.
 
-    **Why this exists.** `docs/theory/anchor_release_timing.md` derives the vertical
-    sink: at end of stance the foot begins to unload and roll while `ContactTrust`
-    still says "planted", so the contact residual ``nu_z`` turns positive while the
-    apportionment fraction ``f = (P_pp - P_pd)/(Sigma_rel + N)`` is still at its tight
-    stance value (~0.54) and the velocity gain is 2584x its swing value. Every liftoff
-    on every foot therefore delivers one rectified downward dose. **A threshold on load
-    LEVEL, however low, is structurally late** -- it can only fire once the load has
-    already gone. The anticipatory signal has to be the load's ratio to its own stance
-    peak, which starts falling well before any small absolute value is reached.
+    **Why.** `docs/theory/anchor_release_timing.md` derives the vertical sink: at end of
+    stance the foot unloads and rolls while `ContactTrust` still says "planted", so ``nu_z``
+    turns positive while the apportionment fraction
+    ``f = (P_pp - P_pd)/(Sigma_rel + N)`` is still at its tight stance value (~0.54) and the
+    velocity gain is 2584x its swing value -- one rectified downward dose per liftoff per
+    foot. **A threshold on load LEVEL, however low, is structurally late**; the anticipatory
+    signal has to be the load's ratio to its own stance peak.
 
-    This is the live counterpart of `experiments.process_socket_ablation
-    .causal_early_release` (arm E'), whose non-causal ceiling is arm B
-    (``loosen_early``, which reads liftoff from the future and is not deployable).
-    Measured offline on `data/dr5` at N=4: baseline slope ``e_pz`` -0.01486 m/s, arm B
-    at 100 ticks of lead -0.00344 (4.3x), arm E' at ``frac = 0.5`` -0.01101 (1.35x).
+    The live counterpart of `experiments.process_socket_ablation.causal_early_release`
+    (arm E'), whose non-causal ceiling is arm B (``loosen_early``, which reads liftoff from
+    the future and is not deployable). Measured offline on `data/dr5` at N=4: baseline slope
+    ``e_pz`` -0.01486 m/s, arm B at 100 ticks of lead -0.00344 (4.3x), arm E' at
+    ``frac = 0.5`` -0.01101 (1.35x).
 
     Three design choices, each of which cost a failed arm to learn:
 
     * **The impact spike is blanked** (`blank_ticks`). Touchdown peak normal force is
-      2.0-10.8x the stance median and lands 1-16% into the stance, so a running peak
-      taken from tick 0 locks onto the impact, ``frac * peak`` sits above where the foot
-      spends the rest of its stance, and the latch fires almost immediately -- 70-86% of
-      stance released. That is not early release, it is a constant-loose anchor, and it
-      scored monotonically WORSE than baseline. Still causal: the blanking window looks
-      backwards from the current tick, never forwards.
-    * **It only ever loosens.** The caller takes the max with the heuristic, so this can
-      move liftoff earlier but never move touchdown earlier -- tightening an anchor
-      before the foot is down is a second change in the opposite direction.
-    * **Latched within a stance.** Ground reaction force is double-humped; a mid-stance
-      dip below ``frac * peak`` would otherwise release and re-tighten, chattering. Once
-      a point is judged to be on its way out it stays out until the next touchdown --
-      the same fire-once logic `inEKF/reseed.py`'s latch uses, for the same reason.
+      2.0-10.8x the stance median and lands 1-16% into the stance, so a running peak from
+      tick 0 locks onto the impact, ``frac * peak`` sits above where the foot spends the rest
+      of its stance, and the latch fires almost immediately -- 70-86% of stance released.
+      That is a constant-loose anchor, not early release, and it scored monotonically WORSE
+      than baseline. Still causal: the window looks backwards, never forwards.
+    * **It only ever loosens.** The caller takes the max with the heuristic, so this moves
+      liftoff earlier and can never move touchdown earlier.
+    * **Latched within a stance.** Ground reaction force is double-humped; a mid-stance dip
+      below ``frac * peak`` would otherwise release and re-tighten, chattering. Same
+      fire-once logic as `inEKF/reseed.py`'s latch, for the same reason.
 
-    ``peak_mode`` picks which stance sets the reference:
+    ``peak_mode`` picks the reference stance. ``"current"`` is the running post-blank peak of
+    the stance in progress: reproduces arm E' exactly, needs the blanking window and cannot
+    act during it. ``"prev"`` is the previous completed stance's peak for this point, so the
+    reference is available from tick 0 and does not depend on this stance's impact at all
+    (falling back to ``"current"`` until one stance has completed). ``"prev"`` is the
+    lead-VARIANCE lever -- arm E' at ``frac = 0.7`` had the better median lead and the worse
+    score.
 
-    ``"current"``
-        the running post-blank peak of the stance in progress. Reproduces arm E'
-        exactly. Needs the blanking window, and cannot act during it.
-    ``"prev"``
-        the previous completed stance's peak for this point, so the reference is
-        available from tick 0 and does not depend on this stance's impact at all.
-        Falls back to ``"current"`` until a first stance has completed. The lead is
-        then set by a quantity that does not itself vary with the impact transient,
-        which is the lead-VARIANCE lever (arm E' at ``frac = 0.7`` had the better
-        median lead and the worse score).
-
-    ``rate_frac`` optionally ORs in a falling-rate test: release when the load is
-    dropping faster than ``rate_frac * peak`` per second. Zero disables it, which is
-    the default and the configuration every recorded number was produced under.
+    ``rate_frac`` ORs in a falling-rate test: release when the load drops faster than
+    ``rate_frac * peak`` per second. Zero disables it, which is the default and the
+    configuration every recorded number was produced under.
 
     ``clock_lead`` ORs in a **stance clock**: release once this stance has run to
-    ``prev_len - lead_ticks``, where ``prev_len`` is the previous stance's length for
-    this point. This is the only member of the family that can reproduce arm B's
-    *fixed* lead, and the reason it is here is a measurement:
+    ``prev_len - lead_ticks``. It is the only member of the family that can reproduce arm B's
+    *fixed* lead, and it is here because of a measurement:
 
-        Arm B (non-causal oracle, 100 ticks) gives every liftoff a lead of ~100 ticks,
-        std 23, and misses **0.7%** of them. Every load-threshold predictor measured on
-        `data/dr5` -- level on the running peak, level on the previous stance's peak,
-        rate, at fractions 0.35 to 0.85 -- misses **31-50%** of liftoffs, and so does a
-        *perfect* contact-point-speed sensor at the same loose fraction (22% missed at a
-        0.02 m/s threshold). The lead arm B uses is not present in the load or in the
-        contact's motion at that instant; it is in the GAIT PLAN. A walking controller
-        has that and a load sensor does not.
+        Arm B (non-causal oracle, 100 ticks) gives every liftoff a lead of ~100 ticks, std
+        23, and misses **0.7%** of them. Every load-threshold predictor measured on
+        `data/dr5` -- level on the running peak, level on the previous stance's peak, rate,
+        at fractions 0.35 to 0.85 -- misses **31-50%** of liftoffs, and so does a *perfect*
+        contact-point-speed sensor at the same loose fraction (22% missed at 0.02 m/s). The
+        lead arm B uses is not in the load or in the contact's motion at that instant; it is
+        in the GAIT PLAN, which a walking controller has and a load sensor does not.
 
-    ``clock_lead`` is therefore the causal predictor with the right *shape*, at the price
-    of assuming stride-to-stride regularity: it degrades exactly where the gait does, and
-    on a dataset containing standing (where a "stance" lasts thousands of ticks) it
-    releases far too early. Set ``frac = 0`` to use the clock alone.
-
-    All state is plain NumPy and lives outside the jitted step (I7 constrains the
-    filter, not the sensor harness).
+    So ``clock_lead`` is the causal predictor with the right *shape*, at the price of
+    assuming stride-to-stride regularity: on a dataset containing standing (where a "stance"
+    lasts thousands of ticks) it releases far too early. Set ``frac = 0`` for the clock alone.
 
     All state is plain NumPy and lives outside the jitted step (I7 constrains the
     filter, not the sensor harness).
@@ -259,14 +225,14 @@ class EarlyRelease:
     **Measured, closed loop at vx = 0.6:** with ``off_dwell = 0`` a 30 s walk reports **306
     "liftoffs"** on two feet -- about 10/s against a real cadence near 2 steps/s. The per-foot
     normal load momentarily reads zero mid-stance (MuJoCo re-solves the contact set every step and
-    a foot can have no qualifying contact for a tick or two), so a single stance fragments into
-    several episodes. Every fragment resets the peak reference AND clears the latch, which is
-    exactly the state this mechanism needs to keep.
+    a foot can have no qualifying contact for a tick or two), so a stance fragments into several
+    episodes and every fragment resets the peak reference AND clears the latch -- exactly the
+    state this mechanism needs to keep. A short off-dwell coalesces them.
 
-    A short off-dwell coalesces the fragments. It is asymmetric on purpose and in the same
-    direction as `ContactTrust`: entering a stance is immediate, leaving it must be sustained --
-    here because a spurious *end* is the expensive error, whereas `ContactTrust` debounces the
-    entry because a bouncing touchdown that anchors early poisons the bias gauge.
+    Asymmetric on purpose, in the same direction as `ContactTrust`: entering a stance is
+    immediate, leaving it must be sustained -- here because a spurious *end* is the expensive
+    error, whereas `ContactTrust` debounces the entry because a bouncing touchdown that anchors
+    early poisons the bias gauge.
 
     ``0`` is the default and reproduces every number recorded before this field existed.
     """
@@ -365,27 +331,18 @@ class EarlyRelease:
 
 
 def _contact_site_names(fused) -> tuple[str, ...]:
-    """The estimator's InEKF contact-site names, in slot order.
-
-    Read off `fused.model.site_names` via `contact_site_ords` rather than
-    hardcoded, so the sim's toe/heel split is driven by whatever the filter was
-    actually built with.
-    """
+    """The estimator's InEKF contact-site names in slot order, read off the filter's own build so
+    the sim's toe/heel split cannot disagree with it."""
     names = tuple(fused.model.site_names)
     return tuple(names[int(o)] for o in fused.contact_site_ords)
 
 
-# ---------------------------------------------------------------------------
-# The reader
-# ---------------------------------------------------------------------------
-
 class SimSensorReader:
     """Index maps from a sim `MjModel` to one `FusedSensors` per call.
 
-    Every lookup is by NAME and resolved once here, never by assuming the sim
-    model and the estimator model share index order — they are built from the
-    same MJCF but the sim adds a floor, collision geoms, actuators and visual
-    meshes, and an index coincidence that holds today is not a contract.
+    Every lookup is by NAME and resolved once here, never by assuming the sim model and the
+    estimator model share index order — the sim adds a floor, collision geoms, actuators and
+    visual meshes, and an index coincidence that holds today is not a contract.
     """
 
     def __init__(
@@ -412,9 +369,8 @@ class SimSensorReader:
         self.noise = noise
         self.stance_chol = stance_chol
         self.swing_chol = swing_chol
-        # `early_release = 0.0` is OFF, and OFF is the default deliberately: every number
-        # on record was produced without it, so leaving it off keeps a run comparable
-        # with them. See `EarlyRelease` for what it does and why.
+        # `early_release = 0.0` is OFF and OFF is the default deliberately: every number on record
+        # was produced without it. See `EarlyRelease`.
         self.early_release_frac = float(early_release)
         self.early_release_blank = int(early_release_blank)
         self.early_release_mode = str(early_release_mode)
@@ -438,22 +394,22 @@ class SimSensorReader:
                 raise KeyError(f"no {obj} named {name!r} in the sim model")
             return i
 
-        # -- IMU sensor addresses (site frame, see module docstring) ---------
+        # IMU sensor addresses (site frame, see module docstring).
         self.gyro_adr = np.array(
             [m.sensor_adr[sid(f"gyro_{s}", mujoco.mjtObj.mjOBJ_SENSOR)] for s in self.imu_names])
         self.acc_adr = np.array(
             [m.sensor_adr[sid(f"acc_{s}", mujoco.mjtObj.mjOBJ_SENSOR)] for s in self.imu_names])
 
-        # -- encoders: the 9 filtered joints, in filter state order ----------
+        # Encoders: the 9 filtered joints, in filter state order.
         self.enc_qadr = np.array(
             [m.jnt_qposadr[sid(n, mujoco.mjtObj.mjOBJ_JOINT)] for n in build.joint_names])
-        # DOF addresses for the same joints. qposadr != dofadr in general, and
-        # torque is a generalised force, so it indexes by DOF, not by qpos.
+        # DOF addresses for the same joints: qposadr != dofadr in general, and torque is a
+        # generalised force, so it indexes by DOF.
         self.enc_dofadr = np.array(
             [m.jnt_dofadr[sid(n, mujoco.mjtObj.mjOBJ_JOINT)] for n in build.joint_names],
             dtype=int)
 
-        # -- the unfiltered anchor-chain joints (Alex's 4 ankles) ------------
+        # The unfiltered anchor-chain joints (Alex's 4 ankles).
         self.unfiltered_names = _dof_joint_names(
             fused.model.mj_model, np.asarray(build.dof_anchor_unfiltered, dtype=int))
         self.unf_dofadr = np.array(
@@ -463,17 +419,14 @@ class SimSensorReader:
             [m.jnt_qposadr[sid(n, mujoco.mjtObj.mjOBJ_JOINT)] for n in self.unfiltered_names],
             dtype=int)
 
-        # -- contact --------------------------------------------------------
         self.foot_gids = np.array(
             [sid(g, mujoco.mjtObj.mjOBJ_GEOM) for g in foot_geoms], dtype=int)
         self.weight = float(m.body_mass.sum()) * 9.81
         self.trust = ContactTrust(n_feet=len(self.foot_gids), dt=dt)
 
-        # -- multi-point contacts (toe/heel), if the estimator was built for them --
-        # `N > K` means the InEKF has more contact points than there are feet, and
-        # `contact_chol` must be sized N. The split is resolved HERE, from the
-        # estimator's own site names, so the sim cannot disagree with the filter
-        # about which slot is which foot's toe.
+        # Multi-point contacts (toe/heel): `N > K` means the InEKF has more contact points than
+        # feet and `contact_chol` must be sized N. The split is resolved HERE, from the
+        # estimator's own site names.
         self.n_points = int(fused.n_contacts)
         self.point_trust = None
         self.gid_to_foot = {int(g): k for k, g in enumerate(self.foot_gids)}
@@ -518,11 +471,9 @@ class SimSensorReader:
                 rate_frac=self.early_release_rate, clock_lead=self.early_release_lead,
                 off_dwell=self.early_release_off_dwell)
 
-        # -- ground truth, for scoring ---------------------------------------
+        # Ground truth, for scoring.
         self.base_bid = sid("PELVIS_LINK", mujoco.mjtObj.mjOBJ_BODY)
         self.base_site = sid("base_body", mujoco.mjtObj.mjOBJ_SITE)
-
-    # -- pieces ------------------------------------------------------------
 
     def foot_loads_raw(self, d: mujoco.MjData) -> np.ndarray:
         """Normalised per-foot normal load, `f_n / (0.5·m·g)`, **unclipped**.
@@ -563,11 +514,10 @@ class SimSensorReader:
         quantity `foot_loads` sums.
 
         Normalisation is per point against the same ``0.5·m·g``, so a *fully*
-        loaded toe reads ~1.0 and a flat-footed stance reads ~0.5 at each point.
-        That is a real consequence worth knowing about: in flat stance each point
-        sits nearer the ``enter = 0.35`` threshold than a whole foot does, so the
-        Schmitt trigger has less margin and may chatter where the per-foot signal
-        would not. Watch `trusted` if a run looks like it is losing anchors.
+        loaded toe reads ~1.0 and a flat-footed stance reads ~0.5 at each point —
+        nearer the ``enter = 0.35`` threshold than a whole foot is, so the Schmitt
+        trigger has less margin and may chatter where the per-foot signal would
+        not. Watch `trusted` if a run looks like it is losing anchors.
         """
         f = np.zeros(self.n_points)
         frc = np.zeros(6)
@@ -579,8 +529,6 @@ class SimSensorReader:
             bid = self.foot_bids[k]
             R = d.xmat[bid].reshape(3, 3)
             x_local = float((R.T @ (np.asarray(c.pos) - d.xpos[bid]))[0])
-            # `(foot, fore) -> contact slot` was resolved at build time from the
-            # site names, so the hot loop is a dict lookup and not a name match.
             j = self.point_slot.get((k, x_local > self.sole_centre_x))
             if j is None:
                 continue
@@ -603,12 +551,10 @@ class SimSensorReader:
         # Only read when the estimator was built with `contact_fk_unfiltered`; an empty array
         # otherwise, which is the "field absent" encoding `FusedSensors` expects.
         q_u = (d.qpos[self.unf_qadr].copy() if self.fused.n_aux else np.zeros(0))
-        # ContactNet feature channel only — the estimator never reads it.
-        # `qfrc_actuator` is the actuator contribution in GENERALISED (joint)
-        # coordinates, so it indexes by dofadr and lines up with the encoder
-        # ordering directly; `actuator_force` would be per-actuator and need the
-        # transmission map.  Ordered concat(filtered, unfiltered), matching how
-        # `fused_inputs` widens q̂ for the contact FK.
+        # ContactNet feature channel only — the estimator never reads it. `qfrc_actuator` is in
+        # GENERALISED coordinates, so it indexes by dofadr and lines up with the encoder ordering;
+        # `actuator_force` would be per-actuator and need the transmission map. Ordered
+        # concat(filtered, unfiltered), matching how `fused_inputs` widens q̂ for the contact FK.
         tau = d.qfrc_actuator[np.concatenate([self.enc_dofadr, self.unf_dofadr])].copy()
         if self.noise is not None:
             gyros = self.noise.corrupt_gyros(gyros)
@@ -649,8 +595,6 @@ class SimSensorReader:
             q_unfiltered=q_u,
             torques=tau,
         )
-
-    # -- ground truth --------------------------------------------------------
 
     def truth(self, d: mujoco.MjData) -> dict:
         """The sim's own answer to what the estimator is estimating.

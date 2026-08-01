@@ -1,37 +1,19 @@
-r"""
-inEKF/ekf.py
-============
-The `InvariantEKF` orchestrator — **pure wiring**, no math of its own.
+r"""The `InvariantEKF` orchestrator — **pure wiring**, no math of its own.
 
-Every numerical operation here delegates: `predict` to `propagate.propagate`,
-`update` to `correct.contact_update`, `gravity_update` to
-`gravity_update.apply_gravity_leveling`.  That is not incidental tidiness — the
-ported `InvariantEKFTest` asserts the orchestrator reproduces the standalone
-propagator and updater **bit-for-bit** (tol 1e-12), which is only guaranteed if
-there is exactly one implementation of each step.
+Every numerical operation delegates: `predict` to `propagate.propagate`, `update` to
+`correct.contact_update`, `gravity_update` to `gravity_update.apply_gravity_leveling`.
+That is not incidental tidiness — the ported `InvariantEKFTest` asserts the
+orchestrator reproduces the standalone propagator and updater **bit-for-bit**
+(tol 1e-12), which is only guaranteed if there is exactly one implementation of each
+step.
 
-Functional shape
-----------------
-Java's `InvariantEKF` is a mutable object holding `(X, P)` and a bag of
-collaborators.  The port splits that in two:
-
-* `InvariantEKF` — the *immutable wiring*: contact count, filter params, contact
-  noise.  Built once by `create`, closed over by the jitted step.
-* `InEKFState` — the *carry*: `(R, v, p, d, P)`, threaded explicitly through
-  every call (I10).
-
-So `ekf.predict(av, la, dt)` becomes `predict(ekf, state, av, la)` returning a
-new state.  Java's introspection getters (`wasLastUpdateApplied`,
-`getLastNormalizedInnovationSquared`, `getLastCorrectionRotationNorm`,
-`getLastConditionProxy`) become the returned `UpdateDiagnostics` pytree rather
-than fields mutated on the side (CLAUDE.md §4).
-
-    # Touchdown re-seed: implemented 2026-07-30 in `inEKF/reseed.py` (congruence
-    # + `TouchdownReseedLatch`), ported tests in `tests/inEKF/test_reseed.py`.
-    # OFF by default (`InvariantEKF.reseed is None`), which keeps every shipped
-    # path and every existing result bit-identical; it is wired as an ablation
-    # arm in `inEKF/filter.make_step`, between `propagate` and the contact
-    # update, exactly where this note used to say the call site was.
+Java's `InvariantEKF` is a mutable object holding `(X, P)` and a bag of collaborators.
+The port splits that in two: `InvariantEKF` is the *immutable wiring* (contact count,
+filter params, contact noise), built once by `create` and closed over by the jitted
+step; `InEKFState` is the *carry* `(R, v, p, d, P)`, threaded explicitly through every
+call (I10).  So `ekf.predict(av, la, dt)` becomes `predict(ekf, state, av, la)`
+returning a new state, and Java's introspection getters become the returned
+`UpdateDiagnostics` pytree rather than fields mutated on the side.
 """
 from typing import NamedTuple, Sequence
 
@@ -54,21 +36,15 @@ from .state import InEKFParams, InEKFState, default_params
 class InvariantEKF(NamedTuple):
     """Immutable filter wiring — Java `InvariantEKF.create(...)`.
 
-    Attributes
-    ----------
-    N : int
-        Number of contact candidates (static for the filter's lifetime, I2).
-    params : InEKFParams
-        Propagation/correction constants, including the precomputed ``Φ`` and ``H``.
-    sigma_c : Array, shape (N, 3, 3)
-        Per-contact **body-frame** process covariances used by the propagation.
-    gravity_params : GravityParams
-        Gravity-leveling configuration.
-    reseed : ReseedParams | None
-        Touchdown re-seed configuration, or ``None`` (the default and every
-        shipped path) to leave the machinery out of the traced graph entirely.
-        See `inEKF/reseed.py`; enabling it also requires driving
-        `InEKFInputs.contact_prob`.
+    ``N`` is the contact-candidate count, static for the filter's lifetime (I2);
+    ``params`` the propagation/correction constants including the precomputed ``Φ``
+    and ``H``; ``sigma_c`` ``(N, 3, 3)`` the per-contact **body-frame** process
+    covariances used by the propagation; ``gravity_params`` the gravity-leveling
+    configuration.
+
+    ``reseed`` is the touchdown re-seed configuration, or ``None`` (the default and
+    every shipped path) to leave the machinery out of the traced graph entirely.  See
+    `inEKF/reseed.py`; enabling it also requires driving `InEKFInputs.contact_prob`.
     """
     N: int
     params: InEKFParams
@@ -137,14 +113,10 @@ def initialize(
 ) -> InEKFState:
     """Java `initialize(rotation, velocity, position, contacts[], covariance)`.
 
-    Validates the two shape contracts the Java version throws on: the contact
-    array must have exactly ``N`` entries, and the covariance must be
-    ``m x m`` with ``m = 9 + 3N``.
-
-    Raises
-    ------
-    ValueError
-        Java raises `IllegalArgumentException`; the port raises `ValueError`.
+    Validates the two shape contracts the Java version throws on: the contact array
+    must have exactly ``N`` entries, and the covariance must be ``m x m`` with
+    ``m = 9 + 3N``.  Java raises `IllegalArgumentException`; the port raises
+    `ValueError`.
     """
     contacts = jnp.asarray(contacts, dtype=float).reshape(-1, 3) if len(contacts) \
         else jnp.zeros((0, 3))
@@ -203,11 +175,8 @@ def update(
     measurement: Array,
     body_covariance: Array,
 ) -> tuple[InEKFState, UpdateDiagnostics]:
-    """Java `update(contactIndex, measurement, bodyCovariance)` — pure delegation.
-
-    The high-level 3-arg contact update: body-frame FK measurement, body-frame
-    3x3 covariance.  Maps onto the low-level `correct.contact_update` with
-    ``learned=False``.
+    """Java `update(contactIndex, measurement, bodyCovariance)` — the high-level 3-arg
+    contact update, delegating to `correct.contact_update` with ``learned=False``.
     """
     updated, _, diagnostics = contact_update(
         state, contact_index, measurement, body_covariance, learned=False
@@ -223,10 +192,8 @@ def gravity_leveling_update(
     pitch_observable: bool | Array = True,
     gate: Array | float = 1.0,
 ) -> tuple[InEKFState, GravityRef, UpdateDiagnostics]:
-    """Java `assembleGravityLeveling(...)` + `applyGravityLeveling()`, fused.
-
-    Returns the corrected state, the advanced gravity reference, and the update
-    diagnostics.
+    """Java `assembleGravityLeveling(...)` + `applyGravityLeveling()`, fused — returns
+    the corrected state, the advanced gravity reference, and the update diagnostics.
     """
     meas = assemble_gravity_leveling(
         ref, state, specific_force, ekf.gravity_params, pitch_observable

@@ -6,27 +6,19 @@ sub-terrains — `flat`, `waves`, `stepping_stones`, `hard_stepping_stones` — 
 `MeshRandomGridTerrain` is a flush axis-aligned grid of squares, which a heightfield represents
 exactly, as ONE geom instead of ~324 collision candidates per foot.
 
-Two things this module owns and nothing else should duplicate:
-
-* the **rasterisers** (`flat`, `waves`, `stepping_stones`) and the `TERRAINS` registry over them;
-* `HeightfieldFloor`, the floor spec `run_policy.build_sim_model(floor=...)` accepts. The model
-  assembly itself — SCS2's collision set, the contact parameters, the position servos, the solver
-  options — stays in `run_policy` and is NOT copied here. Swapping the floor is the only difference
-  between a terrain run and a flat one, so it is the only thing that is parameterised.
+Two things this module owns and nothing else should duplicate: the **rasterisers** (`flat`,
+`waves`, `stepping_stones`) plus the `TERRAINS` registry, and `HeightfieldFloor`, the floor spec
+`run_policy.build_sim_model(floor=...)` accepts. The model assembly — collision set, contact
+parameters, position servos, solver options — stays in `run_policy` and is NOT copied here.
 
     uv run python experiments/terrain_stage1_walk.py     # walks the baseline policy over all four
 
-Gotchas, all of them already paid for (TERRAIN.md §7):
-
-* An hfield is **finite**. The robot walks off the edge of a small one — `EXTENT` is 64 m so that a
-  20 s+ episode from a centre spawn stays on it with room for a discarded warm-up prefix.
-* An hfield needs a nonzero **base thickness** (`size`'s 4th component) or it is a shell, not solid.
-* `hfield_data` is **normalised to [0, 1]** and scaled by `EZ` at compile time. `EZ` is part of the
-  MODEL; `hfield_data` is not, which is exactly why the elevation scale is fixed once here and
-  every terrain is expressed as a fraction of it (it is what makes per-env terrain batchable under
-  `vmap` — TERRAIN.md §2b).
-* Foot soles sit at `ALEX_SOLE_OFFSET`, not the link origin. Terrain work touches contact, so
-  `tests/model/test_sole_frame.py` is part of this module's blast radius.
+Gotchas, all already paid for and written up in **TERRAIN.md §7** — the numbers, not the prose:
+an hfield is finite (`EXTENT` = 64 m, up from the prototype's 16 m); it needs a nonzero base
+thickness (`size`'s 4th component) or it is a shell; `hfield_data` is normalised to [0, 1] and
+scaled by `EZ` at compile time, `EZ` being part of the MODEL while `hfield_data` is not (§2b —
+that split is what makes per-env terrain batchable under `vmap`). Foot soles sit at
+`ALEX_SOLE_OFFSET`, so `tests/model/test_sole_frame.py` is in this module's blast radius.
 """
 import sys
 import xml.etree.ElementTree as ET
@@ -35,10 +27,10 @@ from pathlib import Path
 
 import numpy as np
 
-# --- geometry, fixed for the whole terrain family --------------------------------------------
+# Geometry, fixed for the whole terrain family.
 HSCALE = 0.1        # IsaacLab `horizontal_scale`, m/px
-EXTENT = 64.0       # m of terrain, square. See the "finite" gotcha above; 16 m gave only ~21 s at
-                    # the policy's 0.38 m/s, which is not enough once a warm-up prefix is dropped.
+EXTENT = 64.0       # m of terrain, square. 16 m gave only ~21 s at the policy's 0.38 m/s, which
+                    # is not enough once a warm-up prefix is dropped.
 N = int(round(EXTENT / HSCALE))   # 640 -> hfield_data is 640*640 float32 = 1.6 MB
 EZ = 0.15           # hfield elevation scale, m. The tallest terrain we will ever generate.
 BASE_THICKNESS = 0.1  # m of solid below z = 0
@@ -47,10 +39,9 @@ TILE = 8.0          # IsaacLab sub-terrain tile size, m. The reference length fo
 VSCALE = 0.005      # IsaacLab `vertical_scale`; its hfield backend snaps elevations to this
 
 
-# --- rasterisers -------------------------------------------------------------------------------
-# All three return an (N, N) float32 array of elevations in metres, in [0, EZ]. Index order is
-# MuJoCo's hfield order: axis 0 is the row index (world +y), axis 1 the column index (world +x).
-# The robot walks +x, so terrain that should vary along the direction of travel varies along axis 1.
+# Rasterisers: (N, N) float32 elevations in metres, in [0, EZ], in MuJoCo's hfield index order —
+# axis 0 is the row index (world +y), axis 1 the column index (world +x). The robot walks +x, so
+# terrain varying along the direction of travel varies along axis 1.
 
 def flat(n=N):
     """`MeshPlaneTerrain` — the control. Zero relief."""
@@ -63,10 +54,9 @@ def waves(amplitude=0.10, num_waves=2.0, n=N, hscale=HSCALE, tile=TILE):
     IsaacLab: amplitude 0.00-0.10 m, `num_waves = 2.0`. `num_waves` is a count PER TILE, so the
     wavelength is `tile / num_waves` = 4 m and does not depend on how much terrain we rasterise.
 
-    (Deviation from the Stage-1 prototype, which spread `num_waves` over its whole 16 m field and so
-    produced an 8 m wavelength. Keeping that formula while growing `EXTENT` to 64 m would have
-    stretched the wavelength to 32 m — a gentle ramp, not waves, and a silently easier terrain than
-    the one the recorded result was measured on. Pass `tile=EXTENT` to reproduce the prototype.)
+    (The Stage-1 prototype spread `num_waves` over its whole 16 m field, giving an 8 m wavelength;
+    that formula at `EXTENT` = 64 m would stretch it to 32 m — a gentle ramp, not waves, and a
+    silently easier terrain than the recorded result. Pass `tile=EXTENT` to reproduce it.)
     """
     x = np.arange(n) * hscale                                   # metres along +x
     z = amplitude * 0.5 * (1.0 + np.sin(2.0 * np.pi * num_waves * x / tile))
@@ -92,10 +82,9 @@ def stepping_stones(grid=0.45, hi=0.03, seed=0, platform=0.0, n=N, hscale=HSCALE
     return z.astype(np.float32)
 
 
-# name -> zero-argument callable producing the field. The four sub-terrains of TERRAIN.md §1, at
-# IsaacLab's parameters, so a collector can just iterate `TERRAINS.items()`. The seeds are the
-# Stage-1 ones, so `TERRAINS[name]()` reproduces the recorded run. Everything is a `partial`, so a
-# caller who wants a sweep can re-bind: `TERRAINS["waves"].func(amplitude=0.04)`.
+# The four sub-terrains of TERRAIN.md §1 at IsaacLab's parameters, name -> zero-argument callable.
+# The seeds are the Stage-1 ones, so `TERRAINS[name]()` reproduces the recorded run. All
+# `partial`s, so a sweep can re-bind: `TERRAINS["waves"].func(amplitude=0.04)`.
 TERRAINS = {
     "flat":            partial(flat),
     "waves":           partial(waves, amplitude=0.10, num_waves=2.0),
@@ -104,13 +93,12 @@ TERRAINS = {
 }
 
 
-# --- the floor spec ----------------------------------------------------------------------------
 class HeightfieldFloor:
-    """A `run_policy.build_sim_model(floor=...)` spec that replaces the plane with a heightfield.
+    """A `run_policy.build_sim_model(floor=...)` spec replacing the plane with a heightfield.
 
-    Satisfies the same two-method protocol as `run_policy.PlaneFloor`: `geom_attrs` runs before
-    compilation (and declares the `<asset><hfield>`), `finalize` after it (and writes the normalised
-    elevation samples, which are model DATA, not structure).
+    Same two-method protocol as `run_policy.PlaneFloor`: `geom_attrs` runs before compilation and
+    declares the `<asset><hfield>`, `finalize` after it and writes the normalised elevation
+    samples, which are model DATA, not structure.
     """
 
     def __init__(self, field, *, ez=EZ, extent=EXTENT, base_thickness=BASE_THICKNESS,
@@ -156,9 +144,8 @@ class HeightfieldFloor:
 def sample(field, x, y, extent=EXTENT):
     """Terrain elevation, m, at world `(x, y)` — nearest sample, no interpolation.
 
-    MuJoCo lays an hfield out row-major over [-extent/2, extent/2]^2, with the column index along
-    +x and the row index along +y. Out-of-range queries clamp to the edge (the field is finite;
-    see the module docstring).
+    MuJoCo lays an hfield out row-major over [-extent/2, extent/2]^2, column index along +x and
+    row index along +y. Out-of-range queries CLAMP to the edge — the silent failure, not an error.
     """
     n = field.shape[0]
     hscale = extent / n
@@ -177,13 +164,9 @@ def spawn_lift(field, clearance=0.02):
     return float(np.max(field)) + clearance
 
 
-# --- model builder -----------------------------------------------------------------------------
 def _run_policy():
-    """Import the root-level `run_policy` script.
-
-    It is an entry point at the repo root, not a package module — the same accommodation pytest
-    makes with `pythonpath = ["."]` in `pyproject.toml`. Imported lazily so that importing this
-    module costs nothing (`run_policy` pulls in onnxruntime and reads the policy config at import).
+    """Import the root-level `run_policy` script (not a package module; pytest makes the same
+    `pythonpath = ["."]` accommodation). Lazy — `run_policy` pulls in onnxruntime at import.
     """
     root = Path(__file__).resolve().parents[3]
     if str(root) not in sys.path:
@@ -193,11 +176,7 @@ def _run_policy():
 
 
 def build_terrain_model(policy, field, *, with_visuals=False, with_imu_sensors=False, **floor_kw):
-    """`run_policy.build_sim_model` with its floor plane swapped for `field`.
-
-    Deliberately a one-liner over the shared builder: the collision set, contact parameters, solver
-    options and actuators all come from `run_policy` and exist in exactly one place.
-    """
+    """`run_policy.build_sim_model` with its floor plane swapped for `field`."""
     return _run_policy().build_sim_model(
         policy, with_visuals=with_visuals, with_imu_sensors=with_imu_sensors,
         floor=HeightfieldFloor(field, **floor_kw))
