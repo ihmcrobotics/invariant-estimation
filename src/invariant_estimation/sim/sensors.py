@@ -240,6 +240,7 @@ class SimSensorReader:
         gyros = d.sensordata[self.gyro_adr[:, None] + np.arange(3)].copy()
         accel = d.sensordata[self.acc_adr[self.base_imu] + np.arange(3)].copy()
         enc = d.qpos[self.enc_qadr].copy()
+        enc_vel = d.qvel[self.enc_dofadr].copy()
         qd_u = d.qvel[self.unf_dofadr].copy()
         # Only read when the estimator was built with `contact_fk_unfiltered`; an empty array
         # otherwise, which is the "field absent" encoding `FusedSensors` expects.
@@ -248,6 +249,7 @@ class SimSensorReader:
             gyros = self.noise.corrupt_gyros(gyros)
             accel = self.noise.corrupt_accel(accel)
             enc = self.noise.corrupt_encoders(enc)
+            enc_vel = self.noise.corrupt_velocities(enc_vel)
             qd_u = self.noise.corrupt_velocities(qd_u)
             q_u = self.noise.corrupt_encoders(q_u)
 
@@ -258,6 +260,7 @@ class SimSensorReader:
         chol = np.where(trusted[:, None, None] > 0.0, self.stance_chol, self.swing_chol)
         return FusedSensors(
             encoders=enc,
+            encoders_vel=enc_vel,
             gyros=gyros,
             accel_base=accel,
             qd_unfiltered=qd_u,

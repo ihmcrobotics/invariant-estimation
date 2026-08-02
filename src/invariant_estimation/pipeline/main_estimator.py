@@ -285,6 +285,7 @@ class FusedSensors(NamedTuple):
         otherwise, so the field is optional and defaults to empty.
     """
 
+    #TODO: the encoders are not just the unfiltered joints, we use the entire robot as an input. This is pure sensors, so it shouldn't matter which ones we use.
     encoders: Array
     gyros: Array
     accel_base: Array
@@ -292,6 +293,7 @@ class FusedSensors(NamedTuple):
     contact: Array
     contact_chol: Array
     q_unfiltered: Array = ()
+    encoders_vel: Array = ()
 
 
 class FusedOutputs(NamedTuple):

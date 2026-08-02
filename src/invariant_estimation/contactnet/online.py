@@ -99,7 +99,9 @@ def make_online_features(subchain, base_imu: int, kinematics, cfg: ContactNetCon
     def channels_now(sensors, prev_p) -> tuple[Array, Array]:
         """One tick of raw channels ``(N_c, F)``, and this tick's FK ``p``."""
         q_all = jnp.concatenate([sensors.encoders, sensors.q_unfiltered], axis=-1)
+        qd_all = jnp.concatenate([sensors.encoders_vel, sensors.qd_unfiltered], axis=-1)
         q_sub = q_all[subchain]                              # (N_c, J_sub)
+        qd_sub = qd_all[subchain]
         tau_sub = sensors.torques[subchain]                  # (N_c, J_sub)
 
         # RAW base IMU — never the bias-corrected gyro (I1: that is a filter
@@ -110,7 +112,7 @@ def make_online_features(subchain, base_imu: int, kinematics, cfg: ContactNetCon
         p = kinematics(q_all, jnp.zeros_like(q_all)).y      # (N_c, 3)
         v = (p - prev_p) / cfg.dt
 
-        row = jnp.concatenate([omega, accel, q_sub, tau_sub, p, v], axis=-1)
+        row = jnp.concatenate([omega, accel, q_sub, qd_sub, tau_sub, p, v], axis=-1)
         return row, p
 
     def step(state: OnlineState, sensors):
