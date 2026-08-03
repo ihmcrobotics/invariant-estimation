@@ -26,8 +26,8 @@ JOINT_LABELS: tuple[str, ...] = ("hip_x","hip_z","hip_y","knee_y","ankle_y","ank
 def window_indices(T: int, H: int, stride: int = 1) -> Array:
     if stride < 1:
         raise ValueError(f"Stride must be >= 1, but got {stride}")
-    k = jnp.arange(T)[:,None]
-    h = jnp.arange(H)[:,None]
+    k = jnp.arange(T)[:, None]                      # (T, 1)
+    h = jnp.arange(H)[None, :]                      # (1, H)
     return jnp.maximum(k - (H - 1 - h) * stride, 0)
 
 def boxcar(x: Array, s: int) -> Array:
