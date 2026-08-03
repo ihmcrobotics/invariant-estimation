@@ -230,3 +230,6 @@ experiments/sim_runs/*.npz
 # (regenerate via `scripts/run_contactnet.py --collect`). results/ IS committed
 # (plots, summary.json, history.npy, P0.npy, params.npz) as the run's evidence.
 data/
+
+# Ignore MuJoCo logs
+MUJOCO_LOG.TXT
