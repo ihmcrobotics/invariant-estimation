@@ -36,12 +36,19 @@ N_C = 2
 J_SUB = 6
 N_J = 8
 T = 600
+DT = 1.0e-3
+N_FILTERED = 5          # `encoders` columns; the remaining N_J - 5 are `q_unfiltered`
+
+# 12 fixed channels (base gyro 3 + base accel 3 + p_bc 3 + v_bc 3) and THREE per-joint
+# blocks: q, qd, tau. `qd_*` joined the set on 8/2 for CoCo parity, so this is 3*J_SUB
+# and not 2*J_SUB -- the `len(names) == cfg.F` assertion in `fitted` is what pins it.
+F_CHANNELS = 12 + 3 * J_SUB
 
 
 def _cfg(**kw) -> ContactNetConfig:
     """Small but structurally identical: H=5, stride=8 -> span = 40 ticks."""
-    base = dict(F=12 + 2 * J_SUB, sigma_0=1.0e-4, H=5, window_span_s=0.032,
-                dt=1.0e-3, widths=(16, 16))
+    base = dict(F=F_CHANNELS, sigma_0=1.0e-4, H=5, window_span_s=0.032,
+                dt=DT, widths=(16, 16))
     base.update(kw)
     return ContactNetConfig(**base)
 
@@ -80,13 +87,21 @@ def _sensors(seed: int = 0) -> FusedSensors:
     r = np.random.default_rng(seed)
     t = np.arange(T)[:, None]
     q = 0.4 * np.sin(0.01 * t + np.arange(N_J)[None, :]) + 0.01 * r.standard_normal((T, N_J))
+    # Velocities are the finite difference of the SAME `q` this fixture reports, not an
+    # independent draw: the `qd_*` channels have to be consistent with the `q_*` ones for
+    # the window-agreement tests to mean anything (the joint-KF fixture's
+    # `applyConsistentMotion` exists for the same reason). Both halves must be populated
+    # -- `q_unfiltered` has N_J - N_FILTERED columns, so `qd_unfiltered` does too, or
+    # `features.contact_channels` rejects the width mismatch against `q_all`.
+    qd = np.gradient(q, DT, axis=0)
     return FusedSensors(
-        encoders=jnp.asarray(q[:, :5]),
-        q_unfiltered=jnp.asarray(q[:, 5:]),
+        encoders=jnp.asarray(q[:, :N_FILTERED]),
+        q_unfiltered=jnp.asarray(q[:, N_FILTERED:]),
+        encoders_vel=jnp.asarray(qd[:, :N_FILTERED]),
+        qd_unfiltered=jnp.asarray(qd[:, N_FILTERED:]),
         torques=jnp.asarray(20.0 * np.sin(0.02 * t + np.arange(N_J)[None, :])),
         gyros=jnp.asarray(r.standard_normal((T, 3, 3)) * 0.1),
         accel_base=jnp.asarray(r.standard_normal((T, 3)) * 0.5 + np.array([0, 0, 9.81])),
-        qd_unfiltered=jnp.zeros((T, 0)),
         contact=jnp.zeros((T, N_C)),
         contact_chol=jnp.zeros((T, N_C, 3, 3)),
     )

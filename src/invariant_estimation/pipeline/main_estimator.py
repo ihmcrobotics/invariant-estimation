@@ -505,11 +505,14 @@ def _make_contact_kinematics(
     """
     feet = jnp.asarray(foot_site_ords, dtype=int)
     use_aux = aux_qpos is not None and len(aux_qpos) > 0
-    if use_aux:
-        qpos0 = jnp.asarray(model.mj_model.qpos0, dtype=jnp.float64)
-        idx_filtered = jnp.asarray(model.joint_qpos, dtype=int)
-        idx_aux = jnp.asarray(aux_qpos, dtype=int)
-        n_f = int(n_filtered if n_filtered is not None else model.n_joints)
+    # Bound unconditionally so `_foot_y` closes over names that always exist; when
+    # `use_aux` is False they are empty and the branch below never reads them. All of
+    # this is build time (plain Python over a build-time constant), so the `if` inside
+    # `_foot_y` is resolved before tracing and costs the graph nothing (I7).
+    qpos0 = jnp.asarray(model.mj_model.qpos0, dtype=jnp.float64)
+    idx_filtered = jnp.asarray(model.joint_qpos, dtype=int)
+    idx_aux = jnp.asarray(aux_qpos if use_aux else (), dtype=int)
+    n_f = int(n_filtered if n_filtered is not None else model.n_joints)
 
     def _foot_y(q: Array) -> Array:
         if use_aux:

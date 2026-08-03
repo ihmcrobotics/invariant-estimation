@@ -36,8 +36,11 @@ class ContactNetConfig:
     L: int = 128                   # ticks the gradient traverses
     B: int = 32                    # segments per batch
 
-    # objective
-    objective: str = "l2_velocity"  # or beta_nll when ready
+    # objective. "beta_nll" is accepted vocabulary but NOT implemented --
+    # `rollout.make_segment_loss` raises NotImplementedError on it (the loss fn is
+    # missing from losses.py, and the InEKF diagnostics publish no `logdet_S`).
+    # `beta` is its plumbed-but-unused hyperparameter.
+    objective: str = "l2_velocity"
     beta: float = 0.5
 
     # optimizer
