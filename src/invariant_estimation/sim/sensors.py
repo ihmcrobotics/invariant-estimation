@@ -202,6 +202,11 @@ class SimSensorReader:
         # -- encoders: the 9 filtered joints, in filter state order ----------
         self.enc_qadr = np.array(
             [m.jnt_qposadr[sid(n, mujoco.mjtObj.mjOBJ_JOINT)] for n in build.joint_names])
+        # DOF addresses for the same joints: qposadr != dofadr in general, and
+        # torque/velocity are generalised quantities, so they index by DOF.
+        self.enc_dofadr = np.array(
+            [m.jnt_dofadr[sid(n, mujoco.mjtObj.mjOBJ_JOINT)] for n in build.joint_names],
+            dtype=int)
 
         # -- the unfiltered anchor-chain joints (Alex's 4 ankles) ------------
         self.unfiltered_names = _dof_joint_names(

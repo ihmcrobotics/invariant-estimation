@@ -225,3 +225,8 @@ typings/
 
 # Estimator-in-sim run histories (regenerate with `run_estimator.py --out ...`)
 experiments/sim_runs/*.npz
+
+# ContactNet overnight run: rollouts, caches, checkpoints (regenerate via scripts/run_contactnet.py --collect)
+data/
+results/*.npz
+results/*.npy

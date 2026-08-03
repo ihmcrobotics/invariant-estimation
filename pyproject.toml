@@ -21,6 +21,7 @@ dependencies = [
   # estimator itself, but a hard requirement of the sim entry point, so it stays a main dependency.
   "onnxruntime>=1.20",
   "optax>=0.2.8",
+  "matplotlib>=3.11.1",
 ]
 
 [project.optional-dependencies]

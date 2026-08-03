@@ -369,13 +369,14 @@ def load_rollout(path: Path | str) -> Rollout:
     z = np.load(Path(path), allow_pickle=False)
     g = lambda k: np.asarray(z[k])                                          # noqa: E731
     sensors = FusedSensors(**{f: g(f"sensors.{f}") for f in FusedSensors._fields})
+    # NOTE: take-two's InEKFInputs is PROCESS-SOCKET-ONLY -- no contact_meas_chol
+    # field (the hard invariant, enforced structurally). ContactNet drives contact_chol.
     inputs = InEKFInputs(
         omega=g("inputs.omega"), accel=g("inputs.accel"), raw_omega=g("inputs.raw_omega"),
         joint=JointFilterOutput(
             q=g("inputs.joint.q"), q_dot=g("inputs.joint.q_dot"),
             sigma_q=g("inputs.joint.sigma_q"), sigma_q_dot=g("inputs.joint.sigma_q_dot")),
         contact_chol=g("inputs.contact_chol"),
-        contact_meas_chol=g("inputs.contact_meas_chol"),
     )
     pre = lambda p: {k[len(p):]: g(k) for k in z.files if k.startswith(p)}   # noqa: E731
     return Rollout(sensors=sensors, inputs=inputs, truth=pre("truth."), aux=pre("aux."),
