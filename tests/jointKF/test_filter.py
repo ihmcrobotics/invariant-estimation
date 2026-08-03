@@ -194,7 +194,7 @@ def test_step_compiles_to_one_program_across_contact_patterns(scene):
     )
     # A retrace would push the cache above one entry; eviction can only take it
     # below, so this direction stays meaningful under a full-suite run.
-    assert jstep._cache_size() <= 1, "a contact pattern triggered a retrace"
+    assert jstep._cache_size() <= 1, "a contact pattern triggered a retrace"  # type: ignore[attr-defined]  # jax private API, absent from the stubs
 
 
 def test_run_scans_a_trajectory(scene):

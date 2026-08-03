@@ -55,6 +55,7 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 from jax import Array
+from jax.typing import ArrayLike
 from mujoco import mjx
 
 __all__ = ["MjxModel", "MassMatrixBlocks", "ModelEval"]
@@ -267,7 +268,7 @@ class MjxModel:
 
     # -- configuration plumbing ---------------------------------------------
 
-    def qpos(self, q: Array) -> Array:
+    def qpos(self, q: ArrayLike) -> Array:
         """Widen a filtered-joint vector `(n,)` to a full `qpos` `(nq,)`.
 
         Accepts a full `qpos` unchanged, so callers may pass either.  The choice
@@ -295,7 +296,7 @@ class MjxModel:
         q0 = jnp.asarray(self.mj_model.qpos0, dtype=jnp.float64)
         return q0.at[jnp.asarray(self.joint_qpos)].set(q)
 
-    def _data(self, q: Array) -> mjx.Data:
+    def _data(self, q: ArrayLike) -> mjx.Data:
         """Position-level pipeline only: FK, COM frames, CRB.
 
         `mjx.forward` would additionally run collision detection and the
@@ -309,11 +310,11 @@ class MjxModel:
 
     # -- forward kinematics -------------------------------------------------
 
-    def site_positions(self, q: Array) -> Array:
+    def site_positions(self, q: ArrayLike) -> Array:
         """World positions of the registered sites, `(n_sites, 3)`."""
         return self._data(q).site_xpos[jnp.asarray(self.site_ids)]
 
-    def site_rotations(self, q: Array) -> Array:
+    def site_rotations(self, q: ArrayLike) -> Array:
         """World rotations of the registered sites, `(n_sites, 3, 3)`.
 
         Row `k` is `^W R_{site_k}`; the IMU measurement frame *is* the site frame,
@@ -321,7 +322,7 @@ class MjxModel:
         """
         return self._data(q).site_xmat[jnp.asarray(self.site_ids)]
 
-    def site_poses(self, q: Array) -> tuple[Array, Array]:
+    def site_poses(self, q: ArrayLike) -> tuple[Array, Array]:
         """`(positions, rotations)` in one FK pass."""
         d = self._data(q)
         ids = jnp.asarray(self.site_ids)
@@ -329,7 +330,7 @@ class MjxModel:
 
     # -- Jacobians ----------------------------------------------------------
 
-    def site_angular_jacobians(self, q: Array) -> Array:
+    def site_angular_jacobians(self, q: ArrayLike) -> Array:
         """World-frame angular Jacobians of the sites, `(n_sites, 3, nv)`.
 
         MJX's `mjx.jac` returns `(nv, 3)` -- transposed relative to the usual
@@ -349,7 +350,7 @@ class MjxModel:
 
         return jax.vmap(one)(d.site_xpos[ids], bodies)
 
-    def relative_gyro_jacobian(self, q: Array) -> Array:
+    def relative_gyro_jacobian(self, q: ArrayLike) -> Array:
         r"""Stacked pair Jacobians `J_ang(q) S_ab`, `(n_pairs, 3, n)`, child frame.
 
         For pair `(a, b)` the gyro difference is
@@ -388,7 +389,7 @@ class MjxModel:
 
     # -- inertia ------------------------------------------------------------
 
-    def mass_matrix(self, q: Array) -> Array:
+    def mass_matrix(self, q: ArrayLike) -> Array:
         """Dense composite-rigid-body inertia `M(q)`, `(nv, nv)`, symmetric PD.
 
         Includes `dof_armature` on the diagonal -- MuJoCo folds it in during CRB.
@@ -406,7 +407,7 @@ class MjxModel:
         """
         return mjx.full_m(self.mjx_model, d)
 
-    def evaluate(self, q: Array) -> ModelEval:
+    def evaluate(self, q: ArrayLike) -> ModelEval:
         """FK, site Jacobians and `M(q)` from a **single** position-level pass.
 
         This is the entry point a jitted filter step should call: `_data` (FK ->
@@ -424,7 +425,7 @@ class MjxModel:
             M=self._mass_matrix(d),
         )
 
-    def mass_matrix_blocks(self, q: Array) -> MassMatrixBlocks:
+    def mass_matrix_blocks(self, q: ArrayLike) -> MassMatrixBlocks:
         """`(M_jj, M_jb, M_bb, M_bj)` gathered by the build-time DoF index arrays."""
         M = self.mass_matrix(q)
         j = jnp.asarray(self.joint_dof)

@@ -102,11 +102,11 @@ def main():
           f"(min {zs[:, -1].min():.4f}, max {zs[:, -1].max():.4f})")
     print(f"  all finite: {np.all(np.isfinite(zs))}")
 
-    print(f"\n  traced graphs after the first call: {step._cache_size()}")
+    print(f"\n  traced graphs after the first call: {getattr(step, "_cache_size")()}")
     # A recompile here would mean terrain is baked into the graph, which would kill the approach.
     fields2 = np.stack([terrain(100 + i, a) for i, a in enumerate(np.linspace(0.5, 2.0, N_ENV))])
     step(mx.tree_replace({"hfield_data": jnp.asarray(fields2)}), batch)
-    n = step._cache_size()
+    n = getattr(step, "_cache_size")()
     print(f"  traced graphs after NEW terrain:      {n}   "
           f"{'-> terrain is DATA, not graph structure' if n == 1 else '-> RECOMPILED, bad'}")
     assert n == 1, "swapping terrain recompiled; per-env terrain would not scale"

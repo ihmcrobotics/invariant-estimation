@@ -72,6 +72,7 @@ from typing import NamedTuple
 
 import jax.numpy as jnp
 from jax import Array
+from jax.typing import ArrayLike
 
 from .state import JointKFBuild, JointKFParams
 
@@ -169,7 +170,7 @@ def encoder_noise(build: JointKFBuild, params: JointKFParams | None = None) -> A
 # Pair geometry
 # ---------------------------------------------------------------------------
 
-def pair_frames(model, q: Array) -> tuple[Array, Array]:
+def pair_frames(model, q: ArrayLike) -> tuple[Array, Array]:
     r"""`(J_rel, R_rel)` for every pair, from ONE position-level model pass.
 
     * `J_rel` : `(n_pairs, 3, n)` -- `J_ang(q) S_ab` in the **child** frame.
@@ -193,7 +194,7 @@ def pair_frames(model, q: Array) -> tuple[Array, Array]:
 # The mixing operator L -- the object invariant I6 is about
 # ---------------------------------------------------------------------------
 
-def mixing_operator(build: JointKFBuild, R_rel: Array) -> Array:
+def mixing_operator(build: JointKFBuild, R_rel: ArrayLike) -> Array:
     r"""`L`, shape `(3*n_pairs, 3m)`: how per-IMU bias/noise enters the pair rows.
 
     Row block `e`, column block `k` is
@@ -214,6 +215,7 @@ def mixing_operator(build: JointKFBuild, R_rel: Array) -> Array:
     that could drift.
     """
     m = build.n_imus
+    R_rel = jnp.asarray(R_rel, dtype=jnp.float64)
     imu = jnp.arange(m)
     child_hot = (imu[None, :] == jnp.asarray(build.pair_child)[:, None]).astype(jnp.float64)
     parent_hot = (imu[None, :] == jnp.asarray(build.pair_parent)[:, None]).astype(jnp.float64)
@@ -224,7 +226,7 @@ def mixing_operator(build: JointKFBuild, R_rel: Array) -> Array:
     return blocks.transpose(0, 2, 1, 3).reshape(3 * build.n_pairs, 3 * m)
 
 
-def _block_diag_sigma(gyro_sigma: Array) -> Array:
+def _block_diag_sigma(gyro_sigma: ArrayLike) -> Array:
     """`blkdiag(Sigma_0, ..., Sigma_{m-1})`, shape `(3m, 3m)`.
 
     Per-IMU gyro noise is genuinely independent -- separate silicon, separate
@@ -232,6 +234,7 @@ def _block_diag_sigma(gyro_sigma: Array) -> Array:
     then produced by `L`, which is the point: the correlations are forced by the
     differencing, not assumed.
     """
+    gyro_sigma = jnp.asarray(gyro_sigma, dtype=jnp.float64)
     m = gyro_sigma.shape[0]
     dense = jnp.einsum("kl,kij->kilj", jnp.eye(m, dtype=jnp.float64), gyro_sigma)
     return dense.reshape(3 * m, 3 * m)
@@ -244,13 +247,13 @@ def _block_diag_sigma(gyro_sigma: Array) -> Array:
 def build_stacked(
     build: JointKFBuild,
     params: JointKFParams,
-    q: Array | None = None,
-    gyros: Array | None = None,
-    trusted_feet: Array | None = None,
+    q: ArrayLike | None = None,
+    gyros: ArrayLike | None = None,
+    trusted_feet: ArrayLike | None = None,
     *,
     model=None,
-    J_rel: Array | None = None,
-    R_rel: Array | None = None,
+    J_rel: ArrayLike | None = None,
+    R_rel: ArrayLike | None = None,
     anchor: AnchorBlock | None = None,
 ) -> StackedMeasurement:
     r"""Java `buildStackedMeasurementForTest` -- the pair rows plus the anchors.

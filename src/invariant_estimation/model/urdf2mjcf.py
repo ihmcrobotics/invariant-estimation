@@ -100,6 +100,38 @@ class AlexModelSpec:
 
 
 # ---------------------------------------------------------------------------
+# required XML access
+# ---------------------------------------------------------------------------
+
+
+def _req_attr(elem: ET.Element, name: str) -> str:
+    """A REQUIRED XML attribute, or a `ValueError` that says which one is missing.
+
+    `Element.get` returns `str | None`, and the conversions downstream
+    (`float(...)`, dict keys) accept the `None` silently or fail with a message
+    that names neither the attribute nor the element -- `float() argument must be a
+    string or a real number, not 'NoneType'` while converting a 49-link URDF is not
+    a diagnosis. Every use below is a URDF-mandated attribute, so absence is a
+    malformed description, not a case to default.
+    """
+    value = elem.get(name)
+    if value is None:
+        raise ValueError(
+            f"<{elem.tag}> is missing the required `{name}` attribute"
+            + (f" (name='{elem.get('name')}')" if elem.get("name") else "")
+        )
+    return value
+
+
+def _req_child(elem: ET.Element, tag: str) -> ET.Element:
+    """A REQUIRED child element -- same argument as `_req_attr`."""
+    child = elem.find(tag)
+    if child is None:
+        raise ValueError(f"<{elem.tag}> is missing the required <{tag}> child")
+    return child
+
+
+# ---------------------------------------------------------------------------
 # rotations
 # ---------------------------------------------------------------------------
 
@@ -163,9 +195,9 @@ def _rotate_inertia(inertia: ET.Element, quat: Iterable[float]) -> np.ndarray:
     ``diaginertia`` avoids an eigendecomposition whose eigenvector sign/order
     conventions are unspecified -- a congruence is exact and has no branch.
     """
-    ixx = float(inertia.get("ixx"))
-    iyy = float(inertia.get("iyy"))
-    izz = float(inertia.get("izz"))
+    ixx = float(_req_attr(inertia, "ixx"))
+    iyy = float(_req_attr(inertia, "iyy"))
+    izz = float(_req_attr(inertia, "izz"))
     ixy = float(inertia.get("ixy", 0.0))
     ixz = float(inertia.get("ixz", 0.0))
     iyz = float(inertia.get("iyz", 0.0))
@@ -249,7 +281,8 @@ def urdf_to_mjcf(
     if root.tag != "robot":
         raise ValueError(f"expected a URDF <robot> root, got <{root.tag}>")
 
-    links = {link.get("name"): link for link in root.findall("link")}
+    links: dict[str, ET.Element] = {_req_attr(link, "name"): link
+                                    for link in root.findall("link")}
     joints = root.findall("joint")
 
     children: dict[str, list[ET.Element]] = {name: [] for name in links}
@@ -261,15 +294,16 @@ def urdf_to_mjcf(
         child = joint.find("child")
         if parent is None or child is None:
             raise ValueError(f"joint '{joint.get('name')}' lacks <parent>/<child>")
-        p_name, c_name = parent.get("link"), child.get("link")
+        p_name, c_name = _req_attr(parent, "link"), _req_attr(child, "link")
         if p_name not in links or c_name not in links:
             raise ValueError(f"joint '{joint.get('name')}' references an unknown link")
         children[p_name].append(joint)
         child_links.add(c_name)
 
         limit = joint.find("limit")
-        if limit is not None and limit.get("effort") is not None:
-            effort_limits[joint.get("name")] = float(limit.get("effort"))
+        effort = None if limit is None else limit.get("effort")
+        if effort is not None:
+            effort_limits[_req_attr(joint, "name")] = float(effort)
 
     roots = [name for name in links if name not in child_links]
     if len(roots) != 1:
@@ -290,7 +324,7 @@ def urdf_to_mjcf(
         if link_name not in links:
             raise ValueError(f"extra site '{site_name}' names unknown link '{link_name}'")
         site_of_link.setdefault(link_name, []).append(site_name)
-        site_offsets[site_name] = tuple(float(v) for v in offset)
+        site_offsets[site_name] = (float(offset[0]), float(offset[1]), float(offset[2]))
 
     out: list[str] = [
         f'<mujoco model="{model_name}">',
@@ -317,12 +351,13 @@ def urdf_to_mjcf(
         if joint is None:
             out.append(f'{pad}  <freejoint name="root"/>')
         elif joint.get("type") == "revolute" or joint.get("type") == "continuous":
+            joint_name = _req_attr(joint, "name")
             axis_elem = joint.find("axis")
             axis = _vec(axis_elem.get("xyz") if axis_elem is not None else None, (1.0, 0.0, 0.0))
-            arm = _armature_for(joint.get("name"), rotor_inertia, rotor_inertia_default)
+            arm = _armature_for(joint_name, rotor_inertia, rotor_inertia_default)
             arm_attr = f' armature="{arm!r}"' if arm else ""
             out.append(
-                f'{pad}  <joint name="{joint.get("name")}" type="hinge" '
+                f'{pad}  <joint name="{joint_name}" type="hinge" '
                 f'pos="0 0 0" axis="{_fmt(axis)}"{arm_attr}/>'
             )
         elif joint.get("type") != "fixed":
@@ -331,7 +366,7 @@ def urdf_to_mjcf(
             )
 
         inertial = link.find("inertial")
-        if inertial is not None and float(inertial.find("mass").get("value")) <= 0.0:
+        if inertial is not None and float(_req_attr(_req_child(inertial, "mass"), "value")) <= 0.0:
             # Every Alex sensor mount (19 of them: the *_IMU_LINKs, the ZED
             # brackets) is declared with mass 0 and a zero inertia tensor -- they
             # are pure coordinate frames, not bodies. MuJoCo rejects a zero
@@ -341,9 +376,8 @@ def urdf_to_mjcf(
             inertial = None
         if inertial is not None:
             i_pos, i_quat = _origin(inertial)
-            mass = float(inertial.find("mass").get("value"))
-            inertia = inertial.find("inertia")
-            i_body = _rotate_inertia(inertia, i_quat)
+            mass = float(_req_attr(_req_child(inertial, "mass"), "value"))
+            i_body = _rotate_inertia(_req_child(inertial, "inertia"), i_quat)
             # MJCF fullinertia order is (ixx, iyy, izz, ixy, ixz, iyz).
             full = [
                 i_body[0, 0], i_body[1, 1], i_body[2, 2],
@@ -361,7 +395,7 @@ def urdf_to_mjcf(
             out.append(f'{pad}  <site name="{site_name}" pos="{x!r} {y!r} {z!r}"/>')
 
         for child_joint in children[link_name]:
-            emit_link(child_joint.find("child").get("link"), child_joint, depth + 1)
+            emit_link(_req_attr(_req_child(child_joint, "child"), "link"), child_joint, depth + 1)
 
         out.append(f"{pad}</body>")
 
