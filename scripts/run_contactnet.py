@@ -3,7 +3,8 @@
 
 Coherent 1 kHz regime (rp.DT=0.001, rp.DECIMATION=20; CONTROL_DT=0.02 unchanged),
 process socket only, F=30 (q-dot channel), stride=1 window. Held-out validation:
-body-frame velocity RMSE + velocity NEES + contact NIS/dof, learned Sigma_C vs the
+body-frame velocity RMSE + world-frame velocity NEES (3-DoF and per world axis) +
+contact NIS/dof, learned Sigma_C vs the
 analytic-heuristic contact_chol baseline (the recorded stance/swing factors).
 
 Usage:
@@ -105,8 +106,9 @@ def _windows_full(cache, norm, cfg):
 
 def validate(prep, cache, norm, cfg, params, fused, P0, eps):
     """Run the filter over the held-out usable region with (a) recorded analytic
-    contact_chol and (b) learned Sigma_C. Return body-frame velocity RMSE, velocity
-    NEES (3-DoF), and contact NIS/dof for each."""
+    contact_chol and (b) learned Sigma_C. Return body-frame velocity RMSE, world-frame
+    velocity NEES (3-DoF and per world axis x/y/z), and contact NIS/dof for each."""
+    from invariant_estimation.inEKF.group import skew
     from invariant_estimation.inEKF.state import InEKFState
 
     wins_full = _windows_full(cache, norm, cfg)          # (T, N_c, H, F)
@@ -131,14 +133,37 @@ def validate(prep, cache, norm, cfg, params, fused, P0, eps):
         bv_est = jnp.einsum("tji,tj->ti", out.state.R, out.state.v)
         bv_true = jnp.einsum("tji,tj->ti", R_true, v_true)
         rmse = float(jnp.sqrt(jnp.mean(jnp.sum((bv_est - bv_true) ** 2, axis=-1))))
-        # 3-DoF world velocity NEES against the velocity block of P (tangent 3:6)
+
+        # World-frame velocity error and its covariance.
+        #
+        # P is the right-invariant TANGENT covariance (I4: rotation 0:3, velocity
+        # 3:6). With X_hat = exp(xi) X (I5) the velocity column of the group element
+        # gives  v_hat = (I + (xi_phi)_x) v + xi_v, i.e. the world-frame error is
+        #     dv = v_hat - v = xi_v - (v)_x xi_phi,
+        # so  Sigma_dv = J P[0:6,0:6] J^T   with   J = [ -(v)_x   I_3 ].
+        # Taking P[3:6,3:6] alone (the previous 3-DoF metric) drops the attitude
+        # coupling and under-reports the covariance whenever the robot is moving,
+        # which inflates NEES. Both are reported: `vel_nees_tangent` is the old
+        # number, `vel_nees_world*` are the world-frame ones the axes decompose.
         ev = out.state.v - v_true
         Pvv = out.state.P[:, 3:6, 3:6]
-        nees = jax.vmap(lambda e, P: e @ jnp.linalg.solve(P, e))(ev, Pvv)
-        nees = float(jnp.mean(nees))
+        nees_tangent = float(jnp.mean(
+            jax.vmap(lambda e, P: e @ jnp.linalg.solve(P, e))(ev, Pvv)))
+
+        eye = jnp.broadcast_to(jnp.eye(3), (out.state.v.shape[0], 3, 3))
+        J = jnp.concatenate([-jax.vmap(skew)(out.state.v), eye], axis=-1)   # (T,3,6)
+        Sv = J @ out.state.P[:, 0:6, 0:6] @ jnp.swapaxes(J, -1, -2)         # (T,3,3)
+        nees_world = float(jnp.mean(
+            jax.vmap(lambda e, S: e @ jnp.linalg.solve(S, e))(ev, Sv)))
+        # per world axis: 1-DoF marginal NEES, target 1 each
+        nees_axis = jnp.mean(ev ** 2 / jnp.diagonal(Sv, axis1=-2, axis2=-1), axis=0)
+
         nis = float(jnp.mean(out.contact_diagnostics.nis)) / cfg.dof
         applied = float(jnp.mean(out.contact_diagnostics.applied))
-        return dict(vel_rmse=rmse, vel_nees=nees, nis_over_dof=nis, applied=applied)
+        return dict(vel_rmse=rmse, vel_nees=nees_world, vel_nees_tangent=nees_tangent,
+                    vel_nees_x=float(nees_axis[0]), vel_nees_y=float(nees_axis[1]),
+                    vel_nees_z=float(nees_axis[2]),
+                    nis_over_dof=nis, applied=applied)
 
     baseline = run(inputs.contact_chol)
     L_c = cn_rollout.contact_factors(params, wins, eps)
@@ -277,11 +302,17 @@ def make_plots(hist, val_metrics, out):
     if val_metrics:
         names = [m["rollout"] for m in val_metrics]
         xb = np.arange(len(names))
-        fig, ax = plt.subplots(1, 3, figsize=(15, 4))
-        for j, (key, title, ref) in enumerate([
-                ("vel_rmse", "held-out body-frame velocity RMSE [m/s]", None),
-                ("vel_nees", "held-out velocity NEES (target 3)", 3.0),
-                ("nis_over_dof", "held-out contact NIS/dof (target 1)", 1.0)]):
+        panels = [
+            ("vel_rmse", "held-out body-frame velocity RMSE [m/s]", None),
+            ("vel_nees", "held-out world velocity NEES, 3-DoF (target 3)", 3.0),
+            ("nis_over_dof", "held-out contact NIS/dof (target 1)", 1.0),
+            ("vel_nees_x", "world velocity NEES, x (target 1)", 1.0),
+            ("vel_nees_y", "world velocity NEES, y (target 1)", 1.0),
+            ("vel_nees_z", "world velocity NEES, z (target 1)", 1.0),
+        ]
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        ax = axes.ravel()
+        for j, (key, title, ref) in enumerate(panels):
             base = [m["baseline"][key] for m in val_metrics]
             learned = [m["learned"][key] for m in val_metrics]
             ax[j].bar(xb - 0.2, base, 0.4, label="analytic baseline")
