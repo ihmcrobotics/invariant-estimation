@@ -75,6 +75,7 @@ class IMUNoise:
     encoder_std: float = 2.0e-4       # [rad]
     encoder_vel_std: float = 5.0e-3   # [rad/s]
     gyro_bias_std: float = 1.0e-2     # [rad/s] one draw per IMU, then constant
+    torque_std: float = 5.0e-1        # [N.m] not hardware-grounded; ~1% standing knee torque
     seed: int = 0
     _rng: np.random.Generator = field(init=False, repr=False)
     _bias: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -100,6 +101,9 @@ class IMUNoise:
 
     def corrupt_velocities(self, qd: np.ndarray) -> np.ndarray:
         return qd + self.encoder_vel_std * self._rng.standard_normal(qd.shape)
+
+    def corrupt_torques(self, tau: np.ndarray) -> np.ndarray:
+        return tau + self.torque_std * self._rng.standard_normal(tau.shape)
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +249,10 @@ class SimSensorReader:
         # Only read when the estimator was built with `contact_fk_unfiltered`; an empty array
         # otherwise, which is the "field absent" encoding `FusedSensors` expects.
         q_u = (d.qpos[self.unf_qadr].copy() if self.fused.n_aux else np.zeros(0))
+        # ContactNet feature channel only -- the estimator never reads it. `qfrc_actuator` is in
+        # GENERALISED coords, so it indexes by dofadr and lines up with the encoder ordering.
+        # Ordered concat(filtered, unfiltered), matching how the contact FK widens q̂.
+        tau = d.qfrc_actuator[np.concatenate([self.enc_dofadr, self.unf_dofadr])].copy()
         if self.noise is not None:
             gyros = self.noise.corrupt_gyros(gyros)
             accel = self.noise.corrupt_accel(accel)
@@ -252,6 +260,7 @@ class SimSensorReader:
             enc_vel = self.noise.corrupt_velocities(enc_vel)
             qd_u = self.noise.corrupt_velocities(qd_u)
             q_u = self.noise.corrupt_encoders(q_u)
+            tau = self.noise.corrupt_torques(tau)
 
         trusted = self.trust.update(self.foot_loads(d))
         # The InEKF has NO contact mask: contact condition rides ENTIRELY in
@@ -267,6 +276,7 @@ class SimSensorReader:
             contact=trusted,
             contact_chol=chol * np.tile(np.eye(3), (len(self.foot_gids), 1, 1)),
             q_unfiltered=q_u,
+            torques=tau,
         )
 
     # -- ground truth --------------------------------------------------------

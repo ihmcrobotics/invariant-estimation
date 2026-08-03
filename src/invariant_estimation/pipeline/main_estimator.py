@@ -294,6 +294,7 @@ class FusedSensors(NamedTuple):
     contact_chol: Array
     q_unfiltered: Array = ()
     encoders_vel: Array = ()
+    torques: Array = ()             # (n + n_u,) ContactNet feature channel only; concat(filtered, unfiltered)
 
 
 class FusedOutputs(NamedTuple):
