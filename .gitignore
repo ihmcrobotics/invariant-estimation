@@ -233,3 +233,6 @@ data/
 
 # Ignore MuJoCo logs
 MUJOCO_LOG.TXT
+
+#reports should stay local on machine, not get pushed (this is really just for me (Lucas) to use)
+.claude-reports 
