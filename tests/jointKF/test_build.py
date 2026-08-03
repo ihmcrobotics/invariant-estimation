@@ -106,7 +106,6 @@ def test_pair_velocity_masks_are_disjoint_for_a_shared_imu_star():
 # ---------------------------------------------------------------------------
 
 def test_self_pair_is_rejected():
-    tree = serial_chain(6)
     with pytest.raises(ValueError, match="self-pair"):
         check_pair_graph([(0, 0)], 2, [2, 6])
 

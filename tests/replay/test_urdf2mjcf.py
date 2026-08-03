@@ -57,7 +57,8 @@ def urdf_fk(urdf_xml: str, q: dict[str, float]) -> dict[str, tuple[np.ndarray, n
         p, c = j.find("parent").get("link"), j.find("child").get("link")
         children.setdefault(p, []).append(j)
         child_links.add(c)
-    base = [l.get("name") for l in root.findall("link") if l.get("name") not in child_links][0]
+    base = [lk.get("name") for lk in root.findall("link")
+            if lk.get("name") not in child_links][0]
 
     out = {base: (np.zeros(3), np.eye(3))}
     stack = [base]
@@ -131,9 +132,9 @@ def test_total_mass_matches_the_urdf(urdf_text, model_spec):
     """Mass is conserved through the conversion, including the massless frames."""
     root = ET.fromstring(urdf_text)
     expected = sum(
-        float(l.find("inertial").find("mass").get("value"))
-        for l in root.findall("link")
-        if l.find("inertial") is not None
+        float(lk.find("inertial").find("mass").get("value"))
+        for lk in root.findall("link")
+        if lk.find("inertial") is not None
     )
     m = mujoco.MjModel.from_xml_string(model_spec.mjcf)
     assert m.body_mass.sum() == pytest.approx(expected, abs=1e-9)

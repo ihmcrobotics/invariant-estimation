@@ -300,8 +300,8 @@ def build_stacked(
     R_rel = jnp.asarray(R_rel, dtype=jnp.float64)
     gyros = jnp.asarray(gyros, dtype=jnp.float64)
 
-    n, m, P, K = build.n_joints, build.n_imus, build.n_pairs, build.n_anchors
-    dim, rows = build.dim, build.n_stacked_rows
+    n, P, K = build.n_joints, build.n_pairs, build.n_anchors
+    dim = build.dim
 
     # -- pair rows ----------------------------------------------------------
     # S_ab is applied again here even though the model already masks: it is a
@@ -319,11 +319,12 @@ def build_stacked(
     parent, child = jnp.asarray(build.pair_parent), jnp.asarray(build.pair_child)
     z_pair = (gyros[child] - jnp.einsum("eij,ej->ei", R_rel, gyros[parent])).reshape(3 * P)
 
-    # The exact congruence. Written as one triple product on purpose: assembling
-    # it per pair loses the shared-IMU cross-covariance, and on isotropic noise
-    # the two agree to 1e-20, so no test on a single pair would ever notice.
+    # The per-IMU gyro noise the congruence runs on. There is deliberately NO
+    # per-pair `L_pair Sigma L_pairᵀ` here: the congruence is taken once over the
+    # whole stacked `L` at the end of this function, because assembling it per pair
+    # loses the shared-IMU cross-covariance -- and on isotropic noise the two agree
+    # to 1e-20, so no test on a single pair would ever notice the difference.
     Sigma = _block_diag_sigma(jnp.asarray(build.gyro_sigma, dtype=jnp.float64))
-    R_pair = L_pair @ Sigma @ L_pair.T
 
     # -- anchor rows: fixed shape, masked, never reshaped -------------------
     if anchor is None:
