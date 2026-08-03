@@ -313,6 +313,12 @@ class FusedOutputs(NamedTuple):
     bias: Array                  # (3m,)  per-IMU gyro bias
     jkf: jkf.TickDiagnostics
     inekf: inf.InEKFOutputs
+    inekf_inputs: inf.InEKFInputs
+    """The boundary `_boundary` handed the InEKF this tick -- emitted, not rebuilt.
+    A caller cannot rebuild it: sigma_q comes off jkf_carry.state.P[:n,:n], which
+    run_fused does not otherwise expose. The consumer is ContactNet's data
+    collection: this is exactly contactnet.rollout.Segment.inputs. The joint KF is
+    strictly upstream of ContactNet, so these are frozen per rollout, never in BPTT."""
 
 
 # ---------------------------------------------------------------------------
@@ -626,6 +632,7 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
             R=inekf_out.state.R, v=inekf_out.state.v, p=inekf_out.state.p,
             q=q_hat, q_dot=qd_hat, bias=bias,
             jkf=jkf_diag, inekf=inekf_out,
+            inekf_inputs=inekf_inputs,
         )
         return (jkf_carry, inekf_carry), outputs
 
