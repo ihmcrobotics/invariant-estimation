@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
+from jax.typing import ArrayLike
 
 from ..config import load_config
 from ..inEKF import ekf as inekf_mod
@@ -248,15 +249,15 @@ class FusedSensors(NamedTuple):
     """
 
     #TODO: the encoders are not just the unfiltered joints, we use the entire robot as an input. This is pure sensors, so it shouldn't matter which ones we use.
-    encoders: Array
-    gyros: Array
-    accel_base: Array
-    qd_unfiltered: Array
-    contact: Array
-    contact_chol: Array
-    q_unfiltered: Array = ()
-    encoders_vel: Array = ()
-    torques: Array = ()             # (n + n_u,) ContactNet feature channel only; concat(filtered, unfiltered)
+    encoders: ArrayLike
+    gyros: ArrayLike
+    accel_base: ArrayLike
+    qd_unfiltered: ArrayLike
+    contact: ArrayLike
+    contact_chol: ArrayLike
+    q_unfiltered: ArrayLike = ()
+    encoders_vel: ArrayLike = ()
+    torques: ArrayLike = ()             # (n + n_u,) ContactNet feature channel only; concat(filtered, unfiltered)
 
 
 class FusedOutputs(NamedTuple):

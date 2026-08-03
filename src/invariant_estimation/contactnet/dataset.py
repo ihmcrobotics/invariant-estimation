@@ -381,9 +381,9 @@ class ChainedBatcher:
 
     def _needs_reseed(self, c: _Chain, carry) -> bool:
         p = self.preps[c.rollout]
-        if c.t + self.cfg.L > p.t_hi:
+        if c.t + self.cfg.L > p.t_hi: # if rollout is over by high threshold
             return True
-        if c.ticks >= self.cfg.episode_ticks:
+        if c.ticks >= self.cfg.episode_ticks: # same thing, just with ticks
             return True
         # A diverged chain never recovers and would poison every later step.
         return not bool(jnp.all(jnp.isfinite(carry.state.P))

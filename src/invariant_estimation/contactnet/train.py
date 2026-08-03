@@ -19,12 +19,14 @@ class Metrics(NamedTuple):
                       a calibrated filter sits at 1.0.
     applied_frac   -- fraction of ticks whose update passed the cond(S) gate.
     cond_proxy_max -- worst conditioning proxy in the batch, against cond_max.
+    skipped        -- fraction of ticks whose update was skipped due to NaN or Inf.
     """
     loss: Array
     grad_norm: Array
     nis_over_dof: Array
     applied_frac: Array
     cond_proxy_max: Array
+    skipped: Array
 
 
 def decay_mask(params: ContactNetParams):
@@ -58,6 +60,8 @@ def make_train_step(batch_loss, tx, dof: int):
         (loss, aux), grads = jax.value_and_grad(batch_loss, has_aux=True)(
             params, batch, carry0)
         grad_norm = optax.global_norm(grads)
+        grads = jax.tree.map(lambda g: jnp.where(jnp.isfinite(grad_norm), g, 0.0), grads)
+        skipped = jnp.where(jnp.isfinite(grad_norm), 0.0, 1.0)
         updates, opt_state = tx.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
 
@@ -68,7 +72,8 @@ def make_train_step(batch_loss, tx, dof: int):
             grad_norm=grad_norm,
             nis_over_dof=jnp.mean(d.nis) / dof,
             applied_frac=jnp.mean(d.applied),
-            cond_proxy_max=jnp.max(d.condition_proxy)
+            cond_proxy_max=jnp.max(d.condition_proxy),
+            skipped=skipped
         )
         return params, opt_state, metrics, carry
     return train_step
