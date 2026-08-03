@@ -20,7 +20,7 @@ sys.path.insert(0, str(REPO))
 
 import run_policy as rp
 rp.DT = 0.001
-rp.DECIMATION = 20
+rp.DECIMATION = 20 # for the policy, NOT for the estimator framework. (Policies trained at 50Hz)
 
 import numpy as np
 import jax
