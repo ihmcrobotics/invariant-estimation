@@ -8,11 +8,16 @@ analytic-heuristic contact_chol baseline (the recorded stance/swing factors).
 
 Usage:
     uv run python scripts/run_contactnet.py --collect --steps 300 --seconds 45
+
+Artifacts go to results/<YYYY-MM-DD_HH-MM-SS>[_tag]/ (one directory per run, with
+results/latest symlinked at the newest); --tag names a run, --out-dir overrides.
 """
 import argparse
 import json
+import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -33,8 +38,42 @@ from invariant_estimation.contactnet import (
 from invariant_estimation.contactnet.config import ContactNetConfig
 from invariant_estimation.inEKF.filter import init_carry, make_step
 
-RESULTS = REPO / "results"
-RESULTS.mkdir(exist_ok=True)
+RESULTS_ROOT = REPO / "results"
+
+
+def make_run_dir(root, tag=None, explicit=None):
+    """results/<YYYY-MM-DD_HH-MM-SS>[_tag]/ — one directory per run, sorted by date.
+
+    `explicit` (--out-dir) overrides the naming entirely. A `results/latest`
+    symlink is repointed at the new directory so downstream tooling has a stable
+    path to the most recent run.
+    """
+    if explicit is not None:
+        run_dir = Path(explicit)
+        if not run_dir.is_absolute():
+            run_dir = REPO / run_dir
+    else:
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        run_dir = root / (f"{stamp}_{tag}" if tag else stamp)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    link = root / "latest"
+    try:
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(run_dir.resolve().relative_to(root.resolve()), target_is_directory=True)
+    except (OSError, ValueError):
+        pass  # non-POSIX fs, or --out-dir outside results/: the run dir still stands
+    return run_dir
+
+
+def git_commit():
+    try:
+        out = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+        return out.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
 
 
 def collect_rollouts(c, seeds, seconds):
@@ -116,9 +155,16 @@ def main():
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--warmup-steps", type=int, default=50)
     ap.add_argument("--time-budget-s", type=float, default=3600.0)
+    ap.add_argument("--tag", type=str, default=None,
+                    help="suffix appended to the timestamped run directory name")
+    ap.add_argument("--out-dir", type=str, default=None,
+                    help="write artifacts here instead of results/<timestamp>/")
     args = ap.parse_args()
 
     t_start = time.time()
+    started_at = datetime.now().isoformat(timespec="seconds")
+    out = make_run_dir(RESULTS_ROOT, tag=args.tag, explicit=args.out_dir)
+    print(f"== run directory: {out} ==")
     c = collect.build_collector(policy_name="baseline", chunk_ticks=10_000)
 
     if args.collect:
@@ -138,7 +184,7 @@ def main():
     print("== fitting normalization (train, walking set) ==")
     norm = dataset.fit_normalization(train_paths, source="overnight train set")
     print(f"  floored channels: {list(norm.floored)}")
-    save_norm(norm, RESULTS / "norm_constants.npz")
+    save_norm(norm, out / "norm_constants.npz")
 
     cfg = ContactNetConfig()
     print(f"  cfg: F={cfg.F} d_in={cfg.d_in} H={cfg.H} stride={cfg.stride} "
@@ -150,7 +196,7 @@ def main():
 
     print("== measuring P0 ==")
     P0 = dataset.measure_p0(c.fused, train_preps[0], cfg, ticks=3000)
-    np.save(RESULTS / "P0.npy", P0)
+    np.save(out / "P0.npy", P0)
 
     print("== building network + batcher ==")
     params = network.init(jax.random.PRNGKey(0), cfg.d_in, cfg.widths, cfg.sigma_0, cfg.eps)
@@ -181,9 +227,9 @@ def main():
             print(f"  time budget hit at step {i}; stopping.")
             break
 
-    cn_train.save_params(str(RESULTS / "params.npz"), params)
+    cn_train.save_params(str(out / "params.npz"), params)
     hist = np.array(history)
-    np.save(RESULTS / "history.npy", hist)
+    np.save(out / "history.npy", hist)
 
     print("== validating on held-out ==")
     val_metrics = []
@@ -194,6 +240,8 @@ def main():
         val_metrics.append({"rollout": vp.name, "baseline": base, "learned": learned})
 
     summary = {
+        "run": {"dir": out.name, "started_at": started_at, "tag": args.tag,
+                "git_commit": git_commit(), "args": vars(args)},
         "n_train": len(train_preps), "n_val": len(val_preps),
         "steps_run": len(history), "final_reseeds": reseeds,
         "floored": list(norm.floored),
@@ -206,13 +254,13 @@ def main():
         "loss_first": history[0][0] if history else None,
         "loss_last": history[-1][0] if history else None,
     }
-    (RESULTS / "summary.json").write_text(json.dumps(summary, indent=2))
+    (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print("== summary ==")
     print(json.dumps(summary, indent=2))
-    make_plots(hist, val_metrics)
+    make_plots(hist, val_metrics, out)
 
 
-def make_plots(hist, val_metrics):
+def make_plots(hist, val_metrics, out):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -224,7 +272,7 @@ def make_plots(hist, val_metrics):
         ax[1].plot(hist[:, 2]); ax[1].axhline(1.0, ls="--", c="k", lw=0.8)
         ax[1].set_title("contact NIS / dof"); ax[1].set_xlabel("step")
         ax[2].plot(hist[:, 4]); ax[2].set_title("cumulative reseeds"); ax[2].set_xlabel("step")
-        fig.tight_layout(); fig.savefig(RESULTS / "training.png", dpi=110); plt.close(fig)
+        fig.tight_layout(); fig.savefig(out / "training.png", dpi=110); plt.close(fig)
 
     if val_metrics:
         names = [m["rollout"] for m in val_metrics]
@@ -242,8 +290,8 @@ def make_plots(hist, val_metrics):
                 ax[j].axhline(ref, ls="--", c="k", lw=0.8)
             ax[j].set_title(title); ax[j].set_xticks(xb); ax[j].set_xticklabels(names)
             ax[j].legend()
-        fig.tight_layout(); fig.savefig(RESULTS / "validation.png", dpi=110); plt.close(fig)
-    print(f"  plots -> {RESULTS}/training.png, {RESULTS}/validation.png")
+        fig.tight_layout(); fig.savefig(out / "validation.png", dpi=110); plt.close(fig)
+    print(f"  plots -> {out}/training.png, {out}/validation.png")
 
 
 if __name__ == "__main__":

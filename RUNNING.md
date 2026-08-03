@@ -140,10 +140,18 @@ RMSE**, velocity **NEES** (target 3), and **contact NIS/dof** (target 1).
 | path | what |
 |---|---|
 | `data/flat_seed*.npz` + `data/cache/*_feat.npz` | collected rollouts (~100 MB each) and F=30 feature caches — **gitignored** |
-| `results/summary.json` | the run's config + held-out metrics (baseline vs learned) |
-| `results/{training,validation}.png` | loss / NIS / reseed curves; held-out RMSE / NEES / NIS bars |
-| `results/params.npz`, `results/norm_constants.npz` | trained weights and the **frozen** normalization pair (load them together — a mismatch silently shifts the input distribution) |
+| `results/<YYYY-MM-DD_HH-MM-SS>[_tag]/` | **one directory per run** — every artifact below lands here, so runs never overwrite each other |
+| `results/latest` | symlink repointed at the most recent run directory |
+| `…/summary.json` | the run's config + held-out metrics (baseline vs learned), plus a `run` block (timestamp, git commit, full argv) identifying the run |
+| `…/{training,validation}.png` | loss / NIS / reseed curves; held-out RMSE / NEES / NIS bars |
+| `…/params.npz`, `…/norm_constants.npz` | trained weights and the **frozen** normalization pair (load them together — a mismatch silently shifts the input distribution) |
 | `RESULTS.md` | the written-up validation numbers + caveats (hand-authored, not emitted by the script) |
+
+Name a run with `--tag baseline-redo` (appended to the timestamp) or bypass the
+naming entirely with `--out-dir path/to/dir`. The validated run written up in
+`RESULTS.md` lives in `results/2026-08-03_11-45-30_coco-faithful-f30/` — it
+predates this layout and was moved into it by hand, so its `summary.json` has no
+`run` block.
 
 Last validated run (flat ground, seeds 0–3 train / 4–5 held out): velocity RMSE
 **0.086 → 0.028 m/s**, NEES **19.4 → 1.05** vs the analytic `contact_chol`

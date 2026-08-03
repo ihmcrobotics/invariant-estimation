@@ -8,6 +8,8 @@ held-out validation number vs the analytic-heuristic `contact_chol` baseline.
 All numbers below are from THIS run; log/artifact paths are given. Nothing here is
 projected — a metric with no log path did not run.
 
+Run artifacts: `results/2026-08-03_11-45-30_coco-faithful-f30/`, written `<run>/` below.
+
 ---
 
 ## Executive summary
@@ -24,13 +26,13 @@ projected — a metric with no log path did not run.
 - **Data pipeline: works end-to-end** (collect → save/load → channel cache → fit
   normalization → prepare → measure_p0), 1 kHz regime, `floored=[]` on a walking set.
 - **Training run: COMPLETE.** 300 steps, loss `0.0815 → 0.000958`, final
-  `reseeds=91`, `floored=[]`, wall ~2883 s (`results/summary.json`,
-  `results/training.png`).
+  `reseeds=91`, `floored=[]`, wall ~2883 s (`<run>/summary.json`,
+  `<run>/training.png`).
 - **Held-out validation (learned vs analytic baseline, 2 disjoint held-out flat
   rollouts): learned body-frame velocity RMSE 0.0283 m/s vs analytic 0.0857 m/s —
   a ~3× (≈67%) reduction.** Velocity NEES (target 3): learned ≈1.05 vs baseline
   ≈19.4. Contact NIS/dof (target 1): learned ≈0.026 vs baseline ≈0.065. Both
-  held-out rollouts agree to 3 significant figures (`results/validation.png`).
+  held-out rollouts agree to 3 significant figures (`<run>/validation.png`).
   **Scope: flat terrain only — see caveats.**
 
 ---
@@ -135,22 +137,22 @@ in `_sensors`. The property the gate exists for is verified at F=30 above.
 ## Training run
 
 - Config: F=30, d_in=600, H=20, stride=1, L=128, B=32, objective=l2_velocity,
-  episode_s=43, warm_in_s=1.0, peak_lr=1e-4 (`results/summary.json` `cfg`).
+  episode_s=43, warm_in_s=1.0, peak_lr=1e-4 (`<run>/summary.json` `cfg`).
 - Data: 4 train rollouts (flat, seeds 0–3) + 2 held-out (seeds 4–5), each 45 s at
   1 kHz → T=47000, 30854 legal segment starts each; ~123k usable train ticks after
   the 16 s joint-KF warm-up.
 - 300 steps, wall ~2883 s (CPU, MJX; `time-budget-s 3000` not hit).
 - Training loss (l2_velocity MSE): **0.0815 → 0.000958** (`loss_first`/`loss_last`).
-- Final cumulative **reseeds = 91** over 300 steps (`results/training.png`, panel 3).
+- Final cumulative **reseeds = 91** over 300 steps (`<run>/training.png`, panel 3).
 - `floored=[]` — normalization floored no channel on the walking calibration set.
-- Loss curve, contact NIS/dof, and cumulative reseeds: `results/training.png`.
+- Loss curve, contact NIS/dof, and cumulative reseeds: `<run>/training.png`.
 
 ## Held-out validation (learned Σ_C vs analytic-heuristic contact_chol)
 
 Two held-out flat rollouts (seeds 4, 5) NOT in the training set. Filter seeded from
 truth at `t_lo`, run over the full ~29 k-tick usable region under (a) the recorded
 analytic stance/swing `contact_chol` [baseline] and (b) the learned network Σ_C.
-`results/validation.png`, `results/summary.json` `val`.
+`<run>/validation.png`, `<run>/summary.json` `val`.
 
 | metric (target)              | analytic baseline | learned  | seed4 / seed5 |
 |------------------------------|-------------------|----------|---------------|
