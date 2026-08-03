@@ -20,6 +20,7 @@ dependencies = [
   # run_policy.py runs the exported RL policies (assets/rl_models/*.onnx) on CPU. Not used by the
   # estimator itself, but a hard requirement of the sim entry point, so it stays a main dependency.
   "onnxruntime>=1.20",
+  "optax>=0.2.8",
 ]
 
 [project.optional-dependencies]
