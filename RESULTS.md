@@ -23,8 +23,15 @@ projected — a metric with no log path did not run.
   editable per the rules; the property it guards is verified independently above.
 - **Data pipeline: works end-to-end** (collect → save/load → channel cache → fit
   normalization → prepare → measure_p0), 1 kHz regime, `floored=[]` on a walking set.
-- **Training run: <FILL>.**
-- **Held-out validation (learned vs analytic baseline): <FILL>.**
+- **Training run: COMPLETE.** 300 steps, loss `0.0815 → 0.000958`, final
+  `reseeds=91`, `floored=[]`, wall ~2883 s (`results/summary.json`,
+  `results/training.png`).
+- **Held-out validation (learned vs analytic baseline, 2 disjoint held-out flat
+  rollouts): learned body-frame velocity RMSE 0.0283 m/s vs analytic 0.0857 m/s —
+  a ~3× (≈67%) reduction.** Velocity NEES (target 3): learned ≈1.05 vs baseline
+  ≈19.4. Contact NIS/dof (target 1): learned ≈0.026 vs baseline ≈0.065. Both
+  held-out rollouts agree to 3 significant figures (`results/validation.png`).
+  **Scope: flat terrain only — see caveats.**
 
 ---
 
@@ -108,7 +115,13 @@ in `_sensors`. The property the gate exists for is verified at F=30 above.
   it flags take-two's *own prior* test edits; against the true branch cut
   `8052c02`, `git diff --name-only 8052c02 -- tests/` is **empty** (this branch
   touched no tracked test). Left as-is per instruction ("never edit a check").
-- check 2 (contact_meas_chol zero): **PASS**.
+- check 2 (contact_meas_chol zero): **false-positive** — the only match is a
+  *docstring* line in `dataset.measure_p0` that correctly STATES the invariant
+  ("contact_meas_chol stays zero", prose, not an assignment; identical to the
+  reference dataset.py). The invariant holds structurally: take-two's `InEKFInputs`
+  has **no `contact_meas_chol` field at all**, so it cannot be set non-zero
+  anywhere. Verified: `grep -rn contact_meas_chol src/.../{pipeline,contactnet}`
+  filtered of `zeros`/`#` returns only that one docstring line.
 - check 3 (no filter state in features/online): false-positive on `state.prev_p`/
   `state.n`/`state.buf` — the `OnlineState` ring buffer (sensor-history only,
   §7-legal), identical to the reference online.py. Genuine leakage grep (InEKF
@@ -121,29 +134,97 @@ in `_sensors`. The property the gate exists for is verified at F=30 above.
 
 ## Training run
 
-<FILL: steps run, wall clock, loss first→last, final NIS/dof, reseeds rate,
-log path results/summary.json, plot results/training.png>
+- Config: F=30, d_in=600, H=20, stride=1, L=128, B=32, objective=l2_velocity,
+  episode_s=43, warm_in_s=1.0, peak_lr=1e-4 (`results/summary.json` `cfg`).
+- Data: 4 train rollouts (flat, seeds 0–3) + 2 held-out (seeds 4–5), each 45 s at
+  1 kHz → T=47000, 30854 legal segment starts each; ~123k usable train ticks after
+  the 16 s joint-KF warm-up.
+- 300 steps, wall ~2883 s (CPU, MJX; `time-budget-s 3000` not hit).
+- Training loss (l2_velocity MSE): **0.0815 → 0.000958** (`loss_first`/`loss_last`).
+- Final cumulative **reseeds = 91** over 300 steps (`results/training.png`, panel 3).
+- `floored=[]` — normalization floored no channel on the walking calibration set.
+- Loss curve, contact NIS/dof, and cumulative reseeds: `results/training.png`.
 
 ## Held-out validation (learned Σ_C vs analytic-heuristic contact_chol)
 
-<FILL: per held-out rollout — body-frame velocity RMSE learned vs baseline,
-velocity NEES (target 3), contact NIS/dof (target 1). plot results/validation.png>
+Two held-out flat rollouts (seeds 4, 5) NOT in the training set. Filter seeded from
+truth at `t_lo`, run over the full ~29 k-tick usable region under (a) the recorded
+analytic stance/swing `contact_chol` [baseline] and (b) the learned network Σ_C.
+`results/validation.png`, `results/summary.json` `val`.
+
+| metric (target)              | analytic baseline | learned  | seed4 / seed5 |
+|------------------------------|-------------------|----------|---------------|
+| body-frame velocity RMSE m/s | 0.0857            | 0.0283   | 0.08566/0.08579 base; 0.02830/0.02833 learned |
+| velocity NEES (→ 3)          | 19.35             | 1.05     | 19.353/19.363 base; 1.0547/1.0508 learned |
+| contact NIS/dof (→ 1)        | 0.0654            | 0.0261   | 0.06536/0.06551 base; 0.02615/0.02600 learned |
+| update applied frac          | 1.00              | 1.00     | |
+
+**Headline: learned Σ_C cuts held-out body-frame velocity RMSE ~3× (0.0857→0.0283
+m/s, ≈67%) vs the analytic baseline on flat ground, and moves velocity NEES from
+severely overconfident (19.4) to mildly conservative (1.05, target 3).**
 
 ---
 
-## Deliberate choices, with reasons
+## Caveats — read before quoting the number
 
-- **1 kHz collection** — coherence with `dt=1e-3` / `warmup_ticks=16000` / filter
-  config dt (all 1 kHz); CONTROL_DT unchanged so policy behaviour is identical.
-- **Normalization fit on the walking (train) rollouts, post-warmup region** —
-  `dataset.fit_normalization(usable_only=True)`; `floored=[]` confirms no
-  walking-active channel was floored (the failure mode the plan flagged).
-- **`objective="l2_velocity"`** — CoCo Eq. 9, the process-socket run-1 objective.
-- **episode_s** — <FILL with the value used and why, tied to rollout length>.
+a. **Flat terrain only.** The flat-only `collect.py` port dropped terrain
+   heightfields and domain randomisation. All 6 rollouts are flat ground, varied
+   only by spawn yaw / IMU-noise seed / (constant) forward command. Cross-condition
+   (terrain × friction × disturbance) generalisation is **UNTESTED**. The claim is
+   "**beats the analytic baseline on held-out flat rollouts**," NOT "beats CoCo
+   across conditions."
+b. **Velocity NEES: learned 1.05 vs target 3 = mildly CONSERVATIVE (slightly
+   under-confident velocity covariance); baseline 19.4 = severely OVERCONFIDENT.**
+   The learned filter is close to but under the χ²(3) mean, so it errs on the safe
+   side; the analytic filter's covariance is ~6× too tight in velocity.
+c. **Contact NIS/dof is under-confident for BOTH** (learned 0.026, baseline 0.065,
+   target 1). The stacked contact-channel innovation covariance looks inflated
+   relative to the realised residuals — i.e. both filters trust the contact update
+   less than they should. Flagged as a follow-up (likely the contact `N=J Σ_q Jᵀ`
+   scale or the learned Σ_C absolute scale; l2_velocity only constrains Σ ratios,
+   `losses.l2_velocity` docstring, so absolute NIS calibration is expected to need
+   β-NLL). Not buried: it is the clearest open item.
+d. **Only 300 steps.** `reseeds` climbs ~linearly to 91 over 300 steps, consistent
+   with chains hitting rollout-end / episode boundaries (episode_s=43 exceeds the
+   ~29 s usable region, so chains reseed at rollout end) rather than obviously
+   diverging — but divergence is **not proven absent**; a longer run with a
+   held-out RMSE plateau criterion is the proper stop.
+e. **G1 `test_online.py` still RED by construction** (stale F=24 gate); left
+   untouched per the rules (see the gate section above).
+
+## Deliberate choices, one-line why each
+
+- **1 kHz collection** — the ContactNet stack constants (`config.dt=1e-3`,
+  `WARMUP_TICKS=16000` in `sim/collect.py`, the window f99 bandwidths in
+  `config.py`'s `window_span_s` docstring, and the InEKF/jointKF `dt=1.0e-3` in
+  CLAUDE.md §2b) are all 1 kHz; `rp.DT=0.001, DECIMATION=20` keeps CONTROL_DT=0.02
+  so the policy behaves identically. take-two's default 200 Hz would desync all four.
+- **Moving-mean normalization set** — `dataset.fit_normalization(usable_only=True)`
+  pools the post-warm-up (walking) region; observed `floored=[]` confirms no
+  walking-active channel was mis-scaled (the standing-set failure the plan flagged).
+- **H=20, stride=1** — CoCo Table VI history-size point + full sensor bandwidth
+  (`config.py` `window_span_s`/`stride` docstrings: accel f99 155.6 Hz, gyro 53.9 Hz
+  would alias at stride>1); verified bit-exact online↔offline at F=30.
+- **300 steps** — wall-clock / time-budget bound on CPU MJX, not a convergence
+  claim; CoCo's E=1280/I=100k are on-policy DAgger numbers that do not transfer
+  (contactnet_taketwo.md §4.3). Stop was the step cap, not a measured RMSE plateau.
+- **flat-only collection** — the terrain/DR port was out of the overnight scope
+  (contactnet_taketwo.md "Explicitly out of scope"); breadth was traded for a
+  completed, validated run per the stated priority.
 
 ## Env postmortem
 
-<FILL one paragraph>
+Root cause of the only environment friction: `take-two` shipped without two runtime
+deps the ContactNet path needs — `optax` (train optimizer) and `matplotlib` (plots)
+— and with `warp`/`mujoco_warp` absent. `optax` and `matplotlib` were added via
+`uv add` (owned end-to-end, no user input). `warp` is the GPU/`mujoco_warp` backend;
+its "Failed to import warp" message is a soft warning — MJX falls back to the CPU
+XLA path, which ran the full fused estimator and BPTT correctly (jaxlib is CPU-only
+here; the "NVIDIA GPU … CUDA jaxlib not installed" line is likewise benign). float64
+held throughout (`invariant_estimation` flips `jax_enable_x64` at import; the
+dataset/collect `_assert_float64` guards passed). No dtype, OOM, or compile failures;
+the chunked fused pass (`_run_fused_chunked`) kept RSS bounded on the 47 k-tick
+rollouts.
 
 ## Suggested follow-ups (kept out of this diff)
 - Fix the stale `test_online.py` gate (`2*J_SUB → 3*J_SUB`, populate `encoders_vel`).
