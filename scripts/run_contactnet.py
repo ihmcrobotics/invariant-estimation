@@ -234,10 +234,10 @@ def make_plots(hist, val_metrics):
                 ("vel_rmse", "held-out body-frame velocity RMSE [m/s]", None),
                 ("vel_nees", "held-out velocity NEES (target 3)", 3.0),
                 ("nis_over_dof", "held-out contact NIS/dof (target 1)", 1.0)]):
-            b = [m["baseline"][key] for m in val_metrics]
-            l = [m["learned"][key] for m in val_metrics]
-            ax[j].bar(xb - 0.2, b, 0.4, label="analytic baseline")
-            ax[j].bar(xb + 0.2, l, 0.4, label="learned")
+            base = [m["baseline"][key] for m in val_metrics]
+            learned = [m["learned"][key] for m in val_metrics]
+            ax[j].bar(xb - 0.2, base, 0.4, label="analytic baseline")
+            ax[j].bar(xb + 0.2, learned, 0.4, label="learned")
             if ref is not None:
                 ax[j].axhline(ref, ls="--", c="k", lw=0.8)
             ax[j].set_title(title); ax[j].set_xticks(xb); ax[j].set_xticklabels(names)

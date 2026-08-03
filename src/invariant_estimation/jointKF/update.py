@@ -62,11 +62,12 @@ from typing import NamedTuple
 import jax.numpy as jnp
 from jax import Array
 from jax.scipy.linalg import cho_factor, cho_solve
+from jax.typing import ArrayLike
 
 from .state import JointKFParams, JointKFState
 
 
-def joseph_covariance(P: Array, K: Array, H: Array, R: Array) -> Array:
+def joseph_covariance(P: ArrayLike, K: ArrayLike, H: ArrayLike, R: ArrayLike) -> Array:
     r"""``P⁺ = (I − KH) P (I − KH)ᵀ + K R Kᵀ``, symmetrised.
 
     Exposed as its own function because it is the only part of the update that is
@@ -90,6 +91,7 @@ def joseph_covariance(P: Array, K: Array, H: Array, R: Array) -> Array:
     -------
     Array, shape (dim, dim)
     """
+    P, K, H, R = (jnp.asarray(a) for a in (P, K, H, R))
     IKH = jnp.eye(P.shape[0], dtype=P.dtype) - K @ H
     P_new = IKH @ P @ IKH.T + K @ R @ K.T
     return 0.5 * (P_new + P_new.T)
@@ -145,9 +147,9 @@ class UpdateInfo(NamedTuple):
 
 def joseph_update(
     state: JointKFState,
-    H: Array,
-    z: Array,
-    R: Array,
+    H: ArrayLike,
+    z: ArrayLike,
+    R: ArrayLike,
     params: JointKFParams,
     label: str | None = None,
 ) -> tuple[JointKFState, UpdateInfo]:
@@ -190,6 +192,12 @@ def joseph_update(
     info : UpdateInfo
     """
     del label  # host-side attribution only; see the docstring.
+
+    # numpy in, jax out: the ported oracles build `H`/`z`/`R` with numpy on purpose (an
+    # independent path from the filter's own jax algebra is what makes them oracles).
+    # `asarray` without a dtype PRESERVES dtype, so this cannot launder a float32 leak
+    # into float64 -- I8 still bites where it should.
+    H, z, R = jnp.asarray(H), jnp.asarray(z), jnp.asarray(R)
 
     x, P = state.x, state.P
     k = R.shape[0]

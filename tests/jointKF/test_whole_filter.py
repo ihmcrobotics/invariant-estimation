@@ -64,7 +64,7 @@ import pytest
 from invariant_estimation.jointKF import anchors as anchors_mod
 from invariant_estimation.jointKF.build import build_joint_kf
 from invariant_estimation.jointKF.filter import ModelInputs, SensorInputs, init_carry, step
-from invariant_estimation.jointKF.state import default_params
+from invariant_estimation.jointKF.state import JointKFBuild, JointKFParams, default_params
 
 from . import _fixture as fx
 from ._fixture import kinematic_tree
@@ -112,8 +112,8 @@ class Scene(NamedTuple):
     """
 
     fixture: fx.ChainFixture
-    build: object
-    params: object
+    build: JointKFBuild
+    params: JointKFParams
     model: ModelInputs
 
 

@@ -97,6 +97,18 @@ def make_contact_channels(subchain, base_imu: int, kinematics, dt: float):
     subchain = jnp.asarray(subchain)
     n_c, j_sub = subchain.shape
     def contact_channels(sensors) -> Array:
+        # `FusedSensors` defaults its optional fields to `()` -- an EMPTY PYTREE, so an
+        # unpopulated field costs `lax.scan` no time axis (that is why the sentinel is a
+        # tuple and not `zeros(0)`). Every field below is mandatory for the channel set,
+        # so catch the sentinel here: reaching `jnp.concatenate` with it raises a
+        # `check_arraylike` TypeError from inside jax that names nothing useful.
+        unset = [f for f in ("encoders", "encoders_vel", "q_unfiltered", "qd_unfiltered",
+                             "torques") if isinstance(getattr(sensors, f), tuple)]
+        if unset:
+            raise ValueError(
+                f"FusedSensors {unset} still hold the `()` default; the contact channels "
+                f"need them populated (`qd_*` and `tau_*` are in `channel_names()`)."
+            )
         if sensors.q_unfiltered.shape[-1] == 0:
             raise ValueError("No unfiltered joints in the model; cannot compute contact channels")
         q_all = jnp.concatenate([sensors.encoders, sensors.q_unfiltered], axis=-1)

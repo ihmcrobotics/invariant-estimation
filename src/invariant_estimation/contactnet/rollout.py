@@ -53,7 +53,7 @@ def contact_factors(
     over_time = jax.vmap(over_contacts, in_axes=(None, 0, None))
     return over_time(params, flat, eps)
 
-def make_segment_loss(ekf, kinematics, eps, beta = 0.5, objective="beta_nll", remat=True):
+def make_segment_loss(ekf, kinematics, eps, beta = 0.5, objective="l2_velocity", remat=True):
     """Build the per-segment loss: ``(params, segment) -> (loss, (outputs, carry))``.
 
     A factory matching `make_step`: `ekf`, `kinematics` and the scalars are static
@@ -62,11 +62,30 @@ def make_segment_loss(ekf, kinematics, eps, beta = 0.5, objective="beta_nll", re
 
     ``objective`` is selected at build time, outside the traced region, so it puts
     no branch in the graph: run 1 reproduces CoCo-InEKF with ``l2_velocity``, run 2
-    onward uses ``beta_nll``.  ``remat`` wraps the scan body in `jax.checkpoint`
-    (``prevent_cse=False`` is the correct setting under `scan`).
+    onward is intended to use ``beta_nll`` -- which is NOT implemented yet, see
+    below.  ``remat`` wraps the scan body in `jax.checkpoint` (``prevent_cse=False``
+    is the correct setting under `scan`).
     """
     if objective not in ("beta_nll", "l2_velocity"):
         raise ValueError(f"Unknown objective {objective!r}")
+    if objective == "beta_nll":
+        # Two pieces are missing, and neither is a one-liner to guess at:
+        #   * the loss itself (`beta_nll_from_diagnostics`) does not exist in
+        #     `losses.py` -- only `l2_velocity` does;
+        #   * it needs `log det S` per tick, and `UpdateDiagnostics` publishes
+        #     `applied / nis / condition_proxy / correction_rotation_norm` only.
+        #     `S`'s Cholesky is already formed in `inEKF/correct.linear_update`,
+        #     so exposing `logdet_S` is cheap -- but it widens the diagnostics
+        #     seam that the ported tests read (CLAUDE.md §4), so it is a decision,
+        #     not a fix.
+        # Raised HERE, at build time, because the alternative is a `NameError`
+        # from inside a traced scan on whoever first sets `objective: beta_nll`
+        # in the training config -- which `contactnet/config.py` still accepts.
+        raise NotImplementedError(
+            "objective='beta_nll' is not implemented: `beta_nll_from_diagnostics` is "
+            "missing from contactnet/losses.py and `UpdateDiagnostics` does not publish "
+            "`logdet_S`. Use objective='l2_velocity'."
+        )
 
     step = make_step(ekf, kinematics)
     if remat:
@@ -88,15 +107,14 @@ def make_segment_loss(ekf, kinematics, eps, beta = 0.5, objective="beta_nll", re
         c0 = init_carry(segment.state0) if carry0 is None else carry0
         carry, outputs = jax.lax.scan(step, c0, inputs)
 
-        d = outputs.contact_diagnostics
-        if objective == "beta_nll":
-            per_tick = beta_nll_from_diagnostics(d.nis, d.logdet_S, beta)
-            loss = jnp.mean(per_tick) #NOTE: mean handled outside of beta-NLL, inside of L2.
-        else:
-            # Body-frame, each side by its OWN attitude -- see `l2_velocity`.
-            loss = l2_velocity(
-                outputs.state.v, outputs.state.R, segment.v_true, segment.R_true
-            )
+        # Only `l2_velocity` reaches here -- `beta_nll` is rejected at build time
+        # above. When it lands it belongs here, as a mean over per-tick terms
+        # (`l2_velocity` takes its own mean internally, beta-NLL would not).
+        #
+        # Body-frame, each side by its OWN attitude -- see `l2_velocity`.
+        loss = l2_velocity(
+            outputs.state.v, outputs.state.R, segment.v_true, segment.R_true
+        )
         return loss, (outputs, carry)
 
     return segment_loss

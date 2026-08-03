@@ -76,4 +76,15 @@ package-dir = { "" = "src"}
 where = ["src"]
 
 [tool.ruff.lint]
+# Pinned explicitly rather than inherited: ruff 0.16 widened its DEFAULT rule set from
+# 56 rules to 414, so an unpinned config reports 8 findings under the locked 0.15.22 and
+# 165 under a newer editor-bundled ruff. This is the pre-0.16 default, which is what the
+# `ignore` list below was written against.
+#
+# Widening is a deliberate decision, not a version-upgrade side effect. Checked once
+# against the 0.16 default (165 findings): all mechanical or false, nothing latent. The
+# 4 `B023` hits in `sim/collect.py` are the immediate-invocation false positive -- the
+# lambda closing over `lo` is handed to `jax.tree.map`, which calls it eagerly inside the
+# same iteration, so it never sees an advanced `lo`.
+select = ["E4", "E7", "E9", "F"]
 ignore = ["E401", "E402", "F401", "E702"]

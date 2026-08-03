@@ -110,6 +110,7 @@ from typing import NamedTuple
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
+from jax.typing import ArrayLike
 
 from .state import JointKFBuild, JointKFParams
 
@@ -204,12 +205,12 @@ def unfiltered_dof(build: JointKFBuild) -> np.ndarray:
 
 def anchor_jacobians(
     build: JointKFBuild,
-    J_ang_world: Array,
-    site_rot: Array,
+    J_ang_world: ArrayLike,
+    site_rot: ArrayLike,
     *,
     base_site: int,
-    foot_sites: Array,
-    dof_unfiltered: Array | None = None,
+    foot_sites: ArrayLike,
+    dof_unfiltered: ArrayLike | None = None,
 ) -> AnchorJacobians:
     r"""Split the base->foot angular Jacobian into its F and U parts.
 
@@ -275,9 +276,9 @@ def anchor_noise(
     build: JointKFBuild,
     params: JointKFParams,
     jac: AnchorJacobians,
-    trusted_feet: Array,
+    trusted_feet: ArrayLike,
     *,
-    sigma_eps: Array | None = None,
+    sigma_eps: ArrayLike | None = None,
 ) -> Array:
     r"""Per-anchor ``3x3`` measurement covariance, masked.
 
@@ -323,10 +324,10 @@ def anchor_block(
     params: JointKFParams,
     jac: AnchorJacobians,
     *,
-    gyro_base: Array,
-    qd_unfiltered: Array,
-    trusted_feet: Array,
-    sigma_eps: Array | None = None,
+    gyro_base: ArrayLike,
+    qd_unfiltered: ArrayLike,
+    trusted_feet: ArrayLike,
+    sigma_eps: ArrayLike | None = None,
 ) -> AnchorBlock:
     r"""Build the ``(H, z, R)`` anchor block — Java's anchor loop, fixed-shape.
 

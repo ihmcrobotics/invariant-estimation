@@ -1665,3 +1665,102 @@ precaution rather than a workaround, and `JAX_PLATFORMS=cuda uv run pytest` rema
 * The plan's note about re-recording `experiments/sim_runs/*.npz` after the ORT change was moot:
   that directory has never existed in the repo (it was an ad-hoc scratch path). The stale
   reference in `RUNNING.md` was removed instead.
+
+---
+
+## Lint + type-check baseline (2026-08-03)
+
+Repo-wide `ruff` / `pyright` sweep. Counts as measured with ruff 0.16.1 and pyright 1.1.411
+against `pyrightconfig.json` (default `typeCheckingMode`, no per-rule suppression).
+
+|                     | before | after |
+|---------------------|-------:|------:|
+| ruff (locked 0.15)  |      8 |     0 |
+| ruff (0.16 default) |    165 |     0 |
+| pyright             |   2469 |   194 |
+
+### Two version traps, not code problems
+
+* **84% of the pyright errors were in `typings/`** — stubgen output from `uv run gen-stubs`,
+  gitignored, never checked in. `mujoco_warp`'s warp-kernel annotations are not valid type
+  expressions, so the generated stubs carry ~2100 errors of their own. `pyrightconfig.json`
+  now `exclude`s the directory, which drops the diagnostics while leaving it on `stubPath` —
+  verified both ways: removing the stubs instead takes `run_policy.py` from 15 errors to 52.
+* **ruff 0.16 widened its default rule set from 56 rules to 414**, which is the entire
+  8-vs-165 gap: the locked 0.15.22 and an editor-bundled 0.16 disagree on the same tree.
+  `[tool.ruff.lint] select` is now pinned to the pre-0.16 default that the existing `ignore`
+  list was written against. The 0.16-only findings were read once before being pinned out;
+  all mechanical or false. In particular the 4 `B023` "closure over loop variable" hits in
+  `sim/collect.py` are the immediate-invocation false positive — the lambda goes to
+  `jax.tree.map`, which calls it eagerly in the same iteration.
+
+### `ArrayLike` on inputs, `Array` on outputs
+
+~200 of the real-code errors were one pattern: the ported oracles build `H`/`z`/`R`/`M` with
+**numpy** — deliberately, since an independent path from the filter's own jax algebra is what
+makes them oracles (CLAUDE.md §5) — and the filter seams were annotated `jax.Array`, which
+numpy arrays are not instances of.
+
+Resolved with JAX's own convention: **`jax.typing.ArrayLike` on function parameters, `Array` on
+returns**, plus a `jnp.asarray` at the top of the few bodies that touch `.shape`/`.dtype`/`.T`
+on a parameter. `asarray` without a `dtype` *preserves* dtype, so this cannot launder a float32
+leak into float64 — I8 still bites where it should. Widened: `joseph_update`,
+`joseph_covariance`, `predict`, `schur_complement`, `lambda_eff`, `qa_from_lambda_eff`,
+`equalized_sigma_tau`, `van_loan`, `qa_tripwire`, `pair_frames`, `mixing_operator`,
+`build_stacked`, the three `anchors.py` entry points, and `MjxModel`'s ten `q` methods.
+
+**The same widening is wrong on the NamedTuple fields, and this was measured, not assumed:**
+
+| widened                                     | pyright errors |
+|---------------------------------------------|---------------:|
+| (params only, baseline)                     |            280 |
+| `+ JointKFState.x/P → ArrayLike`            |            354 |
+| `+ JointKFBuild`/`JointKFParams` array fields |            325 |
+
+Both cascade, because consumers of a state or build field index it, matmul it and read `.shape`
+off it, and `ArrayLike` admits `float`/`int`. State and build tuples are the *output* side of the
+convention and keep `Array`. The ~120 remaining `reportArgumentType` errors are numpy arrays
+being passed to those constructors, across 62 sites; the honest fixes are per-site
+`jnp.asarray`, and they are left undone rather than papered over with a field-level widening
+that makes every downstream read worse.
+
+### Left deliberately
+
+* **~120 numpy-into-NamedTuple-constructor** errors, per above. Concentrated: `sim/collect.py`
+  building `FusedSensors` (18) and `jointKF/build.py` building `JointKFBuild` (8) are the two
+  production sites — note the latter means `JointKFBuild`'s `Array` fields hold **numpy** in
+  production, so the annotation is aspirational there.
+* **35 `reportOptionalMemberAccess`** in `run_policy.py` / `run_estimator.py` / tests: argparse
+  and `dict.get` results used without a `None` check. Real but confined to entry-point plumbing,
+  where the failure is an immediate `AttributeError` on a bad flag, not a silent wrong number.
+* **13 `reportAttributeAccessIssue`**, nearly all incomplete-stub artefacts:
+  `mujoco.Renderer` / `MjrContext` / `mjr_render` are absent from the generated `mujoco`
+  stubs (the pyright-generated `typings/mujoco/__init__.pyi` re-exports `Renderer` from
+  `mujoco.rendering.classic.renderer`, a path this mujoco version does not have). Regenerating
+  `typings/` does not fix it because `_stubs.py` never writes `mujoco/__init__.pyi`.
+* `jit(...)._cache_size()` is jax private API absent from the public stubs; the four I7
+  constant-graph tests carry a `# type: ignore[attr-defined]`. Note the assertions are `<= 1`,
+  never `== 1` — the jit cache is a process-global LRU and a full-suite run evicts the entry.
+
+### Fixed, and worth knowing about
+
+* `contactnet/rollout.make_segment_loss` defaulted to `objective="beta_nll"`, which called a
+  `beta_nll_from_diagnostics` that exists nowhere and read a `logdet_S` that `UpdateDiagnostics`
+  does not publish. It now raises `NotImplementedError` at build time; `ContactNetConfig` still
+  accepts the string, so this is the enforcement point.
+* `inEKF/correct.contact_update` was annotated as returning 2 values and returns 3.
+* `tests/contactnet/test_online.py` has been **deleted** (Lucas's call — the online provider path
+  is not being used). It had been erroring at fixture setup for all 5 tests since before this
+  branch: `qd_*` joined the channel set on 8/2, but the fixture still declared
+  `F = 12 + 2*J_SUB` against `channel_names()`'s `12 + 3*J_SUB` and left `encoders_vel` at its
+  `()` default. Both were fixed first and the tests passed, so the diagnosis is recorded here
+  rather than lost — the working file is recoverable from the commit titled *"fix the defects the
+  checkers were actually pointing at"* on `chore/lint-and-typecheck-cleanup` (referenced by title
+  rather than SHA, which a rebase invalidates), if `contactnet/online.py` is ever picked back up.
+  What went away with it is the "the deployed window must be the trained window" property;
+  nothing else asserts it.
+* `FusedSensors`' optional fields default to `()` and that is **load-bearing**: `()` is an empty
+  pytree, so an unpopulated field costs `lax.scan` no time axis, whereas `zeros(0)` would add a
+  leaf that scan demands a length-`T` axis on. The fields are consumed inconsistently
+  (`jnp.asarray` tolerates `()`, `jnp.concatenate` and `.shape` do not), so
+  `features.contact_channels` now names the unpopulated field instead of failing inside jax.
