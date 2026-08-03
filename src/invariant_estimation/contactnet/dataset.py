@@ -15,7 +15,7 @@ Load-bearing points (see the reference dataset.py docstring for the full argumen
  (b) inputs.contact_chol is passed through, not frozen (the sim switches it
      1e-4 <-> 1e1 off ContactTrust). See ContactNetConfig.freeze_contact_chol.
  (c) Warm-up (meta["warmup_ticks"], the joint-KF bias plateau) plus the
-     (H-1)*stride window lead-in bound the legal segment starts.
+     H-1 tick window lead-in bound the legal segment starts.
  (d) Batches are composed across rollouts; ChainedBatcher's B chains decorrelate.
  (e) Ticks inside a segment are never shuffled -- a segment is a trajectory.
  (f) Segments are chained, not independently re-seeded: force-teaching every
@@ -161,14 +161,15 @@ def fit_normalization(paths: Sequence[Path | str], *, cache_dir: Path | str = CA
 
 @dataclass
 class PreparedRollout:
-    """One rollout, normalized and boxcar-smoothed, ready to slice segments from.
+    """One rollout, normalized, ready to slice segments from.
 
-    smoothed = boxcar(normalize.apply(channels), stride) over the WHOLE stream.
-    The global boxcar is what makes a segment's windows bit-identical to
-    features.window over the full rollout (boxcar is a cumsum; a slice differs).
+    channels = normalize.apply(cached channels) over the WHOLE stream. A
+    segment's windows are then a pure gather out of it, so they are bit-identical
+    to features.window over the full rollout -- normalization is per-tick, so
+    unlike the boxcar this pass has no state to lose at a slice boundary.
     """
     name: str
-    smoothed: np.ndarray          # (T, N_c, F)  normalized + boxcar(stride)
+    channels: np.ndarray          # (T, N_c, F)  normalized
     inputs: InEKFInputs           # NumPy leaves, leading axis T
     y_fk: np.ndarray              # (T, N_c, 3)  FK contact vectors at inputs.joint.q
     R_true: np.ndarray            # (T, 3, 3)
@@ -185,21 +186,21 @@ class PreparedRollout:
 
 def valid_start_range(T: int, warmup: int, cfg: ContactNetConfig) -> tuple[int, int]:
     r"""(t_lo, t_hi) inclusive bounds on a segment start.
-    t_lo = warmup + (H-1)*stride (point (c)); t_hi = T - L. Raises rather than
+    t_lo = warmup + (H-1) (point (c)); t_hi = T - L. Raises rather than
     returning empty: a too-short rollout is a collection bug, not a skip."""
-    lo = int(warmup) + (cfg.H - 1) * cfg.stride
+    lo = int(warmup) + (cfg.H - 1)
     hi = int(T) - cfg.L
     if hi < lo:
         raise ValueError(
             f"no legal segment start: T={T}, warmup={warmup}, lead-in="
-            f"{(cfg.H - 1) * cfg.stride}, L={cfg.L} leaves [{lo}, {hi}]")
+            f"{cfg.H - 1}, L={cfg.L} leaves [{lo}, {hi}]")
     return lo, hi
 
 
 def prepare(paths: Sequence[Path | str], norm: normalize.NormConstants,
             cfg: ContactNetConfig, *, cache_dir: Path | str = CACHE_DIR,
             verbose: bool = False) -> list[PreparedRollout]:
-    """Load rollouts + caches, normalize, smooth, and compute the start bounds."""
+    """Load rollouts + caches, normalize, and compute the start bounds."""
     out = []
     for p in paths:
         p = Path(p)
@@ -208,12 +209,11 @@ def prepare(paths: Sequence[Path | str], norm: normalize.NormConstants,
         if c["names"] != norm.names:
             raise ValueError(f"{p.name}: cached channel names disagree with the constants")
         x = np.asarray(normalize.apply(jnp.asarray(c["channels"]), norm))
-        smoothed = np.asarray(features.boxcar(jnp.asarray(x), cfg.stride))
-        T = smoothed.shape[0]
+        T = x.shape[0]
         t_lo, t_hi = valid_start_range(T, roll.meta["warmup_ticks"], cfg)
         prep = PreparedRollout(
             name=f"{roll.meta['terrain']}/seed{roll.meta['seed']}",
-            smoothed=smoothed,
+            channels=x,
             inputs=jax.tree.map(lambda a: np.asarray(a, dtype=np.float64), roll.inputs),
             y_fk=c["y_fk"],
             R_true=np.asarray(roll.truth["R"], dtype=np.float64),
@@ -231,7 +231,7 @@ def prepare(paths: Sequence[Path | str], norm: normalize.NormConstants,
 
 def _assert_float64(prep: PreparedRollout) -> None:
     """I8 at the dataset boundary: a float32 leaf here silently downcasts the filter."""
-    leaves = [prep.smoothed, prep.y_fk, prep.R_true, prep.v_true, prep.p_true]
+    leaves = [prep.channels, prep.y_fk, prep.R_true, prep.v_true, prep.p_true]
     leaves += list(jax.tree.leaves(prep.inputs))
     bad = [x.dtype for x in leaves if np.asarray(x).dtype != np.float64]
     if bad:
@@ -247,10 +247,10 @@ def _constant_contact_chol(cfg: ContactNetConfig, L: int, N_c: int) -> np.ndarra
 
 def _segment_window_indices(t0: int, cfg: ContactNetConfig) -> np.ndarray:
     r"""(L, H) absolute tick indices: the [t0:t0+L] rows of features.window_indices,
-    without the lower clamp (valid_start_range guarantees t0 >= (H-1)*stride)."""
+    without the lower clamp (valid_start_range guarantees t0 >= H-1)."""
     k = t0 + np.arange(cfg.L)[:, None]
     h = np.arange(cfg.H)[None, :]
-    idx = k - (cfg.H - 1 - h) * cfg.stride
+    idx = k - (cfg.H - 1 - h)
     if idx.min() < 0:
         raise ValueError(f"segment at t0={t0} would clamp its window (min index {idx.min()})")
     return idx
@@ -264,7 +264,7 @@ def make_segment(prep: PreparedRollout, t0: int, cfg: ContactNetConfig,
             f"{prep.name}: t0={t0} outside the legal range [{prep.t_lo}, {prep.t_hi}]")
     sl = slice(t0, t0 + cfg.L)
 
-    windows = prep.smoothed[_segment_window_indices(t0, cfg)]     # (L, H, N_c, F)
+    windows = prep.channels[_segment_window_indices(t0, cfg)]     # (L, H, N_c, F)
     windows = np.swapaxes(windows, 1, 2)                          # (L, N_c, H, F)
 
     inputs = jax.tree.map(lambda a: np.asarray(a[sl]), prep.inputs)
@@ -437,8 +437,8 @@ def measure_p0(fused, prep: PreparedRollout, cfg: ContactNetConfig, *,
     from ..inEKF import ekf as inekf_mod
 
     t0 = prep.t_lo if t0 is None else int(t0)
-    if t0 + ticks > prep.smoothed.shape[0]:
-        raise ValueError(f"burn-in [{t0}, {t0 + ticks}) runs past T={prep.smoothed.shape[0]}")
+    if t0 + ticks > prep.channels.shape[0]:
+        raise ValueError(f"burn-in [{t0}, {t0 + ticks}) runs past T={prep.channels.shape[0]}")
 
     xs = jax.tree.map(lambda a: jnp.asarray(a[t0:t0 + ticks]), prep.inputs)
     if cfg.freeze_contact_chol:

@@ -2,7 +2,8 @@
 """ContactNet overnight orchestrator: collect -> cache -> normalize -> train -> validate.
 
 Coherent 1 kHz regime (rp.DT=0.001, rp.DECIMATION=20; CONTROL_DT=0.02 unchanged),
-process socket only, F=30 (q-dot channel), stride=1 window. Held-out validation:
+process socket only, F=30 (q-dot channel), H consecutive ticks of history (no
+boxcar, no decimation). Held-out validation:
 body-frame velocity RMSE + world-frame velocity NEES (3-DoF and per world axis) +
 contact NIS/dof, learned Sigma_C vs the
 analytic-heuristic contact_chol baseline (the recorded stance/swing factors).
@@ -99,9 +100,9 @@ def save_norm(norm, path):
 
 
 def _windows_full(cache, norm, cfg):
-    """(T, N_c, H, F) normalized feature windows over the whole stream (single boxcar)."""
+    """(T, N_c, H, F) normalized feature windows over the whole stream."""
     x = normalize.apply(jnp.asarray(cache["channels"]), norm)
-    return np.asarray(features.window(x, cfg.H, cfg.stride))
+    return np.asarray(features.window(x, cfg.H))
 
 
 def validate(prep, cache, norm, cfg, params, fused, P0, eps):
@@ -212,7 +213,8 @@ def main():
     save_norm(norm, out / "norm_constants.npz")
 
     cfg = ContactNetConfig()
-    print(f"  cfg: F={cfg.F} d_in={cfg.d_in} H={cfg.H} stride={cfg.stride} "
+    print(f"  cfg: F={cfg.F} d_in={cfg.d_in} H={cfg.H} "
+          f"(window {cfg.window_span_seconds * 1e3:.0f} ms, consecutive ticks) "
           f"L={cfg.L} B={cfg.B} objective={cfg.objective} episode_s={cfg.episode_s}")
 
     print("== preparing rollouts ==")
@@ -270,7 +272,8 @@ def main():
         "n_train": len(train_preps), "n_val": len(val_preps),
         "steps_run": len(history), "final_reseeds": reseeds,
         "floored": list(norm.floored),
-        "cfg": {"F": cfg.F, "d_in": cfg.d_in, "H": cfg.H, "stride": cfg.stride,
+        "cfg": {"F": cfg.F, "d_in": cfg.d_in, "H": cfg.H,
+                "window_span_s": cfg.window_span_seconds,
                 "L": cfg.L, "B": cfg.B, "objective": cfg.objective,
                 "episode_s": cfg.episode_s, "warm_in_s": cfg.warm_in_s,
                 "peak_lr": cfg.peak_lr},

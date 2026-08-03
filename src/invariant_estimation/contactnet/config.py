@@ -1,4 +1,3 @@
-import warnings
 from dataclasses import dataclass
 
 
@@ -20,14 +19,16 @@ class ContactNetConfig:
     sigma_0: float = 1.0e-4
 
     # architecture
-    H: int = 20                    # history SAMPLES per evaluation (CoCo Table VI point)
+    H: int = 20
+    """History ticks per evaluation (CoCo Table VI point). CONSECUTIVE ticks at
+    the full sensor rate: the window reaches back (H-1)*dt = 19 ms and there is
+    no smoothing or decimation between them. The strided/boxcar window geometry
+    (`window_span_s`, a derived `stride`, and the Nyquist guard it needed) was
+    removed 2026-08-03 -- it had been pinned at stride==1 since the coherent
+    1 kHz regime landed, so the boxcar was an identity and the span was just
+    (H-1)*dt. See PORT_NOTES, "Dropping the boxcar and the strided window"."""
 
-    window_span_s: float = 0.019   # ~= (H-1)*dt so the derived `stride` rounds to 1
-    """Seconds the history window reaches BACK over; `stride` is DERIVED from it
-    and `dt`, never the reverse. At (H-1)*dt = 19 ms this yields stride==1 --
-    consecutive ticks, full sensor bandwidth (CoCo Table V/VI reference)."""
-
-    dt: float = 1.0e-3             # sim/filter tick period [s]; the only span->ticks conversion
+    dt: float = 1.0e-3             # sim/filter tick period [s]
 
     widths: tuple[int, ...] = (256, 256)  # trunk
     eps: float = 1.0e-6            # softplus floor on diag(L)
@@ -79,36 +80,14 @@ class ContactNetConfig:
         return self.F * self.H
 
     @property
-    def stride(self) -> int:
-        """Ticks between history samples: round(window_span_s / ((H-1)*dt)).
-
-        A property, not a field: window_span_s and dt are the independent
-        numbers, stride falls out of them. H samples fence off H-1 gaps, so
-        reachable spans are integer multiples of (H-1)*dt. Clamped at 1 (the
-        honest full-rate floor; features.window_indices rejects 0)."""
-        if self.H <= 1:
-            return 1
-        return max(1, round(self.window_span_s / ((self.H - 1) * self.dt)))
-
-    @property
     def window_span_ticks(self) -> int:
-        """Ticks the window reaches back over: (H-1)*stride + 1."""
-        return (self.H - 1) * self.stride + 1
+        """Ticks the window reaches back over: H consecutive ticks."""
+        return self.H
 
     @property
     def window_span_seconds(self) -> float:
-        """The ACHIEVED span, (H-1)*stride*dt -- print this, never the request."""
-        return (self.H - 1) * self.stride * self.dt
-
-    @property
-    def effective_rate_hz(self) -> float:
-        """Sample rate the window observes, 1/(stride*dt)."""
-        return 1.0 / (self.stride * self.dt)
-
-    @property
-    def nyquist_hz(self) -> float:
-        """0.5/(stride*dt). Every channel's f99 must sit below this or it folds."""
-        return 0.5 / (self.stride * self.dt)
+        """Seconds the window reaches back over, (H-1)*dt."""
+        return (self.H - 1) * self.dt
 
     @property
     def dof(self) -> int:
@@ -121,21 +100,8 @@ class ContactNetConfig:
             raise ValueError(f"H and F must be positive, got H={self.H} and F={self.F}")
         if not self.dt > 0.0:
             raise ValueError(f"dt must be positive, got {self.dt}")
-        if not self.window_span_s > 0.0:
-            raise ValueError(f"window_span_s must be positive, got {self.window_span_s}")
-        if self.nyquist_hz < 10.0:
-            # Warning not error: a coarse window is a legitimate sweep, and this
-            # object is also built by tooling that only reads d_in. Loud because
-            # the torque f99=4.25 Hz starts folding here.
-            warnings.warn(
-                f"history window Nyquist is {self.nyquist_hz:.2f} Hz "
-                f"(stride={self.stride} at dt={self.dt}s, span "
-                f"{self.window_span_seconds:.3f}s): below ~10 Hz the torque "
-                f"channel (f99 = 4.25 Hz) aliases. Shorten window_span_s or "
-                f"raise H.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        # No Nyquist guard: the window samples consecutive ticks, so it observes
+        # the full 1/dt rate and nothing can alias into it.
         if not self.widths or any(w <= 0 for w in self.widths):
             raise ValueError(f"widths must be non-empty and positive, got {self.widths}")
         if not self.sigma_0 > self.eps:

@@ -1764,3 +1764,160 @@ that makes every downstream read worse.
   leaf that scan demands a length-`T` axis on. The fields are consumed inconsistently
   (`jnp.asarray` tolerates `()`, `jnp.concatenate` and `.shape` do not), so
   `features.contact_channels` now names the unpopulated field instead of failing inside jax.
+
+---
+
+## World-frame NEES against a right-invariant tangent covariance (2026-08-03)
+
+Where this bites: any consistency check that compares the filter's estimate to
+world-frame ground truth — `scripts/run_contactnet.py:validate`, and the G10
+`eval/consistency.py` NIS/NEES bands. The InEKF's `P` is **not** the covariance of
+the world-frame error; reading it as if it were is a silent, one-sided bug.
+
+### The mapping
+
+`P` is the covariance of the right-invariant tangent vector `ξ`, ordered
+rotation-first (I4: rotation `0:3`, base velocity `3:6`, base position `6:9`,
+contact `i` at `9+3i`). The perturbation convention is I5, `X̂ = exp(ξ) X`
+(left multiplication). Writing the group element column-wise, `exp(ξ) ≈
+[I + (ξ_φ)_×, ξ_v, ξ_p, …]`, so the velocity column of `X̂ = exp(ξ)X` is
+
+```
+v̂ = (I + (ξ_φ)_×) v + ξ_v
+```
+
+and therefore the **world-frame** velocity error is
+
+```
+δv = v̂ − v = ξ_v + ξ_φ × v = ξ_v − (v)_× ξ_φ
+```
+
+i.e. `δv = J ξ_{0:6}` with `J = [ −(v)_×  I₃ ]`, giving
+
+```
+Σ_δv = J P[0:6, 0:6] Jᵀ
+     = (v)_× P_φφ (v)_×ᵀ − (v)_× P_φv − P_vφ (v)_×ᵀ + P_vv
+```
+
+The same construction gives the position error, `δp = ξ_p − (p)_× ξ_φ`, and the
+contact-landmark errors, `δd_i = ξ_{d_i} − (d_i)_× ξ_φ` — the Jacobian is always
+`[ −(x)_×  I₃ ]` on `(ξ_φ, ξ_x)`, because every translation-like column of the
+group element transforms the same way. Linearize about the estimate (`v̂`, `p̂`,
+`d̂`), which is what the filter actually has at runtime; with ground truth
+available the difference is second order.
+
+Then:
+
+* 3-DoF NEES `= δvᵀ Σ_δv⁻¹ δv`, `E[·] = 3`.
+* Per-world-axis NEES `= δv_i² / (Σ_δv)_ii`, `E[·] = 1` each. These are 1-DoF
+  **marginals**, so they do not sum to the 3-DoF value unless `Σ_δv` is diagonal —
+  which it is not. Per-axis is the diagnostic (which direction is mis-tuned);
+  3-DoF is the consistency test.
+
+### Why it matters, and the trap
+
+Using `P[3:6, 3:6]` alone — the covariance of `ξ_v`, not of `δv` — drops the
+attitude coupling. It is only correct when `v = 0`. While walking it
+**under-reports** the covariance and so **inflates** NEES: on a representative
+`(P, v)` (‖v‖ ≈ 1.4 m/s, attitude σ ~ mrad) the diagonal ratio
+`diag(Σ_δv)/diag(P_vv)` came out `[1.08, 1.96, 2.13]`, i.e. up to a 2× NEES
+inflation that is purely a frame-convention error, not filter inconsistency. That
+number is scenario-dependent — it grows with ‖v‖ and with attitude uncertainty —
+so the lesson is the mapping, not the constant.
+
+The inverse trap is equally available: comparing a **body-frame** error against
+either block. `ξ_v` is not the body-frame velocity error either. Body-frame wants
+`R̂ᵀ` applied to `δv` and the covariance rotated the same way,
+`R̂ᵀ Σ_δv R̂` — that is a third quantity. `run_contactnet.validate` reports
+body-frame *RMSE* alongside *world*-frame NEES; that mismatch is deliberate but
+worth naming, since RMSE needs no covariance and NEES does.
+
+### Verification
+
+Monte-Carlo property check (the reusable one, if this ever moves into
+`eval/consistency.py`): draw `ξ ~ N(0, P)` with a full, correlated `P`, push each
+draw through the real `group.exp_SEn3`, form `v̂` from the resulting group
+element, and compare the empirical `Cov(v̂ − v)` to `J P Jᵀ`. At 400k draws the
+max relative error was 2.6e-3 against a Monte-Carlo noise floor of
+`1/√M = 1.6e-3`. Nonzero `v` and off-diagonal `P_φv` are both required — either
+one zero and the wrong formula passes.
+
+`run_contactnet.validate` keeps the old number as `vel_nees_tangent` so runs
+predating this fix stay comparable; `vel_nees` is now the world-frame 3-DoF
+value and `vel_nees_{x,y,z}` the per-axis marginals.
+
+---
+
+## Dropping the boxcar and the strided window (2026-08-03)
+
+Lucas's call: the ContactNet features are a **short window of consecutive ticks**,
+so the window geometry that supported longer, decimated spans is gone. What went
+away, and what it cost.
+
+### What was there
+
+`ContactNetConfig` took a `window_span_s` (seconds the history reaches back) and
+*derived* `stride = round(window_span_s / ((H-1)*dt))` from it. `features.window`
+then did boxcar-smooth-by-`stride`, gather-every-`stride`-ticks — decimation with
+an anti-alias prefilter, which is why the config also carried `nyquist_hz` and
+warned when the torque channel's f99 = 4.25 Hz would fold.
+
+Since the coherent 1 kHz regime landed (`rp.DT = 1e-3`), `window_span_s = 0.019`
+with `H = 20` derives `stride == 1` exactly. At `stride == 1` `boxcar` early-returns
+its input and the gather is `k-H+1 … k`. **Every run on record was already the
+consecutive-tick window**; the machinery was inert.
+
+### Removed
+
+* `features.boxcar` — deleted. `features.window(channels, H)` and
+  `window_indices(T, H)` lost their `stride` parameter, as did
+  `make_feature_windows`.
+* `ContactNetConfig.window_span_s`, `.stride`, `.effective_rate_hz`, `.nyquist_hz`,
+  the Nyquist `RuntimeWarning`, and the `warnings` import. `.window_span_ticks`
+  (now `H`) and `.window_span_seconds` (now `(H-1)*dt`) survive as reporting
+  properties — `run_contactnet` prints and records the span, since "H=20" alone
+  does not say how far back the net looks.
+* `dataset.PreparedRollout.smoothed` → `.channels`; `prepare` no longer smooths.
+  `valid_start_range`'s lead-in is `H-1` rather than `(H-1)*stride`.
+* `online.py`'s cumsum: the ring buffer is now exactly `(H, N_c, F)` and **is** the
+  window, so `step` gathers nothing.
+
+### Numerically
+
+* Training/validation path: **bit-identical.** Checked directly — old
+  `features.window(x, H, stride=1)` vs new `features.window(x, H)` over a
+  (500, 2, 30) stream, `array_equal` True, max abs diff 0.0.
+* Online path: **not** identical, and the change is an improvement. The old code
+  reconstructed each sample as a difference of two cumsum partial sums; at
+  `stride == 1` that is algebraically the identity but not the floating-point
+  identity. On a worst-case buffer (values ~5e4, i.e. large partial sums) the old
+  path differed from the exact value by 1.3e-10 absolute / 2.6e-15 relative. The
+  new path returns the stored value.
+
+  This retires the first of `online.py`'s two documented "deliberate differences
+  from training" — the boxcar cumsum was the *only* reason the deployed window was
+  not bit-identical to the trained one. The remaining difference (a warm-up
+  instead of `window_indices`' head clamp) stands.
+
+### Test coverage
+
+`tests/contactnet/test_features.py` held one test, `test_boxcar`, which is now
+meaningless. Replaced with six covering what actually has to hold: window shape,
+newest-tick-last ordering (the network's input layout depends on it and nothing
+else asserted it), consecutive-raw-tick contents, head clamping, and —
+importantly — that a training segment's gather out of `PreparedRollout.channels`
+equals `features.window` over the whole stream at the same ticks. That last one
+is the property the *global* boxcar existed to preserve; with the boxcar gone it
+is free, because per-tick normalization has no state to lose at a slice boundary.
+It is still worth asserting: it is the "trained window == scored window"
+invariant, and `tests/contactnet/test_online.py` (deleted earlier, see the lint
+baseline notes) was the only other thing that touched it.
+
+### Watch for
+
+`ContactNetConfig(window_span_s=...)` is now a `TypeError`, not a silently-ignored
+kwarg. No caller in the tree passes it; older `results/*/summary.json` still record
+a `stride` key, which is now written as `window_span_s` instead. If a longer,
+genuinely decimated window is ever wanted again, restore the boxcar with it — a
+strided gather without the prefilter aliases the torque channel, which is what the
+deleted Nyquist warning was guarding.
