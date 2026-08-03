@@ -1749,10 +1749,16 @@ that makes every downstream read worse.
   does not publish. It now raises `NotImplementedError` at build time; `ContactNetConfig` still
   accepts the string, so this is the enforcement point.
 * `inEKF/correct.contact_update` was annotated as returning 2 values and returns 3.
-* `tests/contactnet/test_online.py` was erroring at fixture setup (5 tests) from before this
+* `tests/contactnet/test_online.py` has been **deleted** (Lucas's call — the online provider path
+  is not being used). It had been erroring at fixture setup for all 5 tests since before this
   branch: `qd_*` joined the channel set on 8/2, but the fixture still declared
   `F = 12 + 2*J_SUB` against `channel_names()`'s `12 + 3*J_SUB` and left `encoders_vel` at its
-  `()` default.
+  `()` default. Both were fixed first and the tests passed, so the diagnosis is recorded here
+  rather than lost — the working file is recoverable from the commit titled *"fix the defects the
+  checkers were actually pointing at"* on `chore/lint-and-typecheck-cleanup` (referenced by title
+  rather than SHA, which a rebase invalidates), if `contactnet/online.py` is ever picked back up.
+  What went away with it is the "the deployed window must be the trained window" property;
+  nothing else asserts it.
 * `FusedSensors`' optional fields default to `()` and that is **load-bearing**: `()` is an empty
   pytree, so an unpopulated field costs `lax.scan` no time axis, whereas `zeros(0)` would add a
   leaf that scan demands a length-`T` axis on. The fields are consumed inconsistently
