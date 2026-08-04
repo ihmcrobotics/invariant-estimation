@@ -1,61 +1,23 @@
 r"""
-pipeline/main_estimator.py
-==========================
-G9 -- the **fused estimator step**: one constant-XLA-graph `lax.scan` body that
-runs the joint-space KF and the world-centric InEKF back to back, threading the
-joint KF's live `(q̂, q̇̂, Σ_q, Σ_q̇, b̂)` into the InEKF the way the log fed each
-filter independently at Tier-2 (CLAUDE.md §0 deliverable 3, §3 gate G9).
+G9 -- the fused estimator step: one constant-XLA-graph `lax.scan` body running the
+joint-space KF and the world-centric InEKF back to back, threading the joint KF's
+`(q̂, q̇̂, Σ_q, Σ_q̇, b̂)` into the InEKF (CLAUDE.md §0 deliverable 3, §3 gate G9).
 
-What is new here, and what is not
----------------------------------
-Both filters are already validated at the sensor→state level (`PORT_NOTES.md`;
-memory `invariant-estimation-port-status`). G9 is a *composition* job, not an
-estimator job. The only genuinely new code is the **boundary** (`_boundary`
-below): the joint KF's per-IMU bias corrects the base gyro, which is then rotated
-IMU-frame→body-frame and handed to the InEKF as the bias-corrected `ω̄` (I1). The
-rest is wiring two `step` functions and one carry.
+The only genuinely new code is the boundary (`_boundary`): the joint KF's per-IMU
+bias corrects the base gyro, which is rotated IMU-frame→body-frame by `R_mount`
+and handed to the InEKF as the bias-corrected `ω̄` (I1). Three frames stay
+distinct — base IMU site `S`, body frame `B` (`base_body_site`), and
+`R_mount = ᴮR_S`; on real Alex `B ≠ S` (a +90° yaw plus offset), and the default
+`base_body_site = S` is correct only for the synthetic fixture.
 
-The single invariant that makes this non-trivial is **I7 (constant XLA graph)**:
-no data-dependent shapes or Python branches inside the jitted step. Each filter
-already obeys it individually (every gate is a `jnp.where` mask). G9 keeps it true
-across the fusion by (a) resolving every name→index at build time in plain Python,
-and (b) evaluating the MJX model *inside* the scan at the carry's estimate, with
-no Python `if` on any traced value. `tests/pipeline/test_main_estimator.py` proves
-it: the `fused_step` jaxpr hashes identically across differing contact / gate
-states.
+Two flight-vs-test defaults are set here, not in `config`: `imu_bias_process_var`
+defaults to 0.0 (the 1e-4 in config is the Java unit-test value), and
+`contact_meas_var` exposes the InEKF contact measurement-noise floor that the port
+otherwise lacks (default 0.0 = current port behaviour).
 
-The two G9 landmines (memory `invariant-estimation-g9-landmines`)
------------------------------------------------------------------
-1. **Gyro-bias process noise must be 0 at flight.** `config` holds the Java
-   *unit-test* value `imu_bias_process_var = 1e-4` (test-locked); flight is 0.0.
-   `build_fused_estimator` overrides it at this boundary by default
-   (`imu_bias_process_var=0.0`), so the fused joint-KF bias is not ~200× too noisy.
-2. **The InEKF contact *measurement*-noise floor has no port analogue.** Flight
-   wires `contactMeasurementVariance = 1e-4` (+ swing inflation); the port's
-   contact R is purely `J Σ_q Jᵀ`. This is a structural gap that affects
-   velocity/position, not roll/pitch. Exposed here as the `contact_meas_var`
-   argument (default 0.0 = current port behaviour); when non-zero it is added as an
-   isotropic floor to the InEKF's contact-position noise. See `_boundary`.
-
-Frames — THREE of them, kept distinct (guide §G9.3; the real-Alex trap)
------------------------------------------------------------------------
-1. **Base IMU site `S`** (`imu_sites[base_imu]`): where the base gyro/accel are
-   measured, and the joint-KF stance-anchor frame.
-2. **Body frame `B`** (`base_body_site`, the pelvis *root* body): the frame the
-   InEKF's `R = ᵂR_B` refers to and the contact-FK origin. On real Alex the IMU is
-   both offset from and yawed +90° relative to `B`, so `B ≠ S` — using the IMU site
-   as the body frame (as an early cut did) puts that offset+yaw straight into the
-   pose. `build_fused_estimator(base_body_site=...)` selects `B`; it defaults to
-   the base IMU site, which is correct only when the two coincide (the synthetic
-   fixture, where `R_mount = I`).
-3. **`R_mount = ᴮR_S`**: rotates the base IMU measurement into `B`. Auto-computed
-   from FK at `qpos0`. Enters only the boundary (`_boundary`); the contact FK uses
-   `B` directly. On real Alex it is a clean +90° yaw, verified against Java to
-   1e-18 (`R_mount @ jointKF_bias_S == invariantAppliedGyroBiasInPelvisFrame`;
-   `tests/replay/test_fused_real_model.py`). NB: the real InEKF consumes a
-   Mahony-prefiltered pelvis gyro, so a full trajectory replay must feed that
-   processed channel, not the raw `gyroscope_pelvis_imu` — see PORT_NOTES "G9 —
-   real model". Roll/pitch are `R_mount`-robust; velocity/position are not.
+Full notes — the I7 argument, the two landmine derivations, and the frame/Mahony
+caveats — are in `~/Documents/main_estimator_things.md`; see also PORT_NOTES
+"G9 — real model" and `tests/pipeline/test_main_estimator.py` (jaxpr constancy).
 """
 from __future__ import annotations
 
@@ -66,6 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
+from jax.typing import ArrayLike
 
 from ..config import load_config
 from ..inEKF import ekf as inekf_mod
@@ -286,14 +249,15 @@ class FusedSensors(NamedTuple):
     """
 
     #TODO: the encoders are not just the unfiltered joints, we use the entire robot as an input. This is pure sensors, so it shouldn't matter which ones we use.
-    encoders: Array
-    gyros: Array
-    accel_base: Array
-    qd_unfiltered: Array
-    contact: Array
-    contact_chol: Array
-    q_unfiltered: Array = ()
-    encoders_vel: Array = ()
+    encoders: ArrayLike
+    gyros: ArrayLike
+    accel_base: ArrayLike
+    qd_unfiltered: ArrayLike
+    contact: ArrayLike
+    contact_chol: ArrayLike
+    q_unfiltered: ArrayLike = ()
+    encoders_vel: ArrayLike = ()
+    torques: ArrayLike = ()             # (n + n_u,) ContactNet feature channel only; concat(filtered, unfiltered)
 
 
 class FusedOutputs(NamedTuple):
@@ -312,6 +276,12 @@ class FusedOutputs(NamedTuple):
     bias: Array                  # (3m,)  per-IMU gyro bias
     jkf: jkf.TickDiagnostics
     inekf: inf.InEKFOutputs
+    inekf_inputs: inf.InEKFInputs
+    """The boundary `_boundary` handed the InEKF this tick -- emitted, not rebuilt.
+    A caller cannot rebuild it: sigma_q comes off jkf_carry.state.P[:n,:n], which
+    run_fused does not otherwise expose. The consumer is ContactNet's data
+    collection: this is exactly contactnet.rollout.Segment.inputs. The joint KF is
+    strictly upstream of ContactNet, so these are frozen per rollout, never in BPTT."""
 
 
 # ---------------------------------------------------------------------------
@@ -536,11 +506,14 @@ def _make_contact_kinematics(
     """
     feet = jnp.asarray(foot_site_ords, dtype=int)
     use_aux = aux_qpos is not None and len(aux_qpos) > 0
-    if use_aux:
-        qpos0 = jnp.asarray(model.mj_model.qpos0, dtype=jnp.float64)
-        idx_filtered = jnp.asarray(model.joint_qpos, dtype=int)
-        idx_aux = jnp.asarray(aux_qpos, dtype=int)
-        n_f = int(n_filtered if n_filtered is not None else model.n_joints)
+    # Bound unconditionally so `_foot_y` closes over names that always exist; when
+    # `use_aux` is False they are empty and the branch below never reads them. All of
+    # this is build time (plain Python over a build-time constant), so the `if` inside
+    # `_foot_y` is resolved before tracing and costs the graph nothing (I7).
+    qpos0 = jnp.asarray(model.mj_model.qpos0, dtype=jnp.float64)
+    idx_filtered = jnp.asarray(model.joint_qpos, dtype=int)
+    idx_aux = jnp.asarray(aux_qpos if use_aux else (), dtype=int)
+    n_f = int(n_filtered if n_filtered is not None else model.n_joints)
 
     def _foot_y(q: Array) -> Array:
         if use_aux:
@@ -625,6 +598,7 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
             R=inekf_out.state.R, v=inekf_out.state.v, p=inekf_out.state.p,
             q=q_hat, q_dot=qd_hat, bias=bias,
             jkf=jkf_diag, inekf=inekf_out,
+            inekf_inputs=inekf_inputs,
         )
         return (jkf_carry, inekf_carry), outputs
 

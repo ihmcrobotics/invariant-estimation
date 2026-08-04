@@ -1,5 +1,21 @@
 {
   "venvPath": ".",
   "venv": ".venv",
-  "stubPath": "typings"
+  "stubPath": "typings",
+
+  // `typings/` is GENERATED (`uv run gen-stubs`, see `_stubs.py`) and gitignored.
+  // It stays on `stubPath` -- the mujoco/mjx stubs are what let the real code
+  // type-check at all -- but it must not be *reported on*: stubgen output carries
+  // ~2100 of its own errors (mostly `mujoco_warp`'s warp-kernel annotations, which
+  // are not valid type expressions), which is 84% of every diagnostic in the repo
+  // and buries the ~380 that are about our code. `exclude` drops diagnostics, not
+  // stub resolution.
+  "exclude": [
+    "typings",
+    ".venv",
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "**/.mypy_cache",
+    "**/.ruff_cache"
+  ]
 }

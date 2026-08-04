@@ -116,6 +116,58 @@ the Java InEKF to 1e-18. **Caveat for a full trajectory replay:** the real InEKF
 consumes a *Mahony-prefiltered* pelvis gyro, not the raw `gyroscope_pelvis_imu`
 (see `PORT_NOTES.md` "G9 — real model").
 
+## Training ContactNet (the learned contact-noise socket)
+
+`scripts/run_contactnet.py` is the one-shot orchestrator — **collect → cache →
+normalize → train → validate**. It trains a network that emits the InEKF's
+per-contact `contact_chol` from sensor-history features only. It writes the
+**process** socket (the contact-anchor random-walk block of `Q_d`), never the
+measurement socket; features are F=30 (includes the raw q̇ channel) on a `stride=1`
+full-rate window, and the sim runs at a coherent 1 kHz (`rp.DT=0.001`,
+`rp.DECIMATION=20`).
+
+```bash
+uv run python scripts/run_contactnet.py --collect --steps 300 --seconds 45
+uv run python scripts/run_contactnet.py --collect --train-seeds 0 1 2 3 --val-seeds 4 5 \
+       --steps 300 --warmup-steps 50 --time-budget-s 3000     # the overnight run's args
+```
+
+`--collect` re-runs the sim to gather rollouts (it skips any seed already on disk);
+drop it to reuse `data/*.npz`. The val seeds are disjoint from the train seeds, and
+held-out validation reports learned-vs-analytic-baseline **body-frame velocity
+RMSE**, velocity **NEES** (target 3), and **contact NIS/dof** (target 1).
+
+| path | what |
+|---|---|
+| `data/flat_seed*.npz` + `data/cache/*_feat.npz` | collected rollouts (~100 MB each) and F=30 feature caches — **gitignored** |
+| `results/<YYYY-MM-DD_HH-MM-SS>[_tag]/` | **one directory per run** — every artifact below lands here, so runs never overwrite each other |
+| `results/latest` | symlink repointed at the most recent run directory |
+| `…/summary.json` | the run's config + held-out metrics (baseline vs learned), plus a `run` block (timestamp, tag, full argv) identifying the run |
+| `…/{training,validation}.png` | loss / NIS / reseed curves; held-out RMSE / NEES / NIS bars |
+| `…/params.npz`, `…/norm_constants.npz` | trained weights and the **frozen** normalization pair (load them together — a mismatch silently shifts the input distribution) |
+| `RESULTS.md` | the written-up validation numbers + caveats (hand-authored, not emitted by the script) |
+
+Name a run with `--tag baseline-redo` (appended to the timestamp) or bypass the
+naming entirely with `--out-dir path/to/dir`. The validated run written up in
+`RESULTS.md` lives in `results/2026-08-03_11-45-30_coco-faithful-f30/` — it
+predates this layout and was moved into it by hand, so its `summary.json` has no
+`run` block.
+
+Last validated run (flat ground, seeds 0–3 train / 4–5 held out): velocity RMSE
+**0.086 → 0.028 m/s**, NEES **19.4 → 1.05** vs the analytic `contact_chol`
+baseline. Full numbers and caveats (flat-terrain only, etc.) in `RESULTS.md`.
+
+**Gate before pushing:** `bash scripts/verify.sh` — the Layer-1 deterministic
+checks (F=30, `d_in=600`, `stride=1`, channel order q,q̇,τ; process-socket-only;
+nothing under `tests/` modified; the `test_online` geometry). It only greps and
+asserts, so a red check means fix the code it points at — never the check.
+
+> **Known red gate:** `tests/contactnet/test_online.py` is a stale F=24 copy of the
+> pre-q̇ online test and fails against the F=30 set *by construction* (its `_cfg`
+> sets `F=12+2·J_SUB` and `_sensors` never populates `encoders_vel`). One-line human
+> fix: `2·J_SUB → 3·J_SUB` + populate `encoders_vel`. Left untouched per the
+> no-editing-tests rule; the online↔offline window agreement is verified separately.
+
 ## Watching an RL policy in a standalone MuJoCo sim (`run_policy.py`)
 
 `run_policy.py` (repo root) runs an IHMC pre-trained ONNX policy **directly** (via

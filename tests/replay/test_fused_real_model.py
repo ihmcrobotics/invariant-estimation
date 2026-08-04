@@ -113,7 +113,7 @@ def test_runs_finite_and_constant_graph_on_the_real_model(alex_fused):
         P = np.asarray(carry[1].state.P)
         assert np.linalg.eigvalsh(0.5 * (P + P.T)).min() > -1e-9
     assert len(programs) == 1, f"the step changed program across ticks ({len(programs)} distinct)"
-    assert step._cache_size() <= 1, "a tick triggered a retrace"
+    assert step._cache_size() <= 1, "a tick triggered a retrace"  # type: ignore[attr-defined]  # jax private API, absent from the stubs
 
 
 def test_R_mount_is_a_ninety_degree_yaw(alex_fused):

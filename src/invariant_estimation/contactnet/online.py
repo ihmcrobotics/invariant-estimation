@@ -1,10 +1,9 @@
 r"""Per-tick ContactNet inference — the deployment counterpart of `features.py`.
 
 `features.make_feature_windows` builds ``(T, N_c, H, F)`` from a whole recorded
-trajectory: it vmaps FK over the full leading axis, cumsums the boxcar over all
-``T``, and gathers every window at once.  That shape is right for training and
-impossible online, where tick ``k`` must be produced from tick ``k``'s sensors
-and a bounded amount of history.
+trajectory: it vmaps FK over the full leading axis and gathers every window at
+once.  That shape is right for training and impossible online, where tick ``k``
+must be produced from tick ``k``'s sensors and a bounded amount of history.
 
 This module is the online form: a fixed-size ring buffer of normalized channels,
 advanced one tick at a time, from which the same ``(N_c, H, F)`` window is
@@ -17,20 +16,26 @@ input distribution has silently shifted and the measured gain evaporates with
 nothing raising.  (Run 2's 3.3x in velocity / 8.5x in height were **in-sample**;
 out of sample the same net beats the analytic heuristic by velocity 25%,
 position 50%, height 62% — PORT_NOTES, "Run 2 transfers out of sample".)
-`tests/contactnet/test_online.py` asserts that agreement against
-`features.window` over a real rollout.
+`tests/contactnet/test_online.py` used to assert that agreement against
+`features.window` over a real rollout; it was deleted when this path was shelved
+(see PORT_NOTES, lint baseline). **Nothing asserts it today** — restore it before
+this module is picked back up.
 
-Two deliberate differences from training, both bounded and both tested:
+One deliberate difference from training:
 
-* **Not bit-identical, by construction.**  `features.boxcar` cumsums over the
-  whole rollout; here it cumsums over a 400-tick buffer.  A difference of two
-  large partial sums is not the same floating-point number as a difference of
-  two small ones.  Agreement is ~1e-13 relative, not exact.
 * **A warm-up, instead of `window_indices`' clamp.**  Training segments are
   chosen past the lead-in so their windows never clamp (`make_segment` raises if
   they would), which means the clamped branch is a code path the network was
   never trained on.  Rather than reproduce it, `OnlineFeatures` reports
   ``ready`` only once the buffer holds `span_ticks` real samples.
+
+The boxcar that used to sit between the buffer and the gather is gone (2026-08-03,
+with the strided window geometry -- see PORT_NOTES).  It was the *only* reason
+this path was not bit-identical to training: it cumsummed over a 400-tick buffer
+here and over the whole rollout there, and a difference of two large partial sums
+is not the same float as a difference of two small ones.  The window is now a
+pure gather over per-tick-normalized channels, so past warm-up this path and
+`features.window` agree exactly.
 """
 
 from __future__ import annotations
@@ -49,13 +54,13 @@ from .network import ContactNetParams, forward
 class OnlineState(NamedTuple):
     r"""Ring buffer of normalized per-tick channels, plus what the FK diff needs.
 
-    ``buf`` is ``(span, N_c, F)`` normalized channels, oldest first, with
-    ``span = (H-1)*stride + stride`` — enough that the boxcar feeding the
-    *oldest* gathered sample has its full `stride` ticks of support.  ``prev_p``
-    is ``(N_c, 3)``, the previous tick's body-frame contact FK for the causal
-    first difference producing the ``ᴮv`` channels; held separately because the
-    buffer stores the *normalized* value and the difference is taken on the raw
-    one.  ``n`` is the saturating count of ticks pushed, which drives `ready`.
+    ``buf`` is ``(H, N_c, F)`` normalized channels, oldest first — exactly the
+    window, since the gather is over consecutive ticks and nothing smooths.
+    ``prev_p`` is ``(N_c, 3)``, the previous tick's body-frame contact FK for the
+    causal first difference producing the ``ᴮv`` channels; held separately
+    because the buffer stores the *normalized* value and the difference is taken
+    on the raw one.  ``n`` is the saturating count of ticks pushed, which drives
+    `ready`.
     """
     buf: Array
     prev_p: Array
@@ -63,8 +68,8 @@ class OnlineState(NamedTuple):
 
 
 def span_ticks(cfg: ContactNetConfig) -> int:
-    """Raw ticks the window needs: the gather span plus the boxcar's support."""
-    return (cfg.H - 1) * cfg.stride + cfg.stride
+    """Raw ticks the window needs: H consecutive ticks, nothing behind them."""
+    return cfg.H
 
 
 def init_state(cfg: ContactNetConfig, n_c: int) -> OnlineState:
@@ -85,7 +90,7 @@ def make_online_features(subchain, base_imu: int, kinematics, cfg: ContactNetCon
     one tick of sensors.
 
     Channel order is `features.make_contact_channels`' verbatim —
-    ``(omega, accel, q_sub, tau_sub, p, v)`` — and must stay that way: it is the
+    ``(omega, accel, q_sub, qd_sub, tau_sub, p, v)`` — and must stay that way: it is the
     same ordering `normalize` and the trained weights were fitted under.
     """
     subchain = jnp.asarray(subchain)
@@ -93,8 +98,6 @@ def make_online_features(subchain, base_imu: int, kinematics, cfg: ContactNetCon
     mean = jnp.asarray(constants.mean, dtype=jnp.float64)
     std = jnp.asarray(constants.std, dtype=jnp.float64)
     span = span_ticks(cfg)
-    # Gather offsets from the END of the buffer: the newest sample is last.
-    idx = span - 1 - (cfg.H - 1 - jnp.arange(cfg.H)) * cfg.stride
 
     def channels_now(sensors, prev_p) -> tuple[Array, Array]:
         """One tick of raw channels ``(N_c, F)``, and this tick's FK ``p``."""
@@ -124,19 +127,14 @@ def make_online_features(subchain, base_imu: int, kinematics, cfg: ContactNetCon
         row = row.at[:, -3:].set(jnp.where(state.n == 0, 0.0, row[:, -3:]))
 
         row_n = (row - mean) / std                           # (N_c, F)
-        buf = jnp.concatenate([state.buf[1:], row_n[None]], axis=0)
+        # The buffer IS the window: H consecutive per-tick-normalized rows,
+        # oldest first, so `dataset.prepare`'s normalize-then-gather order is
+        # reproduced with nothing in between.
+        buf = jnp.concatenate([state.buf[1:], row_n[None]], axis=0)   # (H, N_c, F)
         n = jnp.minimum(state.n + 1, span)
 
-        # Boxcar then gather — the same order as `dataset.prepare`, which
-        # normalizes, smooths the whole stream, and only then windows.
-        c = jnp.cumsum(buf, axis=0)
-        c = jnp.concatenate([jnp.zeros_like(c[:1]), c], axis=0)
-        smoothed = (c[cfg.stride:] - c[:-cfg.stride]) / cfg.stride   # (span-s+1, ...)
-        # `smoothed[j]` is the average ending at buf index `j + stride - 1`.
-        win = smoothed[idx - (cfg.stride - 1)]               # (H, N_c, F)
-
         return (OnlineState(buf=buf, prev_p=p, n=n),
-                jnp.swapaxes(win, 0, 1),                     # (N_c, H, F)
+                jnp.swapaxes(buf, 0, 1),                     # (N_c, H, F)
                 n >= span)
 
     return step

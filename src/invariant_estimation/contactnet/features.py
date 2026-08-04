@@ -23,30 +23,27 @@ Do not touch unless you're sure!
 # extra helpers for lower body, as the structure is the same per side.
 JOINT_LABELS: tuple[str, ...] = ("hip_x","hip_z","hip_y","knee_y","ankle_y","ankle_x")
 
-def window_indices(T: int, H: int, stride: int = 1) -> Array:
-    if stride < 1:
-        raise ValueError(f"Stride must be >= 1, but got {stride}")
-    k = jnp.arange(T)[:,None]
-    h = jnp.arange(H)[:,None]
-    return jnp.maximum(k - (H - 1 - h) * stride, 0)
+def window_indices(T: int, H: int) -> Array:
+    """(T, H) gather indices: row k is the H CONSECUTIVE ticks ending at k.
 
-def boxcar(x: Array, s: int) -> Array:
-    if s < 1:
-        raise ValueError(f"Boxcar size must be >= 1, but got {s}")
-    if s == 1:
-        return x
-    pad = jnp.repeat(x[:1], s - 1, axis=0)
-    c = jnp.cumsum(jnp.concatenate([pad, x], axis=0), axis=0)
-    c = jnp.concatenate([jnp.zeros_like(c[:1]), c], axis=0)
-    return (c[s:] - c[:-s]) / s
+    Clamped at 0, so the first H-1 rows repeat tick 0. Callers that must not see
+    the clamped rows (training segments) bound their starts instead --
+    `dataset.valid_start_range`.
+    """
+    k = jnp.arange(T)[:, None]                      # (T, 1)
+    h = jnp.arange(H)[None, :]                      # (1, H)
+    return jnp.maximum(k - (H - 1 - h), 0)
 
-def window(channels: Array, H: int, stride: int = 1) -> Array:
+def window(channels: Array, H: int) -> Array:
+    """(T, N_c, F) -> (T, N_c, H, F): the last H raw ticks at every k.
+
+    No smoothing and no decimation: the network looks at a short window of
+    consecutive ticks at the full sensor rate, so the window IS the raw history.
+    """
     if channels.ndim != 3:
         raise ValueError(f"Expected (T, N_c, F), but got {channels.shape}")
-    smoothed = boxcar(channels, stride)
-    idx = window_indices(smoothed.shape[0], H, stride)
-    gathered = smoothed[idx]
-    return jnp.swapaxes(gathered, 1, 2) # (T, F, H)
+    gathered = channels[window_indices(channels.shape[0], H)]
+    return jnp.swapaxes(gathered, 1, 2) # (T, N_c, H, F)
 
 def build_subchain_indices(joint_names, unfiltered_names, foot_chains=ALEX_FOOT_CHAINS, contacts_per_foot: int = 1):
     if contacts_per_foot < 1:
@@ -97,6 +94,18 @@ def make_contact_channels(subchain, base_imu: int, kinematics, dt: float):
     subchain = jnp.asarray(subchain)
     n_c, j_sub = subchain.shape
     def contact_channels(sensors) -> Array:
+        # `FusedSensors` defaults its optional fields to `()` -- an EMPTY PYTREE, so an
+        # unpopulated field costs `lax.scan` no time axis (that is why the sentinel is a
+        # tuple and not `zeros(0)`). Every field below is mandatory for the channel set,
+        # so catch the sentinel here: reaching `jnp.concatenate` with it raises a
+        # `check_arraylike` TypeError from inside jax that names nothing useful.
+        unset = [f for f in ("encoders", "encoders_vel", "q_unfiltered", "qd_unfiltered",
+                             "torques") if isinstance(getattr(sensors, f), tuple)]
+        if unset:
+            raise ValueError(
+                f"FusedSensors {unset} still hold the `()` default; the contact channels "
+                f"need them populated (`qd_*` and `tau_*` are in `channel_names()`)."
+            )
         if sensors.q_unfiltered.shape[-1] == 0:
             raise ValueError("No unfiltered joints in the model; cannot compute contact channels")
         q_all = jnp.concatenate([sensors.encoders, sensors.q_unfiltered], axis=-1)
@@ -131,8 +140,8 @@ def make_contact_channels(subchain, base_imu: int, kinematics, dt: float):
 
 
 
-def make_feature_windows(subchain, base_imu: int, kinematics, dt: float, H: int, stride: int = 1):
+def make_feature_windows(subchain, base_imu: int, kinematics, dt: float, H: int):
     channels = make_contact_channels(subchain, base_imu, kinematics, dt)
     def feature_windows(sensors) -> Array:
-        return window(channels(sensors), H, stride)
+        return window(channels(sensors), H)
     return feature_windows

@@ -241,7 +241,7 @@ def test_step_does_not_recompile_across_conditions(fused):
     assert len(programs) == 1, (
         f"a contact/gate condition changed the compiled program ({len(programs)} distinct)"
     )
-    assert step._cache_size() <= 1, "a contact/gate condition triggered a retrace"
+    assert step._cache_size() <= 1, "a contact/gate condition triggered a retrace"  # type: ignore[attr-defined]  # jax private API, absent from the stubs
 
 
 # ---------------------------------------------------------------------------

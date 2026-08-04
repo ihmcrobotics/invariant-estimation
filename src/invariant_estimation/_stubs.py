@@ -24,8 +24,17 @@ TYPINGS = ROOT / "typings"
 # Compiled extension modules — stubgen must import & reflect on these.
 COMPILED = [
     "mujoco._structs", "mujoco._functions", "mujoco._enums", "mujoco._constants",
-    "mujoco._callbacks", "mujoco._errors", "mujoco._specs",
+    "mujoco._callbacks", "mujoco._errors", "mujoco._specs", "mujoco._render",
 ]
+# Pure-Python modules missing py.typed — AST-parsed, no import.
+#
+# ``mujoco`` itself is NOT optional: a `typings/mujoco/` directory with no
+# `__init__.pyi` is a stub *namespace* package, and it shadows the real
+# `mujoco/__init__.py` outright — every `mujoco.MjModel` then reports
+# "not a known attribute of module mujoco" even though `mujoco._structs.MjModel`
+# resolves. The generated `__init__.pyi` is just the `from mujoco._X import *`
+# re-export chain, which is exactly what makes the submodule stubs reachable.
+MODULES = ["mujoco"]
 # Pure-Python packages missing py.typed — AST-parsed, no import.
 PACKAGES = ["mujoco.mjx"]
 
@@ -41,7 +50,7 @@ def main() -> None:
     _uv("install", "-q", "mypy")  # dev-only; removed in the finally below
     try:
         spec: list[str] = []
-        for m in COMPILED:
+        for m in (*COMPILED, *MODULES):
             spec += ["-m", m]
         for p in PACKAGES:
             spec += ["-p", p]

@@ -1,0 +1,54 @@
+{
+  "n_train": 4,
+  "n_val": 2,
+  "steps_run": 300,
+  "final_reseeds": 91,
+  "floored": [],
+  "cfg": {
+    "F": 30,
+    "d_in": 600,
+    "H": 20,
+    "stride": 1,
+    "L": 128,
+    "B": 32,
+    "objective": "l2_velocity",
+    "episode_s": 43.0,
+    "warm_in_s": 1.0,
+    "peak_lr": 0.0001
+  },
+  "wall_s": 2882.671166419983,
+  "val": [
+    {
+      "rollout": "flat/seed4",
+      "baseline": {
+        "vel_rmse": 0.08565737498306703,
+        "vel_nees": 19.35331675753588,
+        "nis_over_dof": 0.06535928672969,
+        "applied": 1.0
+      },
+      "learned": {
+        "vel_rmse": 0.028303901806981255,
+        "vel_nees": 1.0547211586829057,
+        "nis_over_dof": 0.02614933768644651,
+        "applied": 1.0
+      }
+    },
+    {
+      "rollout": "flat/seed5",
+      "baseline": {
+        "vel_rmse": 0.08578883819349653,
+        "vel_nees": 19.362941829869204,
+        "nis_over_dof": 0.06550721851841863,
+        "applied": 1.0
+      },
+      "learned": {
+        "vel_rmse": 0.02832844606281378,
+        "vel_nees": 1.0508060248468516,
+        "nis_over_dof": 0.025995787271739682,
+        "applied": 1.0
+      }
+    }
+  ],
+  "loss_first": 0.0815433875070297,
+  "loss_last": 0.0009580961157846435
+}

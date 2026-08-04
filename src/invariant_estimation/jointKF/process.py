@@ -136,6 +136,7 @@ import warnings
 import jax.numpy as jnp
 from jax import Array
 from jax.scipy.linalg import cho_factor, cho_solve
+from jax.typing import ArrayLike
 
 from .state import JointKFBuild, JointKFParams
 
@@ -182,7 +183,8 @@ class ProcessDiagnostics(NamedTuple):
     qa_trip_count: Array
 
 
-def qa_tripwire(qa: Array, params: JointKFParams, count: Array | None = None) -> ProcessDiagnostics:
+def qa_tripwire(qa: ArrayLike, params: JointKFParams,
+                count: ArrayLike | None = None) -> ProcessDiagnostics:
     """Evaluate the QA_MAX tripwire.  **Surfaces, never rescales** (module docstring).
 
     `count` is the previous tick's `ProcessDiagnostics.qa_trip_count`; `None`
@@ -233,7 +235,7 @@ def warn_qa_tripwire(diag: ProcessDiagnostics, build: JointKFBuild, params: Join
 # Step 1: Schur complement
 # ---------------------------------------------------------------------------
 
-def schur_complement(M: Array, filtered_idx: Array, nuisance_idx: Array) -> Array:
+def schur_complement(M: ArrayLike, filtered_idx: ArrayLike, nuisance_idx: ArrayLike) -> Array:
     r"""Articulated joint inertia ``Lambda = M_jj - M_jb M_bb^-1 M_bj``  (eq. 1).
 
     Parameters
@@ -285,7 +287,7 @@ def schur_complement(M: Array, filtered_idx: Array, nuisance_idx: Array) -> Arra
 # Step 2: rotor inertia
 # ---------------------------------------------------------------------------
 
-def lambda_eff(lam: Array, rotor: Array) -> Array:
+def lambda_eff(lam: ArrayLike, rotor: ArrayLike) -> Array:
     r"""``Lambda_eff = Lambda + diag(rotor)``  (eq. 2) -- exact diagonal add.
 
     Off-diagonals are left bit-identical: the drivetrain does not couple through
@@ -302,7 +304,7 @@ def lambda_eff(lam: Array, rotor: Array) -> Array:
     return lam + jnp.diag(jnp.asarray(rotor, dtype=jnp.float64))
 
 
-def _apply_rotor(lam: Array, rotor: Any) -> Array:
+def _apply_rotor(lam: ArrayLike, rotor: Any) -> Array:
     """Resolve the ``rotor=`` argument: sentinel -> identity, array -> add."""
     if rotor is None or isinstance(rotor, str):
         # `None` is rejected rather than aliased to "add nothing": the two
@@ -342,7 +344,7 @@ def sigma_tau_per_joint(build: JointKFBuild, params: JointKFParams) -> Array:
     return jnp.where(usable, alpha * safe_tau, params.sigma_tau)
 
 
-def equalized_sigma_tau(lam_eff: Array, target_qdd_std: float) -> Array:
+def equalized_sigma_tau(lam_eff: ArrayLike, target_qdd_std: float) -> Array:
     r"""Offline calibration: ``sigma_i = target / |Lambda_eff^-1[i,i]|``  (CLAUDE.md §2).
 
     Equalises the DOMINANT term of each joint's unmodeled-acceleration STD --
@@ -366,7 +368,7 @@ def equalized_sigma_tau(lam_eff: Array, target_qdd_std: float) -> Array:
 # Step 4: Gram-form Qa
 # ---------------------------------------------------------------------------
 
-def qa_from_lambda_eff(lam_eff: Array, sigma_tau: Array) -> Array:
+def qa_from_lambda_eff(lam_eff: ArrayLike, sigma_tau: ArrayLike) -> Array:
     r"""``Qa = Y Y^T`` with ``Y[i,j] = Lambda_eff^-1[i,j] sigma_tau_j``  (eq. 3).
 
     ``Y`` is obtained as ``cho_solve(Lambda_eff, diag(sigma_tau))`` -- one
@@ -386,7 +388,7 @@ def qa_from_lambda_eff(lam_eff: Array, sigma_tau: Array) -> Array:
 def acceleration_covariance(
     build: JointKFBuild,
     params: JointKFParams,
-    M: Array | None = None,
+    M: ArrayLike | None = None,
     *,
     rotor: Any = ROTOR_IN_MASS_MATRIX,
 ) -> Array:
@@ -422,7 +424,7 @@ def acceleration_covariance(
 # Step 5: Van Loan discretisation
 # ---------------------------------------------------------------------------
 
-def van_loan(qa: Array, params: JointKFParams, n_imus: int) -> Array:
+def van_loan(qa: ArrayLike, params: JointKFParams, n_imus: int) -> Array:
     r"""Assemble the discrete process noise ``Q`` from ``Qa``  (eq. 4).
 
     ::
@@ -458,7 +460,7 @@ def van_loan(qa: Array, params: JointKFParams, n_imus: int) -> Array:
 def build_process_noise(
     build: JointKFBuild,
     params: JointKFParams,
-    M: Array | None = None,
+    M: ArrayLike | None = None,
     *,
     rotor: Any = ROTOR_IN_MASS_MATRIX,
 ) -> Array:
@@ -475,10 +477,10 @@ def build_process_noise(
 def build_process_noise_with_diagnostics(
     build: JointKFBuild,
     params: JointKFParams,
-    M: Array | None = None,
+    M: ArrayLike | None = None,
     *,
     rotor: Any = ROTOR_IN_MASS_MATRIX,
-    qa_trip_count: Array | None = None,
+    qa_trip_count: ArrayLike | None = None,
 ) -> tuple[Array, ProcessDiagnostics]:
     """`build_process_noise` plus the `ProcessDiagnostics` pytree.
 

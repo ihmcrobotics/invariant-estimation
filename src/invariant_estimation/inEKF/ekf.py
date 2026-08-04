@@ -107,11 +107,13 @@ def create(
         raise ValueError(f"number of contacts must be >= 0, got {number_of_contacts}")
 
     cfg = section("inekf")
-    contact_var = cfg["contact_var"] if contact_var is None else contact_var
+    # Separate `float` local, not a reassignment of the Optional parameter -- see the
+    # same pattern in `correct.linear_update`.
+    contact_variance = float(cfg["contact_var"] if contact_var is None else contact_var)
     params = default_params(
         number_of_contacts, dt=dt, gyro_var=gyro_var, accel_var=accel_var,
     )
-    sigma_c = jnp.tile(contact_var * jnp.eye(3), (number_of_contacts, 1, 1))
+    sigma_c = jnp.tile(contact_variance * jnp.eye(3), (number_of_contacts, 1, 1))
     return InvariantEKF(
         N=number_of_contacts,
         params=params,
