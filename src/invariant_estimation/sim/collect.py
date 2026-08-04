@@ -34,6 +34,8 @@ import jax.numpy as jnp
 import mujoco
 import numpy as np
 
+from invariant_estimation.contactnet.config import ContactNetConfig
+
 from ..pipeline import main_estimator as me
 from ..pipeline.main_estimator import FusedSensors
 from ..inEKF.filter import InEKFInputs, JointFilterOutput
@@ -161,6 +163,16 @@ class Rollout(NamedTuple):
     aux: dict                 # bias, nis, est_R/est_v/est_p -- filter health
     meta: dict
 
+def _command_schedule(seed, n_control_ticks, control_dt, cfg):
+    rng = np.random.default_rng((int(seed) << 8) ^ 0xBADA55) # hell yeah brother lol
+    per = max(1, round(cfg.cmd_resample_s / control_dt))
+    def draw(lo, hi): return rng.choice((-1.0, 1.0)) * rng.uniform(lo, hi)
+    n = -(-n_control_ticks // per)
+    sched = np.array(
+        [[draw(*cfg.cmd_vx_range), draw(*cfg.cmd_vy_range), draw(*cfg.cmd_yaw_range)] for _ in range(n)]
+    )
+    return sched, per
+
 
 def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
                     collector: Collector | None = None, vx: float = 0.4,
@@ -168,7 +180,8 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
                     stance_chol: float = 1.0e-4, swing_chol: float = 1.0e1,
                     spawn_radius: float = SPAWN_RADIUS, max_tilt_deg: float = MAX_TILT_DEG,
                     warmup_ticks: int | None = None,
-                    out_dir: Path | str | None = DATA_DIR, verbose: bool = True) -> Rollout:
+                    out_dir: Path | str | None = DATA_DIR, cfg: ContactNetConfig = ContactNetConfig(),
+                    cmd_override = None, verbose: bool = True) -> Rollout:
     """Walk flat ground for `seconds`, record at 1/rp.DT Hz, run the estimator once, save.
 
     Raises RuntimeError -- never returns partial data -- if the robot falls or goes
@@ -206,9 +219,15 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
     if verbose:
         print(f"  flat/seed{seed}: spawn=({x0:+.1f},{y0:+.1f})m yaw={np.degrees(yaw):+.0f}deg  "
               f"{settle_s:.0f}s settle + {seconds:.0f}s walk -> T={T} ticks")
+    if cmd_override is not None:
+        sched, per = np.asarray([cmd_override], dtype=float), max(1, total_ticks)  # override the schedule with a single command
+    else:
+        sched, per = _command_schedule(seed, total_ticks, control_dt, cfg)
     for k in range(total_ticks):
         if k >= settle_ticks:
-            loop.cmd[0:3] = (vx, 0.0, 0.0)
+            # loop.cmd[0:3] = (vx, 0.0, 0.0) #WARNING: this is only forward command, and this isn't randomized - explain why we aren't robust to a wide range of motions.
+            idx = min((k - settle_ticks) // per, len(sched) - 1)
+            loop.cmd[0:3] = sched[idx]
             loop.cmd[3] = 0.0
         loop.control_tick()
         if not np.all(np.isfinite(loop.d.qpos)):
@@ -233,7 +252,14 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
         "dt": float(c.dt),
         "seconds": float(seconds),
         "settle_s": float(settle_s),
-        "vx": float(vx),
+        # "vx": float(vx),
+        "cmd_seed": int(seed),
+        "cmd_override": None if cmd_override is None else [float(x) for x in cmd_override],
+        "cmd_ranges": {
+            "vx": cfg.cmd_vx_range,
+            "vy": cfg.cmd_vy_range,
+            "yaw": cfg.cmd_yaw_range
+        },
         "decimation": int(rp.DECIMATION),
         "T": int(T),
         "settle_ticks": int(settle_ticks * rp.DECIMATION),
@@ -275,11 +301,17 @@ def _check_rollout(truth: dict, *, max_tilt_deg: float, label: str) -> np.ndarra
     tilt = np.degrees(np.arccos(np.clip(np.asarray(truth["R"])[:, 2, 2], -1.0, 1.0)))
     if not np.all(np.isfinite(tilt)):
         raise RuntimeError(f"{label}: non-finite attitude")
-    if tilt.max() > max_tilt_deg:
-        k = int(tilt.argmax())
+    tail = tilt[-int(0.5 / rp.DT):]
+    # if tilt.max() > max_tilt_deg:
+    #     k = int(tilt.argmax())
+    #     raise RuntimeError(
+    #         f"{label}: tilt reached {tilt.max():.1f}deg at t={k * rp.DT:.2f}s "
+    #         f"(bound {max_tilt_deg}deg) -- the robot fell; the rollout is not data")
+    if tail.mean() > max_tilt_deg or tilt.max() > 75.0:
         raise RuntimeError(
-            f"{label}: tilt reached {tilt.max():.1f}deg at t={k * rp.DT:.2f}s "
-            f"(bound {max_tilt_deg}deg) -- the robot fell; the rollout is not data")
+            f"{label}: end-tilt {tail.mean():.1f}deg / peak {tilt.max():.1f} deg"
+            f"(bound {max_tilt_deg}deg) -- fell and did not recover, the rollout is not data"
+        )
     return tilt
 
 
@@ -367,7 +399,7 @@ def save_rollout(roll: Rollout, path: Path | str, *, compress: bool = True) -> P
 def load_rollout(path: Path | str) -> Rollout:
     """Inverse of save_rollout. Reassembles the typed pytrees, not a bag of arrays."""
     z = np.load(Path(path), allow_pickle=False)
-    g = lambda k: np.asarray(z[k])                                          # noqa: E731
+    g = lambda k: jnp.asarray(z[k])                                          # noqa: E731
     sensors = FusedSensors(**{f: g(f"sensors.{f}") for f in FusedSensors._fields})
     # NOTE: take-two's InEKFInputs is PROCESS-SOCKET-ONLY -- no contact_meas_chol
     # field (the hard invariant, enforced structurally). ContactNet drives contact_chol.

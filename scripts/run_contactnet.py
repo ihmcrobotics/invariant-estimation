@@ -42,6 +42,13 @@ from invariant_estimation.inEKF.filter import init_carry, make_step
 
 RESULTS_ROOT = REPO / "results"
 
+# validation modes for later
+VAL_MODES = { # val seed -> (label, constant (vx, vy, yaw))
+    4: ("forward", (0.45, 0.00, 0.00)),
+    5: ("backward", (-0.45, 0.00, 0.00)),
+    6: ("lateral_L", (0.00, 0.40, 0.00)),
+    7: ("turn_L", (0.00, 0.00, 0.75)),
+}
 
 def make_run_dir(root, tag=None, explicit=None):
     """results/<YYYY-MM-DD_HH-MM-SS>[_tag]/ — one directory per run, sorted by date.
@@ -78,7 +85,7 @@ def git_commit():
         return None
 
 
-def collect_rollouts(c, seeds, seconds):
+def collect_rollouts(c, seeds, seconds, cfg, cmd_override_map=None):
     paths = []
     for s in seeds:
         p = collect.DATA_DIR / f"flat_seed{s:03d}.npz"
@@ -87,7 +94,7 @@ def collect_rollouts(c, seeds, seconds):
             paths.append(p)
             continue
         try:
-            collect.collect_rollout(seed=s, seconds=seconds, collector=c, out_dir=collect.DATA_DIR)
+            collect.collect_rollout(seed=s, seconds=seconds, collector=c, out_dir=collect.DATA_DIR, cfg=cfg, cmd_override=(cmd_override_map or {}).get(s))
             paths.append(p)
         except RuntimeError as e:
             print(f"  seed{s}: FELL/skipped: {e}")
@@ -176,7 +183,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--collect", action="store_true")
     ap.add_argument("--train-seeds", type=int, nargs="+", default=[0, 1, 2, 3])
-    ap.add_argument("--val-seeds", type=int, nargs="+", default=[4, 5])
+    ap.add_argument("--val-seeds", type=int, nargs="+", default=[4, 5, 6, 7])
     ap.add_argument("--seconds", type=float, default=45.0)
     ap.add_argument("--steps", type=int, default=300)
     ap.add_argument("--warmup-steps", type=int, default=50)
@@ -187,6 +194,8 @@ def main():
                     help="write artifacts here instead of results/<timestamp>/")
     args = ap.parse_args()
 
+    cfg = ContactNetConfig()
+
     t_start = time.time()
     started_at = datetime.now().isoformat(timespec="seconds")
     out = make_run_dir(RESULTS_ROOT, tag=args.tag, explicit=args.out_dir)
@@ -195,7 +204,9 @@ def main():
 
     if args.collect:
         print("== collecting ==")
-        collect_rollouts(c, args.train_seeds + args.val_seeds, args.seconds)
+        val_cmd = {s : cmd for s, (_label, cmd) in VAL_MODES.items()}
+        collect_rollouts(c, args.train_seeds, args.seconds, cfg)
+        collect_rollouts(c, args.val_seeds, args.seconds, cfg, val_cmd)
 
     train_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.train_seeds]
     val_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.val_seeds]
@@ -212,7 +223,6 @@ def main():
     print(f"  floored channels: {list(norm.floored)}")
     save_norm(norm, out / "norm_constants.npz")
 
-    cfg = ContactNetConfig()
     print(f"  cfg: F={cfg.F} d_in={cfg.d_in} H={cfg.H} "
           f"(window {cfg.window_span_seconds * 1e3:.0f} ms, consecutive ticks) "
           f"L={cfg.L} B={cfg.B} objective={cfg.objective} episode_s={cfg.episode_s}")
@@ -226,12 +236,12 @@ def main():
     np.save(out / "P0.npy", P0)
 
     print("== building network + batcher ==")
-    params = network.init(jax.random.PRNGKey(0), cfg.d_in, cfg.widths, cfg.sigma_0, cfg.eps)
+    params = network.init(jax.random.PRNGKey(cfg.init_seed), cfg.d_in, cfg.widths, cfg.sigma_0, cfg.eps)
     batch_loss = cn_rollout.make_batch_loss(
         c.fused.ekf, c.fused.kinematics, cfg.eps, beta=cfg.beta,
         objective=cfg.objective, remat=cfg.remat)
     warm_in = cn_rollout.make_warm_in(c.fused.ekf, c.fused.kinematics)
-    batcher = dataset.ChainedBatcher(train_preps, cfg, P0, warm_in, seed=0)
+    batcher = dataset.ChainedBatcher(train_preps, cfg, P0, warm_in, seed=cfg.batcher_seed)
 
     # Fast-fail: one train step before committing to the full run.
     print("== training ==")
@@ -263,8 +273,10 @@ def main():
     for vp, vpath in zip(val_preps, val_paths):
         cache = dataset.load_channel_cache(dataset.cache_path(vpath))
         base, learned = validate(vp, cache, norm, cfg, params, c.fused, P0, cfg.eps)
+        seed = int(vp.name.split("seed")[1].split(".")[0])
+        label = VAL_MODES.get(seed, ("mixed", None))[0]
         print(f"  {vp.name}: baseline={base}  learned={learned}")
-        val_metrics.append({"rollout": vp.name, "baseline": base, "learned": learned})
+        val_metrics.append({"mode": label, "rollout": vp.name, "baseline": base, "learned": learned})
 
     summary = {
         "run": {"dir": out.name, "started_at": started_at, "tag": args.tag,
@@ -276,7 +288,14 @@ def main():
                 "window_span_s": cfg.window_span_seconds,
                 "L": cfg.L, "B": cfg.B, "objective": cfg.objective,
                 "episode_s": cfg.episode_s, "warm_in_s": cfg.warm_in_s,
-                "peak_lr": cfg.peak_lr},
+                "peak_lr": cfg.peak_lr,
+                "init_seed": cfg.init_seed, "batcher_seed": cfg.batcher_seed,
+                "cmd_ranges": {
+                    "vx": cfg.cmd_vx_range,
+                    "vy": cfg.cmd_vy_range,
+                    "yaw": cfg.cmd_yaw_range
+                },
+        },
         "wall_s": time.time() - t_start,
         "val": val_metrics,
         "loss_first": history[0][0] if history else None,

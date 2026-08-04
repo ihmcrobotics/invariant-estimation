@@ -75,6 +75,16 @@ class ContactNetConfig:
 
     remat: bool = True
 
+    # training domain randomization on command (not env yet)
+    cmd_vx_range: tuple = (0.30, 0.90)
+    cmd_vy_range: tuple = (0.25, 0.50)
+    cmd_yaw_range: tuple = (0.30, 1.50)
+    cmd_resample_s: float = 3.0
+
+    # seeds keep training deterministic and reproducible, but still subject to the stochasticity of the environment and the dataset
+    init_seed: int = 0
+    batcher_seed: int = 0
+
     @property
     def d_in(self) -> int:
         return self.F * self.H
