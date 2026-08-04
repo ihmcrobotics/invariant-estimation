@@ -20,7 +20,6 @@ mismatch every one of those constants.
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -274,7 +273,6 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
         "chunk_ticks": int(c.chunk_ticks),
         "travelled_m": travelled,
         "tilt_max_deg": float(tilt.max()),
-        "git_commit": _git_commit(),
         "wall_sim_s": loop.sim_s,
         "wall_read_s": loop.read_s,
         "wall_fused_s": fused_s,
@@ -375,14 +373,6 @@ def _flat(tree, prefix: str) -> dict:
     for k, v in items:
         out.update(_flat(v, f"{prefix}{k}."))
     return out
-
-
-def _git_commit() -> str:
-    try:
-        return subprocess.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
-                              capture_output=True, text=True, check=True).stdout.strip()
-    except Exception:
-        return "unknown"
 
 
 def save_rollout(roll: Rollout, path: Path | str, *, compress: bool = True) -> Path:

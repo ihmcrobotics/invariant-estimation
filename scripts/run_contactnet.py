@@ -16,7 +16,6 @@ results/latest symlinked at the newest); --tag names a run, --out-dir overrides.
 """
 import argparse
 import json
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -74,15 +73,6 @@ def make_run_dir(root, tag=None, explicit=None):
     except (OSError, ValueError):
         pass  # non-POSIX fs, or --out-dir outside results/: the run dir still stands
     return run_dir
-
-
-def git_commit():
-    try:
-        out = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
-                             capture_output=True, text=True, timeout=10)
-        return out.stdout.strip() or None
-    except (OSError, subprocess.SubprocessError):
-        return None
 
 
 def collect_rollouts(c, seeds, seconds, cfg, cmd_override_map=None):
@@ -280,7 +270,7 @@ def main():
 
     summary = {
         "run": {"dir": out.name, "started_at": started_at, "tag": args.tag,
-                "git_commit": git_commit(), "args": vars(args)},
+                "args": vars(args)},
         "n_train": len(train_preps), "n_val": len(val_preps),
         "steps_run": len(history), "final_reseeds": reseeds,
         "floored": list(norm.floored),

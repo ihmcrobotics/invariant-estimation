@@ -142,7 +142,7 @@ RMSE**, velocity **NEES** (target 3), and **contact NIS/dof** (target 1).
 | `data/flat_seed*.npz` + `data/cache/*_feat.npz` | collected rollouts (~100 MB each) and F=30 feature caches — **gitignored** |
 | `results/<YYYY-MM-DD_HH-MM-SS>[_tag]/` | **one directory per run** — every artifact below lands here, so runs never overwrite each other |
 | `results/latest` | symlink repointed at the most recent run directory |
-| `…/summary.json` | the run's config + held-out metrics (baseline vs learned), plus a `run` block (timestamp, git commit, full argv) identifying the run |
+| `…/summary.json` | the run's config + held-out metrics (baseline vs learned), plus a `run` block (timestamp, tag, full argv) identifying the run |
 | `…/{training,validation}.png` | loss / NIS / reseed curves; held-out RMSE / NEES / NIS bars |
 | `…/params.npz`, `…/norm_constants.npz` | trained weights and the **frozen** normalization pair (load them together — a mismatch silently shifts the input distribution) |
 | `RESULTS.md` | the written-up validation numbers + caveats (hand-authored, not emitted by the script) |
