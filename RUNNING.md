@@ -133,9 +133,28 @@ uv run python scripts/run_contactnet.py --collect --train-seeds 0 1 2 3 --val-se
 ```
 
 `--collect` re-runs the sim to gather rollouts (it skips any seed already on disk);
-drop it to reuse `data/*.npz`. The val seeds are disjoint from the train seeds, and
-held-out validation reports learned-vs-analytic-baseline **body-frame velocity
-RMSE**, velocity **NEES** (target 3), and **contact NIS/dof** (target 1).
+drop it to reuse `data/*.npz`. **Pass `--seconds 60` to match the collected set** —
+the default is 45 s, and mixing rollout lengths is a silent trap. The val seeds are
+disjoint from the train seeds, and held-out validation reports
+learned-vs-analytic-baseline **body-frame velocity RMSE**, velocity **NEES**
+(target 3), and **contact NIS/dof** (target 1). The per-mode validation labels
+(forward/backward/lateral_L/lateral_R/turn_L/turn_R) are keyed to the val seeds in
+`VAL_MODES` at the top of `run_contactnet.py` — the `--val-seeds` you pass MUST be
+those keys (currently **900–905**) or the rollouts collect with random commands and
+label as `"mixed"`.
+
+**GPU (large speedup — do this).** JAX falls back to CPU unless the CUDA plugin is
+installed; the project ships the extra. Sync once, then prefix runs with `--extra gpu`:
+
+```bash
+uv sync --extra gpu                                   # installs jax-cuda13-plugin (additive)
+uv run --extra gpu python scripts/run_contactnet.py … # collection ~2× ; training much faster
+uv run --extra gpu python -c "import jax; print(jax.devices())"   # -> [CudaDevice(id=0)]
+```
+
+Note the training clock (`--time-budget-s`, measured from process start) includes
+collection + the per-run cache rebuild (`build_channel_cache` is unconditional,
+~4 min/rollout, CPU-bound), so budget accordingly or collect in a prior pass.
 
 | path | what |
 |---|---|
@@ -426,6 +445,8 @@ uv run python run_estimator.py --policy baseline --headless --source truth      
 uv run python run_estimator.py ... --out run.npz                                    # per-tick log
 uv run python run_estimator.py --policy baseline --ticks 1500 --vx 0.6 \
        --video walk.mp4                                                             # 30 s video
+uv run --extra gpu python run_estimator.py --policy baseline --headless --ticks 500 \
+       --vx 0.45 --contactnet results/latest/params.npz                            # ContactNet in the loop
 ```
 
 Every run prints an error table against the sim's own state (tilt as the policy sees it,
@@ -437,6 +458,7 @@ attitude, gyro, velocity, position drift, joint state) over the whole run and ov
 | `--imu-noise` | constant per-IMU gyro bias + white noise on gyros/accel/encoders (`--noise-seed`) |
 | `--contact-fk measured\|pinned` | whether the InEKF contact FK uses the measured ankle angles (default) or pins them at `qpos0`, as the library default still does — worth ~2x on attitude error, see below |
 | `--stance-chol` / `--swing-chol` | the Σ_C factor for a trusted / airborne foot. The InEKF has **no contact mask**; contact condition rides entirely in Σ_C, so a swing foot needs a large factor or the filter keeps believing it is planted |
+| `--contactnet PARAMS.npz` (+ `--contactnet-norm`) | run a trained ContactNet in the loop: its learned per-tick `contact_chol` (via `contactnet.online.make_provider`) replaces the analytic stance/swing heuristic. Reads `norm_constants.npz` beside `PARAMS.npz` unless overridden; config is the `ContactNetConfig()` defaults the checkpoint trained under. Run the same command without the flag for the closed-loop A/B |
 | `--contact-meas-var` | flight's `1e-4` contact measurement-noise floor (port default 0) |
 | `--video walk.mp4` | record the run offscreen to H.264 (implies `--headless`, `--video-fps` / `--video-size` tune it) |
 | `--ghost [mode]` | draw a translucent robot at the estimated state: `full` (default) or `attitude`. Viewer only |

@@ -43,10 +43,12 @@ RESULTS_ROOT = REPO / "results"
 
 # validation modes for later
 VAL_MODES = { # val seed -> (label, constant (vx, vy, yaw))
-    4: ("forward", (0.45, 0.00, 0.00)),
-    5: ("backward", (-0.45, 0.00, 0.00)),
-    6: ("lateral_L", (0.00, 0.40, 0.00)),
-    7: ("turn_L", (0.00, 0.00, 0.75)),
+    900: ("forward", (0.45, 0.00, 0.00)),
+    901: ("backward", (-0.45, 0.00, 0.00)),
+    902: ("lateral_L", (0.00, 0.40, 0.00)),
+    903: ("lateral_R", (0.00, -0.40, 0.00)),
+    904: ("turn_L", (0.00, 0.00, 0.75)),
+    905: ("turn_R", (0.00, 0.00, -0.75)),
 }
 
 def make_run_dir(root, tag=None, explicit=None):
