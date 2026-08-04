@@ -271,6 +271,7 @@ class UpdateDiagnostics(NamedTuple):
     nis: Array
     condition_proxy: Array
     correction_rotation_norm: Array
+    logdet_s: Array
 
 
 def no_update_diagnostics() -> UpdateDiagnostics:
@@ -284,6 +285,7 @@ def no_update_diagnostics() -> UpdateDiagnostics:
         nis=jnp.array(jnp.nan),
         condition_proxy=jnp.array(jnp.nan),
         correction_rotation_norm=jnp.array(jnp.nan),
+        logdet_s=jnp.array(jnp.nan)
     )
 
 
@@ -340,6 +342,7 @@ def linear_update(
     factor = cho_factor(S)
 
     diag = jnp.abs(jnp.diag(factor[0]))
+    logdet_s = 2.0 * jnp.sum(jnp.log(diag))  # log(det(S)) = 2 sum(log(L_ii))
     condition_proxy = (jnp.max(diag) / jnp.min(diag)) ** 2
 
     K = cho_solve(factor, H @ state.P).T           # P Hᵀ S⁻¹
@@ -361,6 +364,7 @@ def linear_update(
             nis=nis,
             condition_proxy=condition_proxy,
             correction_rotation_norm=jnp.linalg.norm(xi[0:3]),
+            logdet_s=logdet_s
         ),
     )
 
