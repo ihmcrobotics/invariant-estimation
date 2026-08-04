@@ -292,7 +292,7 @@ def _add_visual_meshes(root, urdf_path):
              contype="0", conaffinity="0", group="1", material="robot")
 
 
-def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
+def build_sim_model(policy, with_visuals=True, with_imu_sensors=False, terrain=None):
     """Free-base Alex: estimator MJCF + floor + SCS2's collision set + per-joint position servos.
 
     kd is applied as MuJoCo joint damping, which with a kp-only `position` actuator reproduces
@@ -312,8 +312,6 @@ def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
     # compile the same dynamics with neither.
     if with_visuals:
         _add_scene_look(root)
-    _geom(root.find("worldbody"), "floor", TERRAIN_GROUP, type="plane", size="20 20 0.1",
-          **({"material": "groundplane"} if with_visuals else {}))
     bodies = {b.get("name"): b for b in root.iter("body")}
     for body, typ, size, pos, quat in SCS2_COLLISION_GEOMS:
         _geom(bodies[body], f"{body}_collision_0", ROBOT_GROUP,
@@ -334,10 +332,26 @@ def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
 
     if with_visuals:
         _add_visual_meshes(root, urdf)
+    if terrain is None:
+        _geom(root.find("worldbody"), "floor", TERRAIN_GROUP, type="plane", size="20 20 0.1",
+              **({"material": "groundplane"} if with_visuals else {}))
+    else:
+        from invariant_estimation.sim import terrain as terr
+        hf = ET.SubElement(_asset(root), "hfield")
+        hf.set("name","terrain")
+        hf.set("nrow", str(terr.N))
+        hf.set("ncol",str(terr.N))
+        hf.set("size", f"{terr.EXTENT/2} {terr.EXTENT/2} {terr.EZ} 0.1")
+        _geom(root.find("worldbody"), "floor", TERRAIN_GROUP, type="hfield", hfield="terrain",
+              **({"material": "groundplane"} if with_visuals else {}))
     if with_imu_sensors:
         from invariant_estimation.sim.sensors import add_imu_sensors
         add_imu_sensors(root, me.ALEX_IMU_SITES)
-    return mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+    m = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+    if terrain is not None:
+        from invariant_estimation.sim import terrain as terr
+        m.hfield_data[:] = (np.asarray(terrain, np.float32) /  terr.EZ).clip(0,1).ravel()
+    return m
 
 
 # ---------------------------------------------------------------------------

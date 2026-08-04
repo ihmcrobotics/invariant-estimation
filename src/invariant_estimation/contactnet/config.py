@@ -85,6 +85,16 @@ class ContactNetConfig:
     init_seed: int = 0
     batcher_seed: int = 0
 
+    # environment variables for domain randomization
+    env_dr: bool = False
+    friction_range: tuple = (0.6, 1.2)
+    friction_low_tail_prob: float = 0.25
+    friction_low_tail: tuple = (0.15, 0.45)
+    disturb_rate_hz: float = 0.4
+    disturb_mag_N: tuple = (30.0, 120.0)
+    disturb_dur_s: float = 0.1
+    terrain_mix: tuple = (("flat", 0.25), ("waves", 0.25), ("stepping_stones",0.25), ("hard_stepping",0.25))
+
     @property
     def d_in(self) -> int:
         return self.F * self.H

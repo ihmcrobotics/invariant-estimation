@@ -116,13 +116,18 @@ def build_collector(policy_name: str = "baseline", *, dt: float = None,
               f"({1 / dt:.0f} Hz)  [built in {c.build_s:.1f}s]")
     return c
 
+@dataclass
+class Disturb:
+    rate_hz: float = 0.0
+    mag_N: tuple = (30.0, 120.0)
+    dur_s: float = 0.1
 
 class _RecordingLoop(rp.Loop):
     """run_policy.Loop that samples the sensors after EVERY mj_step. control_tick
     is reimplemented (the base has no hook inside its decimation loop); the
     policy/actuator lines are a verbatim copy of rp.Loop.control_tick."""
 
-    def __init__(self, m, policy, maps, reader: SimSensorReader):
+    def __init__(self, m, policy, maps, reader: SimSensorReader, disturb = None, dr_seed=0):
         super().__init__(m, policy, maps)
         self.reader = reader
         self.sensors: list = []
@@ -131,7 +136,25 @@ class _RecordingLoop(rp.Loop):
         self.read_s = 0.0
         self.tick = 0
 
+        self.disturb = disturb
+        self._drng = np.random.default_rng((int(dr_seed) << 20) ^ 0xF00D)
+        self._push_left = 0
+        self._push_vec = np.zeros(3)
+        self._push_bid = reader.base_bid # pelvis
+
     def control_tick(self):
+        if self.disturb is not None and self.disturb.rate_hz > 0.0:
+            dt_c = rp.DT * rp.DECIMATION
+            if self._push_left <= 0 and self._drng.random() < self.disturb.rate_hz * dt_c:
+                mag = self._drng.uniform(*self.disturb.mag_N)
+                ang = self._drng.uniform(0.0, 2 * np.pi)
+                self._push_vec = mag * np.array([np.cos(ang), np.sin(ang), 0.0])
+                self._push_left = max(1, int(round(self.disturb.dur_s / dt_c)))
+            # xrfc applied is not auto cleared, we need to set it every tick, and zero when its not doing anything.
+            self.d.xfrc_applied[self._push_bid, :3] = self._push_vec if self._push_left > 0 else 0.0
+            self._push_left -= 1
+
+        # Existing code before change to disturbances
         t0 = time.perf_counter()
         self.cmd[4] = self._height()
         obs = rp.build_obs(self.m, self.d, self.policy, self.maps, self.cmd, self.last_action)
@@ -174,6 +197,7 @@ def _command_schedule(seed, n_control_ticks, control_dt, cfg):
 
 
 def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
+                    terrain="flat",
                     collector: Collector | None = None, vx: float = 0.4,
                     settle_s: float = SETTLE_S, imu_noise: bool = True,
                     stance_chol: float = 1.0e-4, swing_chol: float = 1.0e1,
@@ -181,27 +205,48 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
                     warmup_ticks: int | None = None,
                     out_dir: Path | str | None = DATA_DIR, cfg: ContactNetConfig = ContactNetConfig(),
                     cmd_override = None, verbose: bool = True) -> Rollout:
-    """Walk flat ground for `seconds`, record at 1/rp.DT Hz, run the estimator once, save.
+    """Walk for `seconds`, record at 1/rp.DT Hz, run the estimator once, save.
 
     Raises RuntimeError -- never returns partial data -- if the robot falls or goes
     non-finite. terrain_name is fixed to "flat" (the built-in plane floor)."""
+    from invariant_estimation.sim import terrain as terr
     c = collector or build_collector(verbose=verbose)
+    dr_rng = np.random.default_rng((int(seed) << 24) ^ 0xDEADBEEF)
+
+    use_terrain = terrain != "flat"
+    field = terr.sample_field(terrain, seed) if use_terrain else None
+    m = rp.build_sim_model(c.policy, with_visuals=False, with_imu_sensors=True, terrain=field)
+
+    if cfg.env_dr:
+        # MuJoCo mixes pairwise friction by ELEMENT-WISE MAX -> a low mu on the foot
+        # alone is clipped back up by the mu = 1 floor, so we set both, so the effective mu is the one that we want.
+        if dr_rng.random() < cfg.friction_low_tail_prob:
+            lo, hi = cfg.friction_low_tail
+        else:
+            lo, hi = cfg.friction_range
+        mu = float(dr_rng.uniform(lo, hi))
+        gids = [m.geom(n).id for n in rp.FOOT_GEOMS] + [m.geom("floor").id]
+        m.geom_friction[gids, 0] = mu
+    else:
+        mu = float(rp.CONTACT["friction"].split()[0])
+
     control_dt = rp.DT * rp.DECIMATION
     n_ticks = int(round(seconds / control_dt))
     settle_ticks = int(round(settle_s / control_dt))
     total_ticks = settle_ticks + n_ticks
     T = total_ticks * rp.DECIMATION
 
-    m = rp.build_sim_model(c.policy, with_visuals=False, with_imu_sensors=True)
-
     reader = SimSensorReader(m, c.fused, foot_geoms=rp.FOOT_GEOMS, dt=c.dt,
                              noise=IMUNoise(seed=int(seed)) if imu_noise else None,
                              stance_chol=stance_chol, swing_chol=swing_chol)
-    loop = _RecordingLoop(m, c.policy, rp.make_maps(m, c.policy), reader)
+    disturb = (Disturb(cfg.disturb_rate_hz, cfg.disturb_mag_N, cfg.disturb_dur_s) if cfg.env_dr else None)
+    loop = _RecordingLoop(m, c.policy, rp.make_maps(m, c.policy), reader, disturb=disturb, dr_seed=seed)
 
     x0, y0, yaw = spawn_pose(seed, radius=spawn_radius)
     loop.d.qpos[0:2] = (x0, y0)
     loop.d.qpos[3:7] = (np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2))
+    if use_terrain:
+        loop.d.qpos[2] = float(field.max()) + 0.02
     mujoco.mj_forward(m, loop.d)
     loop.set_height_target(loop.height_target)
 
@@ -216,7 +261,7 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
     )
 
     if verbose:
-        print(f"  flat/seed{seed}: spawn=({x0:+.1f},{y0:+.1f})m yaw={np.degrees(yaw):+.0f}deg  "
+        print(f"  {terrain}/seed{seed}: spawn=({x0:+.1f},{y0:+.1f})m yaw={np.degrees(yaw):+.0f}deg  "
               f"{settle_s:.0f}s settle + {seconds:.0f}s walk -> T={T} ticks")
     if cmd_override is not None:
         sched, per = np.asarray([cmd_override], dtype=float), max(1, total_ticks)  # override the schedule with a single command
@@ -230,13 +275,13 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
             loop.cmd[3] = 0.0
         loop.control_tick()
         if not np.all(np.isfinite(loop.d.qpos)):
-            raise RuntimeError(f"flat/seed{seed}: non-finite qpos at control tick {k}")
+            raise RuntimeError(f"{terrain}/seed{seed}: non-finite qpos at control tick {k}")
 
     sensors = _stack(loop.sensors)
     truth = _stack(loop.truth)
     assert len(loop.sensors) == T, f"recorded {len(loop.sensors)} ticks, expected {T}"
 
-    tilt = _check_rollout(truth, max_tilt_deg=max_tilt_deg, label=f"flat/seed{seed}")
+    tilt = _check_rollout(truth, max_tilt_deg=max_tilt_deg, label=f"{terrain}/seed{seed}")
 
     t0 = time.perf_counter()
     inputs, aux, chunk_wall = _run_fused_chunked(c, carry, sensors, T)
@@ -277,6 +322,14 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
         "wall_read_s": loop.read_s,
         "wall_fused_s": fused_s,
         "wall_fused_chunks_s": chunk_wall,
+        "terrain": terrain,
+        "friction_mu": mu,
+        "env_dr": bool(cfg.env_dr),
+        "disturb": (None if disturb is None else {
+            "rate_hz": float(cfg.disturb_rate_hz),
+            "mag_N": list(cfg.disturb_mag_N),
+            "dur_s": float(cfg.disturb_dur_s)
+        })
     }
     if verbose:
         sim_s = seconds + settle_s
@@ -287,7 +340,7 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
     roll = Rollout(sensors=sensors, inputs=inputs, truth=truth, aux=aux, meta=meta)
     _assert_float64(roll)
     if out_dir is not None:
-        path = Path(out_dir) / f"flat_seed{seed:03d}.npz"
+        path = Path(out_dir) / f"{terrain}_seed{seed:03d}.npz"
         save_rollout(roll, path)
         if verbose:
             print(f"    -> {path}  ({path.stat().st_size / 1e6:.0f} MB)")
@@ -437,5 +490,5 @@ def collect_all(seeds: Sequence[int] = (0, 1, 2), seconds: float = 60.0, *,
             roll = collect_rollout(int(s), seconds, collector=c, out_dir=out_dir, **kw)
             metas.append(roll.meta)
         except RuntimeError as e:
-            print(f"  skipped flat/seed{s}: {e}")
+            print(f"  skipped {kw.get('terrain', 'flat')}/seed{s}: {e}")
     return metas
