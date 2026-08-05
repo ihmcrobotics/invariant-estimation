@@ -178,13 +178,37 @@ than retrained, which is what makes an 8000-step R3 affordable in the remaining
 window. The N=2 regression suites confirm this commit does not change N=2 behaviour,
 so the comparison stands.
 
-| Run | N | data | loss | steps | held-out vel RMSE | NIS/dof | verdict |
-|---|---|---|---|---|---|---|---|
-| R0 baseline (analytic) | 2 | flat | — | — | 0.0517 | 0.0277 | reference |
-| **R0 learned** | 2 | flat | L2 | 8000 | **0.0387** | 0.0418 | **beats baseline** |
-| R1 | 2 | flat | β-NLL | 300 | 0.83 | 2.36 | *undertrained — see below* |
-| R0′ control | 2 | flat | L2 | 300 | 0.79 | 2.17 | *undertrained* |
-| R3 | 8 | DR | β-NLL | | | | |
+| Run | N | data | loss | steps | held-out vel RMSE | NIS/dof | applied | verdict |
+|---|---|---|---|---|---|---|---|---|
+| R0 baseline (analytic) | 2 | flat | — | — | 0.0517 | 0.0277 | 1.00 | reference |
+| **R0 learned** | 2 | flat | L2 | 8000 | **0.0387** | 0.0418 | 1.00 | **beats baseline** |
+| R1 | 2 | flat | β-NLL | 300 | 0.83 | 2.36 | 1.00 | *undertrained* |
+| R0′ control | 2 | flat | L2 | 300 | 0.79 | 2.17 | 1.00 | *undertrained* |
+| **R3** | 8 | DR | β-NLL | 6000 | **0.20 – 0.59** | **1.31 – 3.21** | 1.00 | **mean-excuse** |
+| R3b | 8 | DR | L2 | 6000 | *(running)* | | | *the disambiguator* |
+
+### R3 (N=8 + DR + β-NLL), per terrain — the plan's required breakdown
+
+| terrain | baseline vel RMSE | learned vel RMSE | baseline NIS/dof | learned NIS/dof |
+|---|---|---|---|---|
+| flat | 0.0572 | 0.2008 | 0.045 | **1.31** |
+| hard_stepping | 0.0552 | 0.2474 | 0.043 | **1.39** |
+| stepping_stones | 0.0639 | 0.2150 | 0.046 | **1.37** |
+| waves | 0.0511 | 0.5929 | 0.037 | 3.21 |
+
+Read this as one sentence: **calibration went from badly over-confident to nearly
+ideal, and the mean got 3.5–11× worse.** NIS/dof moved 0.04 → ~1.35 (target 1.0);
+velocity RMSE moved 0.055 → ~0.22. `waves` is the outlier on both axes.
+
+That is textbook plan-§6 "mean-excuse": β-NLL is free to widen Σ until the
+innovations look statistically consistent, and a biased mean is then *excused*
+rather than corrected. It is exactly the failure the plan told us to watch for and
+fall back to the hybrid objective on.
+
+**The confound, stated plainly:** R3 uses β-NLL and R0 uses L2, so the velocity
+regression cannot be attributed to N=8 on this evidence alone. R3b (N=8, DR, **L2**)
+is running to separate them — it shares R3's contact count and dataset and differs
+only in objective.
 
 ### Correction: β-NLL is NOT shown to fail
 
@@ -199,6 +223,37 @@ and nonzero at both N=2 and N=8, and it drives the loss negative (expected — t
 `0.5(NIS + logdet S)` form is unbounded below in `logdet`, unlike a sum of
 squares). Whether it beats L2 needs a matched-step comparison that did not fit in
 this window.
+
+---
+
+## 5b. Per-corner Σ_C is NOT degenerate — the research question, answered
+
+This was the plan's open question and the stated PARTIAL criterion ("Σ_C
+degenerate/identical across a foot's corners ⇒ FK-only discrimination is
+insufficient"). Measured on R3, over 4 s of walking:
+
+```
+median relative spread across a foot's 4 corners : 8.1 %
+max    relative spread                           : 53.7 %
+per-corner median det(Σ_C)^(1/3)  [m]:
+    heel-R 7.12e-9   heel-L 7.02e-9   toe-R 6.81e-9   toe-L 7.01e-9
+```
+
+![Sigma_C over a stride](results/2026-08-05_03-12-27_R3_n8_dr_betanll/sigma_c_over_stride.png)
+
+Two things in that figure matter:
+
+1. **Σ_C is strongly gait-modulated** — nearly two orders of magnitude between
+   stance and swing. The network learned the thing it was supposed to learn.
+2. **The heel pair separates from the toe pair** (blue/orange sit clearly below
+   green/red around t ≈ 0.6–1.0 s). The corners are not merely different by
+   noise; they split along the physically meaningful axis, and the lower panel
+   shows why — heel and toe corners make and break contact at different times,
+   which is precisely the signal per-corner attribution was built to expose.
+
+So FK-only discrimination **is** sufficient to distinguish corners, at least
+heel-from-toe. The medians are close because all four corners spend most of a
+stride in the same regime; the spread appears where the physics differs.
 
 ---
 

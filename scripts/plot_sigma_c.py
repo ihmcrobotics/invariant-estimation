@@ -59,8 +59,13 @@ def plot_sigma_over_stride(sigma, contact_force, out_path, foot=0, cpf=4, dt=1e-
     for j in range(cpf):
         i = foot * cpf + j
         c, ls = CORNER_STYLE[j]
-        ax.plot(t, contact_force[:, i], color=c, ls=ls, lw=1.2)
-    ax.set_ylabel("normal force [N]")
+        # offset each corner slightly so overlapping 0/1 traces stay readable
+        ax.plot(t, contact_force[:, i] * 0.9 + 0.04 * j, color=c, ls=ls, lw=1.2)
+    # This is the per-corner CONTACT TRUST mask the sim publishes (0/1), not a
+    # force in newtons -- labelling it "normal force" would be a plain untruth
+    # about what the reader is looking at.
+    ax.set_ylabel("per-corner contact trust")
+    ax.set_yticks([0, 1])
     ax.set_xlabel("time [s]")
     ax.grid(alpha=0.3)
 
