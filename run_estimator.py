@@ -412,10 +412,17 @@ def run_headless(loop, ticks, cmd=None, out=None, every=25, video=None, video_fp
         print(f"  recording {w}x{h} @ {control_hz / stride:.0f} fps -> {video}")
     x0, y0 = loop.d.qpos[0], loop.d.qpos[1]
     t0 = time.time()
+    def _overlay(scn):
+        """Draw the estimate's ghost into the offscreen scene, if one is configured."""
+        est = loop.current_estimate()
+        if loop.ghost is not None and est is not None:
+            loop.ghost.update(est, loop.d)
+            loop.ghost.draw(scn)
+
     for k in range(ticks):
         loop.control_tick()
         if rec is not None and k % stride == 0:
-            rec.capture(loop.d)
+            rec.capture(loop.d, overlay=_overlay if loop.ghost is not None else None)
         if k % every == 0:
             print(f"  t={k * rp.DECIMATION * rp.DT:5.2f}s  {loop.status()}\n"
                   f"            {loop.est_status()}")
@@ -556,10 +563,13 @@ if __name__ == "__main__":
         contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every,
         threaded=args.realtime, max_backlog_ticks=args.max_backlog_ticks,
         contactnet=args.contactnet, contactnet_norm=args.contactnet_norm)
-    # The ghost is a viewer feature: it draws, and headless has nothing to draw into.
-    if args.ghost != "off" and headless:
-        raise SystemExit("--ghost needs a viewer; drop --headless/--video")
-    if not headless:
+    # The ghost draws into an `mjvScene`. The viewer has one; so does an offscreen
+    # `mujoco.Renderer`, so --ghost now composes with --video (that is how the
+    # validation recording is made). It still has nothing to draw into on a bare
+    # --headless run with no recording.
+    if args.ghost != "off" and headless and not args.video:
+        raise SystemExit("--ghost needs a viewer or --video; drop --headless")
+    if not headless or args.video:
         loop.ghost = Ghost(loop.m, loop.maps, loop.filtered_slots,
                            offset=args.ghost_offset, mode=args.ghost)
     if headless:

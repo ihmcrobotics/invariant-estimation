@@ -810,8 +810,16 @@ class VideoRecorder:
              "-pix_fmt", "yuv420p", path],
             stdin=subprocess.PIPE)
 
-    def capture(self, d):
+    def capture(self, d, overlay=None):
+        """Render one frame. `overlay(scn)` may append geoms to the offscreen scene.
+
+        The hook is what lets the estimator ghost -- previously viewer-only, because
+        headless "has nothing to draw into" -- be recorded: `mujoco.Renderer` owns a
+        real `mjvScene`, so `Ghost.draw` works against it unchanged.
+        """
         self.renderer.update_scene(d, camera=self.cam, scene_option=self.opt)
+        if overlay is not None:
+            overlay(self.renderer.scene)
         self.proc.stdin.write(self.renderer.render().tobytes())
         self.n += 1
 

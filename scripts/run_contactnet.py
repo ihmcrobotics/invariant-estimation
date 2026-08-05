@@ -184,15 +184,28 @@ def main():
                     help="suffix appended to the timestamped run directory name")
     ap.add_argument("--out-dir", type=str, default=None,
                     help="write artifacts here instead of results/<timestamp>/")
+    ap.add_argument("--contacts-per-foot", type=int, default=1,
+                    help="1 = the shipped N=2 soles, 4 = the N=8 corner set")
+    ap.add_argument("--objective", type=str, default=None,
+                    choices=["l2_velocity", "beta_nll"],
+                    help="override ContactNetConfig.objective (the run-ladder knob)")
+    ap.add_argument("--pool", type=str, default=None,
+                    help="rollout pool tag, e.g. 'n8'. Selects data/*_<tag>_seed*.npz "
+                         "and holds out one rollout PER TERRAIN for validation. "
+                         "Omit for the flat N=2 pool addressed by --train-seeds.")
     args = ap.parse_args()
 
-    cfg = ContactNetConfig()
+    overrides = {}
+    if args.objective is not None:
+        overrides["objective"] = args.objective
+    cfg = ContactNetConfig(**overrides)
 
     t_start = time.time()
     started_at = datetime.now().isoformat(timespec="seconds")
     out = make_run_dir(RESULTS_ROOT, tag=args.tag, explicit=args.out_dir)
     print(f"== run directory: {out} ==")
-    c = collect.build_collector(policy_name="baseline", chunk_ticks=10_000)
+    c = collect.build_collector(policy_name="baseline", chunk_ticks=10_000,
+                                contacts_per_foot=args.contacts_per_foot)
 
     if args.collect:
         print("== collecting ==")
@@ -200,8 +213,23 @@ def main():
         collect_rollouts(c, args.train_seeds, args.seconds, cfg)
         collect_rollouts(c, args.val_seeds, args.seconds, cfg, val_cmd)
 
-    train_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.train_seeds]
-    val_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.val_seeds]
+    if args.pool:
+        # Hold out one rollout PER TERRAIN, not a random slice: Gate G evaluates on
+        # terrain specifically, and a pooled split can leave a terrain unrepresented
+        # in val, which is exactly the averaging that hides the terrain effect.
+        pool = sorted(collect.DATA_DIR.glob(f"*_{args.pool}_seed*.npz"))
+        if not pool:
+            raise SystemExit(f"no rollouts matching *_{args.pool}_seed*.npz in {collect.DATA_DIR}")
+        by_terrain = {}
+        for p in pool:
+            by_terrain.setdefault(p.name.split(f"_{args.pool}_")[0], []).append(p)
+        val_paths = [v[-1] for v in by_terrain.values() if v]
+        train_paths = [p for p in pool if p not in set(val_paths)]
+        print(f"pool '{args.pool}': {len(pool)} rollouts over "
+              f"{ {k: len(v) for k, v in by_terrain.items()} }")
+    else:
+        train_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.train_seeds]
+        val_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.val_seeds]
     train_paths = [p for p in train_paths if p.exists()]
     val_paths = [p for p in val_paths if p.exists()]
     print(f"train rollouts: {[p.name for p in train_paths]}")
