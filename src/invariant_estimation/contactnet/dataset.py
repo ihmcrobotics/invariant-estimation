@@ -85,7 +85,7 @@ def chunked_fk(kinematics, q: np.ndarray, chunk: int = 2_000) -> np.ndarray:
 
 def build_channel_cache(paths: Sequence[Path | str], collector: collect.Collector, *,
                         cache_dir: Path | str = CACHE_DIR, chunk: int = 2_000,
-                        verbose: bool = True) -> list[Path]:
+                        reuse: bool = True, verbose: bool = True) -> list[Path]:
     r"""Write raw (not normalized) channels + y_fk for every rollout in paths.
 
     channels is features.make_contact_channels over Rollout.sensors (raw: the
@@ -100,15 +100,47 @@ def build_channel_cache(paths: Sequence[Path | str], collector: collect.Collecto
     channels = features.make_contact_channels(
         sub, fused.base_imu, fused.kinematics, collector.dt)
 
+    expect_names = np.asarray(features.channel_names())
+    n_c = int(fused.n_contacts)
+
+    def _reusable(out: Path, src: Path) -> bool:
+        """Is `out` a cache we can trust for `src` under the CURRENT feature code?
+
+        Rebuilding every channel cache costs ~4 min/rollout, which dominates a
+        training run whose inputs have not changed. But a stale cache is worse
+        than a slow one -- it trains on features that no longer match the code
+        and nothing downstream would notice -- so reuse is allowed only when all
+        of these hold, and ANY mismatch falls through to a rebuild:
+          * the cache is newer than the rollout it came from;
+          * the channel NAMES are identical (catches a changed/reordered channel
+            set, which is the realistic way this goes wrong);
+          * the contact axis matches this collector's N (an N=2 cache must never
+            be reused for an N=8 run).
+        """
+        if not (out.exists() and out.stat().st_mtime >= src.stat().st_mtime):
+            return False
+        try:
+            with np.load(out, allow_pickle=False) as z:
+                if not np.array_equal(z["names"], expect_names):
+                    return False
+                return z["channels"].shape[1] == n_c and z["y_fk"].shape[1] == n_c
+        except Exception:
+            return False
+
     written = []
     for p in paths:
         p = Path(p)
+        out = cache_dir / f"{p.stem}_feat.npz"
+        if reuse and _reusable(out, p):
+            written.append(out)
+            if verbose:
+                print(f"  reused {out.name} (cache newer than rollout, channels match)")
+            continue
         roll = collect.load_rollout(p)
         x = collect.contact_channels_chunked(channels, roll.sensors, chunk=chunk)
         y = chunked_fk(fused.kinematics, roll.inputs.joint.q, chunk=chunk)
         if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
             raise RuntimeError(f"{p.name}: non-finite features/FK in the cache pass")
-        out = cache_dir / f"{p.stem}_feat.npz"
         np.savez_compressed(
             out, channels=x, y_fk=y,
             names=np.asarray(features.channel_names()),

@@ -99,9 +99,19 @@ def save_norm(norm, path):
 
 
 def _windows_full(cache, norm, cfg):
-    """(T, N_c, H, F) normalized feature windows over the whole stream."""
-    x = normalize.apply(jnp.asarray(cache["channels"]), norm)
-    return np.asarray(features.window(x, cfg.H))
+    """(T, N_c, H, F) normalized feature windows over the whole stream.
+
+    Forced onto the CPU device. This materialises T*N_c*H*F float64 -- 0.6 GB at
+    T=62k, N=2, and 2.4 GB at N=8 -- plus a transpose copy, and doing that on the
+    accelerator OOM'd a 12 GB card mid-validation after training had already
+    finished, losing the run. It is a one-shot gather with no math in it, so the
+    GPU buys nothing here; the result is handed back as NumPy and only the sliced
+    usable region is put back on device by the caller.
+    """
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        x = normalize.apply(jnp.asarray(cache["channels"], dtype=jnp.float64), norm)
+        return np.asarray(features.window(x, cfg.H))
 
 
 def validate(prep, cache, norm, cfg, params, fused, P0, eps):
@@ -184,15 +194,28 @@ def main():
                     help="suffix appended to the timestamped run directory name")
     ap.add_argument("--out-dir", type=str, default=None,
                     help="write artifacts here instead of results/<timestamp>/")
+    ap.add_argument("--contacts-per-foot", type=int, default=1,
+                    help="1 = the shipped N=2 soles, 4 = the N=8 corner set")
+    ap.add_argument("--objective", type=str, default=None,
+                    choices=["l2_velocity", "beta_nll"],
+                    help="override ContactNetConfig.objective (the run-ladder knob)")
+    ap.add_argument("--pool", type=str, default=None,
+                    help="rollout pool tag, e.g. 'n8'. Selects data/*_<tag>_seed*.npz "
+                         "and holds out one rollout PER TERRAIN for validation. "
+                         "Omit for the flat N=2 pool addressed by --train-seeds.")
     args = ap.parse_args()
 
-    cfg = ContactNetConfig()
+    overrides = {}
+    if args.objective is not None:
+        overrides["objective"] = args.objective
+    cfg = ContactNetConfig(**overrides)
 
     t_start = time.time()
     started_at = datetime.now().isoformat(timespec="seconds")
     out = make_run_dir(RESULTS_ROOT, tag=args.tag, explicit=args.out_dir)
     print(f"== run directory: {out} ==")
-    c = collect.build_collector(policy_name="baseline", chunk_ticks=10_000)
+    c = collect.build_collector(policy_name="baseline", chunk_ticks=10_000,
+                                contacts_per_foot=args.contacts_per_foot)
 
     if args.collect:
         print("== collecting ==")
@@ -200,8 +223,23 @@ def main():
         collect_rollouts(c, args.train_seeds, args.seconds, cfg)
         collect_rollouts(c, args.val_seeds, args.seconds, cfg, val_cmd)
 
-    train_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.train_seeds]
-    val_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.val_seeds]
+    if args.pool:
+        # Hold out one rollout PER TERRAIN, not a random slice: Gate G evaluates on
+        # terrain specifically, and a pooled split can leave a terrain unrepresented
+        # in val, which is exactly the averaging that hides the terrain effect.
+        pool = sorted(collect.DATA_DIR.glob(f"*_{args.pool}_seed*.npz"))
+        if not pool:
+            raise SystemExit(f"no rollouts matching *_{args.pool}_seed*.npz in {collect.DATA_DIR}")
+        by_terrain = {}
+        for p in pool:
+            by_terrain.setdefault(p.name.split(f"_{args.pool}_")[0], []).append(p)
+        val_paths = [v[-1] for v in by_terrain.values() if v]
+        train_paths = [p for p in pool if p not in set(val_paths)]
+        print(f"pool '{args.pool}': {len(pool)} rollouts over "
+              f"{ {k: len(v) for k, v in by_terrain.items()} }")
+    else:
+        train_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.train_seeds]
+        val_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.val_seeds]
     train_paths = [p for p in train_paths if p.exists()]
     val_paths = [p for p in val_paths if p.exists()]
     print(f"train rollouts: {[p.name for p in train_paths]}")
@@ -266,7 +304,13 @@ def main():
         cache = dataset.load_channel_cache(dataset.cache_path(vpath))
         base, learned = validate(vp, cache, norm, cfg, params, c.fused, P0, cfg.eps)
         seed = int(vp.name.split("seed")[1].split(".")[0])
-        label = VAL_MODES.get(seed, ("mixed", None))[0]
+        if args.pool:
+            # Under --pool the held-out set is one rollout PER TERRAIN, so the
+            # terrain IS the label -- that is what makes the per-terrain table in
+            # results.md possible instead of a single pooled average.
+            label = vp.name.split(f"_{args.pool}_")[0]
+        else:
+            label = VAL_MODES.get(seed, ("mixed", None))[0]
         print(f"  {vp.name}: baseline={base}  learned={learned}")
         val_metrics.append({"mode": label, "rollout": vp.name, "baseline": base, "learned": learned})
 
@@ -296,18 +340,25 @@ def main():
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print("== summary ==")
     print(json.dumps(summary, indent=2))
-    make_plots(hist, val_metrics, out)
+    make_plots(hist, val_metrics, out, cfg.objective)
 
 
-def make_plots(hist, val_metrics, out):
+def make_plots(hist, val_metrics, out, objective="l2_velocity"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     if hist.size:
         fig, ax = plt.subplots(1, 3, figsize=(15, 4))
-        ax[0].plot(hist[:, 0]); ax[0].set_title("training loss (l2_velocity)")
-        ax[0].set_xlabel("step"); ax[0].set_ylabel("loss"); ax[0].set_yscale("log")
+        ax[0].plot(hist[:, 0])
+        # The objective is NOT always l2_velocity, and beta_nll's loss is NEGATIVE
+        # (0.5*(NIS + logdet S) is unbounded below in logdet). A hardcoded log scale
+        # drops every point and renders an EMPTY panel -- which is exactly what the
+        # first N=8 beta-NLL run produced. Log only when the curve is all-positive.
+        ax[0].set_title(f"training loss ({objective})")
+        ax[0].set_xlabel("step"); ax[0].set_ylabel("loss")
+        if np.all(hist[:, 0] > 0):
+            ax[0].set_yscale("log")
         ax[1].plot(hist[:, 2]); ax[1].axhline(1.0, ls="--", c="k", lw=0.8)
         ax[1].set_title("contact NIS / dof"); ax[1].set_xlabel("step")
         ax[2].plot(hist[:, 4]); ax[2].set_title("cumulative reseeds"); ax[2].set_xlabel("step")

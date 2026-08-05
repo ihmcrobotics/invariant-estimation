@@ -1,0 +1,98 @@
+[
+  {
+    "label": "flat",
+    "rollout": "flat_n8_seed008.npz",
+    "baseline": {
+      "vel_rmse": 0.05724628941489031,
+      "vel_nees": 4.3382027164683405,
+      "vel_nees_tangent": 6.4775647195793935,
+      "vel_nees_x": 0.11732964251387065,
+      "vel_nees_y": 0.05494014822431225,
+      "vel_nees_z": 2.1801426776608586,
+      "nis_over_dof": 0.04511032432712204,
+      "applied": 0.9999999999999999
+    },
+    "learned": {
+      "vel_rmse": 0.20082243913099176,
+      "vel_nees": 51.074396777007664,
+      "vel_nees_tangent": 109.19394530566028,
+      "vel_nees_x": 1.8188416388278912,
+      "vel_nees_y": 1.9435968435775686,
+      "vel_nees_z": 16.658895843863977,
+      "nis_over_dof": 1.3087246363649636,
+      "applied": 0.9999999999999999
+    }
+  },
+  {
+    "label": "hard_stepping",
+    "rollout": "hard_stepping_n8_seed007.npz",
+    "baseline": {
+      "vel_rmse": 0.05516395724556491,
+      "vel_nees": 4.161727512985568,
+      "vel_nees_tangent": 5.777363188275045,
+      "vel_nees_x": 0.04004642965345144,
+      "vel_nees_y": 0.07805985059953549,
+      "vel_nees_z": 2.3596892275748385,
+      "nis_over_dof": 0.04347231925812959,
+      "applied": 0.9999999999999999
+    },
+    "learned": {
+      "vel_rmse": 0.24738882237865117,
+      "vel_nees": 81.38699222191094,
+      "vel_nees_tangent": 126.80259363882665,
+      "vel_nees_x": 2.9220941123524025,
+      "vel_nees_y": 1.3694245519694535,
+      "vel_nees_z": 21.282904065753726,
+      "nis_over_dof": 1.388033760767154,
+      "applied": 0.9999999999999999
+    }
+  },
+  {
+    "label": "stepping_stones",
+    "rollout": "stepping_stones_n8_seed010.npz",
+    "baseline": {
+      "vel_rmse": 0.06385824282674098,
+      "vel_nees": 4.593192626353214,
+      "vel_nees_tangent": 6.820882090213222,
+      "vel_nees_x": 0.2897081985027732,
+      "vel_nees_y": 0.08364150293109433,
+      "vel_nees_z": 1.8688953441546559,
+      "nis_over_dof": 0.04569513428153655,
+      "applied": 0.9999999999999999
+    },
+    "learned": {
+      "vel_rmse": 0.21503866232927796,
+      "vel_nees": 53.122256495936874,
+      "vel_nees_tangent": 175.54491434347023,
+      "vel_nees_x": 2.525213283566397,
+      "vel_nees_y": 1.7204389381596867,
+      "vel_nees_z": 21.46273454522731,
+      "nis_over_dof": 1.366799502666126,
+      "applied": 0.9999999999999999
+    }
+  },
+  {
+    "label": "waves",
+    "rollout": "waves_n8_seed009.npz",
+    "baseline": {
+      "vel_rmse": 0.05106821528372667,
+      "vel_nees": 3.2128638629115978,
+      "vel_nees_tangent": 4.799603015465344,
+      "vel_nees_x": 0.0930783923599808,
+      "vel_nees_y": 0.046866554545728974,
+      "vel_nees_z": 1.68558355854489,
+      "nis_over_dof": 0.036500751005527125,
+      "applied": 0.9999999999999999
+    },
+    "learned": {
+      "vel_rmse": 0.5928871844014287,
+      "vel_nees": 402.89302669521817,
+      "vel_nees_tangent": 878.5732425606764,
+      "vel_nees_x": 10.825570387077175,
+      "vel_nees_y": 9.794267998581045,
+      "vel_nees_z": 91.05683764945701,
+      "nis_over_dof": 3.2119423437228605,
+      "applied": 0.9999999999999999
+    }
+  }
+]

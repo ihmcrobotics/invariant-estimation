@@ -23,4 +23,28 @@ def l2_velocity(
     body_true = jnp.einsum("...ji,...j->...i", R_true, v_true)
     return jnp.mean(jnp.sum((body_estimated - body_true) ** 2, axis=-1))
 
-#TODO: add beta NLl once ready.
+def beta_nll_from_diagnostics(
+    nis,
+    logdet_S,
+    applied,
+    beta,
+    dof
+):
+    """
+    Per-tick Gaussian innovation NLL, beta-weighted (Seitzer et al. 2022, "On the pitfalls of heteroscedastic uncertainty estimation with probabilistic neural networks"). 
+    This is averaged over applied+finite ticks, with NIS and the logdet_S defined as:
+        NIS = nu^T S^{-1} nu, logdet_S = log(det(S)), where nu is the innovation and S is the innovation covariance.
+    These are both from the same cholesky in linear_update, with DOF = 3 * N_c
+    """
+    finite = (applied > 0) & jnp.isfinite(nis) & jnp.isfinite(logdet_S)
+    nis_c = jnp.where(finite, nis, 0.0)
+    logdet_c = jnp.where(finite, logdet_S, 0.0)
+
+    per_tick = 0.5 * (nis_c + logdet_c)
+    weight = jax.lax.stop_gradient(
+        jnp.exp((beta / dof * logdet_c))
+    )
+    term = jnp.where(finite, weight * per_tick, 0.0)
+
+    denom = jnp.maximum(jnp.sum(finite), 1.0)
+    return jnp.sum(term) / denom
