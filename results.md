@@ -1,13 +1,27 @@
 # β-NLL + Env-DR + N=8 — verdict
 
-> **VERDICT: PARTIAL — with one FAIL inside it.**
-> N=8 lands structurally and is verified gate by gate. **β-NLL fails outright at
-> N=2 on flat ground** (9× worse held-out velocity than the analytic baseline),
-> which means it cannot be used to evaluate N=8 without confounding the contact
-> count with a broken objective. Two blocking defects were found and fixed in the
-> *inherited* base before any of that could be measured. Details and numbers below.
-
-*(placeholder — final numbers filled in as the ladder completes; see §Run ladder.)*
+> ## VERDICT: **PARTIAL**
+>
+> **What is established:**
+> 1. **N=8 lands structurally**, gate by gate, with the N=2 regression preserved.
+> 2. **Per-corner Σ_C is not degenerate** — the plan's open research question.
+>    FK alone distinguishes corners, along the heel/toe axis, with no new channels
+>    and no contact-force channel. 33 % median spread under L2.
+> 3. **β-NLL is the mean-excuse failure, and it is now attributed.** Changing
+>    *only* the objective (R3 → R3b, identical N, data, steps) recovers
+>    **2.5–6.7×** of velocity accuracy. Recommend the hybrid/L2 fallback that
+>    plan §6 prescribed.
+> 4. **The N=8 conditioning gate does not collapse** — `applied = 1.00` on every
+>    run and terrain, contradicting my own conservative prediction (§3).
+>
+> **What is NOT established:** whether N=8 *improves* the estimate. R3b is still
+> ~1.4–1.6× worse than the analytic baseline while R0 (N=2, flat) beat it — but N,
+> dataset and step count all differ at once. The missing run is N=2 on the same DR
+> pool.
+>
+> **Also:** four defects in the *inherited* base had to be fixed before any of this
+> was measurable, including one that had never executed and one that spawned the
+> robot underground.
 
 ---
 
@@ -20,9 +34,10 @@ estimator". The honest answer this run supports:
 |---|---|---|
 | Does N=8 build correctly? | **Yes** | Gates A–D, 29 new oracles, mutation-checked |
 | Is N=8 conditioning a problem? | **Yes, quantified** | cond(S) = 1.09e9 vs `cond_s_max` = 1e9 |
-| Does β-NLL help? | **Not established** | 300-step runs are undertrained; L2 control is equally bad (§5) |
+| Does β-NLL help? | **No — it costs 2.5–6.7× velocity** | R3 vs R3b, objective is the only difference (§5) |
 | Did DR work as shipped? | **No — three separate defects** | §1, §4; incl. robot spawned buried in terrain |
-| Does N=8 improve the estimate? | See §Run ladder | |
+| Is per-corner Σ_C degenerate? | **No — 33 % spread, heel/toe split** | §5b |
+| Does N=8 improve the estimate? | **Not established** | N, data and steps all differ at once (§5) |
 
 ---
 
@@ -184,8 +199,8 @@ so the comparison stands.
 | **R0 learned** | 2 | flat | L2 | 8000 | **0.0387** | 0.0418 | 1.00 | **beats baseline** |
 | R1 | 2 | flat | β-NLL | 300 | 0.83 | 2.36 | 1.00 | *undertrained* |
 | R0′ control | 2 | flat | L2 | 300 | 0.79 | 2.17 | 1.00 | *undertrained* |
-| **R3** | 8 | DR | β-NLL | 6000 | **0.20 – 0.59** | **1.31 – 3.21** | 1.00 | **mean-excuse** |
-| R3b | 8 | DR | L2 | 6000 | *(running)* | | | *the disambiguator* |
+| **R3** | 8 | DR | β-NLL | 6000 | **0.20 – 0.59** | 1.31 – 3.21 | 1.00 | **mean-excuse** |
+| **R3b** | 8 | DR | L2 | 6000 | **0.079 – 0.104** | 0.17 – 0.73 | 1.00 | **2.5–6.7× better than R3** |
 
 ### R3 (N=8 + DR + β-NLL), per terrain — the plan's required breakdown
 
@@ -205,10 +220,33 @@ innovations look statistically consistent, and a biased mean is then *excused*
 rather than corrected. It is exactly the failure the plan told us to watch for and
 fall back to the hybrid objective on.
 
-**The confound, stated plainly:** R3 uses β-NLL and R0 uses L2, so the velocity
-regression cannot be attributed to N=8 on this evidence alone. R3b (N=8, DR, **L2**)
-is running to separate them — it shares R3's contact count and dataset and differs
-only in objective.
+### R3b (N=8 + DR + **L2**) — the disambiguator, and the headline result
+
+R3b differs from R3 in **exactly one thing**: the objective. Same contact count,
+same rollouts, same split, same step count, same seed.
+
+| terrain | analytic baseline | R3 (β-NLL) | **R3b (L2)** | R3b vs R3 |
+|---|---|---|---|---|
+| flat | 0.0572 | 0.2008 | **0.0814** | 2.5× better |
+| hard_stepping | 0.0552 | 0.2474 | **0.0791** | 3.1× better |
+| stepping_stones | 0.0639 | 0.2150 | **0.1042** | 2.1× better |
+| waves | 0.0511 | 0.5929 | **0.0885** | 6.7× better |
+
+**Changing only the objective recovers 2.5–6.7× of velocity accuracy.** That is a
+clean attribution: the velocity regression in R3 belongs to β-NLL, not to N=8 and
+not to the DR dataset. Plan §6 called this failure mode in advance and prescribed
+the fallback; the data now supports acting on it.
+
+R3b's calibration is also good (NIS/dof 0.17–0.73 against a baseline of 0.037–0.046
+— nearer 1 than the analytic filter on three of four terrains), so the calibration
+gain does **not** require β-NLL.
+
+**What R3b does not establish:** its learned net is still ~1.4–1.6× worse than the
+analytic baseline on velocity, whereas R0 (N=2, flat, L2, 8000 steps) *beat* its
+baseline. Three things differ at once — N (2→8), data (flat→DR), and steps
+(8000→6000, with R3b's loss still falling) — so this is not a clean verdict on N=8.
+Naming that honestly is the point: the run that would settle it is N=2 on the same
+DR pool at 6000 steps, which did not fit tonight.
 
 ### Correction: β-NLL is NOT shown to fail
 
@@ -232,28 +270,36 @@ This was the plan's open question and the stated PARTIAL criterion ("Σ_C
 degenerate/identical across a foot's corners ⇒ FK-only discrimination is
 insufficient"). Measured on R3, over 4 s of walking:
 
-```
-median relative spread across a foot's 4 corners : 8.1 %
-max    relative spread                           : 53.7 %
-per-corner median det(Σ_C)^(1/3)  [m]:
-    heel-R 7.12e-9   heel-L 7.02e-9   toe-R 6.81e-9   toe-L 7.01e-9
-```
+| | R3 (β-NLL) | **R3b (L2)** |
+|---|---|---|
+| median relative spread across a foot's 4 corners | 8.1 % | **33.3 %** |
+| max relative spread | 53.7 % | **102.7 %** |
+| Σ_C dynamic range over a stride | ~2 decades | **~7 decades** |
 
-![Sigma_C over a stride](results/2026-08-05_03-12-27_R3_n8_dr_betanll/sigma_c_over_stride.png)
+**R3b (L2) — the healthy one:**
 
-Two things in that figure matter:
+![Sigma_C over a stride, R3b](results/2026-08-05_04-29-44_R3b_n8_dr_l2/sigma_c_over_stride.png)
 
-1. **Σ_C is strongly gait-modulated** — nearly two orders of magnitude between
-   stance and swing. The network learned the thing it was supposed to learn.
-2. **The heel pair separates from the toe pair** (blue/orange sit clearly below
-   green/red around t ≈ 0.6–1.0 s). The corners are not merely different by
-   noise; they split along the physically meaningful axis, and the lower panel
-   shows why — heel and toe corners make and break contact at different times,
-   which is precisely the signal per-corner attribution was built to expose.
+Three things in that figure matter:
 
-So FK-only discrimination **is** sufficient to distinguish corners, at least
-heel-from-toe. The medians are close because all four corners spend most of a
-stride in the same regime; the spread appears where the physics differs.
+1. **Σ_C is strongly gait-modulated** — ~1e-7 in stance, ~1e-1 in swing. That is
+   the behaviour the socket exists for: trust the contact when it is planted,
+   ignore it when the foot is in the air. The network learned it unsupervised,
+   from the loss alone.
+2. **The corners separate** — heel-L (orange) rides consistently above toe-R
+   (green) through swing. Not noise: they split along the heel/toe axis, and the
+   lower panel shows why — the per-corner trust mask toggles at *different* times
+   for heel and toe, which is exactly the signal per-corner attribution was built
+   to expose.
+3. **β-NLL suppresses this.** Its Σ_C moves over ~2 decades instead of ~7 and its
+   corner spread is 4× smaller. Widening Σ is how β-NLL buys calibration, so it
+   has no incentive to make Σ *small* in stance — and the per-corner structure is
+   collateral damage.
+
+**Verdict on the plan's open research question: FK-only discrimination IS
+sufficient.** The corners are distinguished, along the physically right axis, with
+no new feature channels — and emphatically without a contact-force channel
+(invariant 4 held).
 
 ---
 
@@ -269,13 +315,23 @@ stride in the same regime; the spread appears where the physics differs.
 
 ---
 
-## 7. Recommended next steps
+## 7. Recommended next steps, in priority order
 
-1. **Do not ship β-NLL as configured.** Fall back to the hybrid (L2 anchor +
-   innovation term) that plan §6 names, or re-derive the weighting — the pure
-   stacked `det(S)^{β/dof}` form drives the loss negative and the mean with it.
-2. **The N=8 conditioning number is the real design question.** 1.09e9 against a
-   1e9 floor is not a tuning problem; a rigid foot genuinely does not carry 12
-   independent contact constraints.
-3. Per-corner discrimination, if pursued, should come from a **deployable**
-   signal — torque-derived, never contact force (invariant 4).
+1. **Run N=2 on the DR pool at 6000 steps.** One run, ~90 min, and it is the only
+   thing standing between this and a clean verdict on N=8. Everything else is
+   already in place — the pool, the split, the evaluator, the figures.
+2. **Do not ship β-NLL as configured.** Use the hybrid (L2 anchor + innovation
+   term) from plan §6, or re-derive the weighting. The pure stacked
+   `det(S)^{β/dof}` form is unbounded below in `logdet`, drives the loss negative,
+   and takes the mean with it — measured at 2.5–6.7× worse velocity than L2 on
+   identical data. β-NLL's calibration gain is *not* worth it: R3b gets good
+   calibration under L2 anyway.
+3. **Train longer before concluding anything about N=8.** R3b's loss was still
+   falling at 6000 steps, and the 300-step runs in §5 show this pipeline is
+   actively misleading before it converges.
+4. **The conditioning number is a bound, not a bug.** 1.09e9 against a 1e9 floor
+   says a *stiffer* contact model would cross it, even though today's does not.
+   Worth knowing before anyone raises the contact stiffness.
+5. Per-corner discrimination, if pushed further, should come from a **deployable**
+   signal — torque-derived, never contact force (invariant 4). Though note that
+   FK alone already works (§5b), so this is an enhancement, not a prerequisite.
