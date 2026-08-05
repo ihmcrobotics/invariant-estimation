@@ -20,8 +20,8 @@ estimator". The honest answer this run supports:
 |---|---|---|
 | Does N=8 build correctly? | **Yes** | Gates A–D, 29 new oracles, mutation-checked |
 | Is N=8 conditioning a problem? | **Yes, quantified** | cond(S) = 1.09e9 vs `cond_s_max` = 1e9 |
-| Does β-NLL help? | **No — it is much worse** | R1: vel RMSE 0.83 vs 0.091 m/s baseline |
-| Does DR work as configured? | **No — it was unwalkable** | 7/8 rollouts fell, incl. on flat |
+| Does β-NLL help? | **Not established** | 300-step runs are undertrained; L2 control is equally bad (§5) |
+| Did DR work as shipped? | **No — three separate defects** | §1, §4; incl. robot spawned buried in terrain |
 | Does N=8 improve the estimate? | See §Run ladder | |
 
 ---
@@ -119,10 +119,14 @@ result is about corner correlation specifically, not about N=8 per se.
 
 ---
 
-## 4. Env-DR was not survivable as configured
+## 4. Env-DR was not survivable as configured — two independent causes
 
-7 of the first 8 DR rollouts fell — **including one on flat ground**, which is what
-ruled out the terrain as the cause.
+7 of the first 8 DR rollouts fell, **including one on flat ground**. That flat
+failure is what separated the two causes; had every failure been on terrain, the
+obvious (and wrong) conclusion was "the flat-trained policy cannot walk terrain",
+which is Gate E's STOP and would have cost the terrain tiers entirely.
+
+**Cause 1 — the friction tail (flat failures).**
 
 | Ablation | Result |
 |---|---|
@@ -132,29 +136,53 @@ ruled out the terrain as the cause.
 | friction only (pushes off) | seed 4 **FELL** |
 
 Attribution: **friction**, not pushes. The tail reached μ = 0.15 — effectively ice.
-Note the constant-command sweep cleared every arm: the falls need the DR *and* the
-randomised command schedule together, so a sim-only sweep alone would have missed
-this. Tail widened to (0.45, 0.70), still a genuine slip regime against a ~1.0
-nominal. A tail the policy cannot survive yields no rollouts, which trains nothing.
+The constant-command sweep cleared every arm, so the falls need the DR *and* the
+randomised command schedule together; a sim-only sweep alone would have missed it.
+Tail widened to (0.45, 0.70): still a real slip regime against a ~1.0 nominal, and
+a tail the policy cannot survive yields no rollouts at all.
+
+**Cause 2 — the robot was spawned buried (all terrain failures).**
+`collect_rollout` did `qpos[2] = field.max() + 0.02` — an **assignment**, putting
+the pelvis at ~0.12 m instead of its nominal ~0.9 m. Every terrain rollout began
+with the robot buried to the chest and fell instantly.
+
+What isolated it: after the friction fix, `waves/seed1` still fell with *identical*
+tilt numbers (85.1° / 95.7°) — bit-for-bit the same trajectory. A fix that changes
+nothing means the thing you fixed was not the cause. `test_policy_walks_on_terrain`
+passes on waves precisely because it raises the spawn itself (`+=`) instead of
+going through `collect_rollout`.
 
 ---
 
 ## 5. Run ladder
 
-*(filled in as runs complete)*
+**R0 is the existing 8000-step overnight run** (`results/2026-08-04_00-06-04_overnight`):
+N=2, flat, L2 — exactly the R0 specification, already converged. It is reused rather
+than retrained, which is what makes an 8000-step R3 affordable in the remaining
+window. The N=2 regression suites confirm this commit does not change N=2 behaviour,
+so the comparison stands.
 
-| Run | N | data | loss | held-out vel RMSE | NIS/dof | applied | verdict |
+| Run | N | data | loss | steps | held-out vel RMSE | NIS/dof | verdict |
 |---|---|---|---|---|---|---|---|
-| baseline (analytic) | 2 | flat | — | | | | reference |
-| R0 | 2 | flat | L2 | | | | |
-| R1 | 2 | flat | β-NLL | 0.83 m/s | 2.36 | 1.00 | **FAIL** |
+| R0 baseline (analytic) | 2 | flat | — | — | 0.0517 | 0.0277 | reference |
+| **R0 learned** | 2 | flat | L2 | 8000 | **0.0387** | 0.0418 | **beats baseline** |
+| R1 | 2 | flat | β-NLL | 300 | 0.83 | 2.36 | *undertrained — see below* |
+| R0′ control | 2 | flat | L2 | 300 | 0.79 | 2.17 | *undertrained* |
 | R3 | 8 | DR | β-NLL | | | | |
 
-**R1 (β-NLL alone, N=2, flat) — FAIL.** Held-out velocity RMSE **0.83 m/s** against
-the analytic baseline's **0.091** — 9× worse — with NIS/dof 2.36 vs 0.056 and a
-training loss driven negative. This is plan §6's "mean-excuse" failure mode
-appearing on the first rung, and it is why an N=8 run under β-NLL would confound
-the contact count with a broken objective.
+### Correction: β-NLL is NOT shown to fail
+
+An earlier reading of this run called R1 a β-NLL failure. **That conclusion is
+withdrawn.** At 300 steps β-NLL gives 0.83 m/s — but the L2 control at the *same*
+300 steps gives 0.79 m/s, and the converged 8000-step L2 run gives 0.0387. Both
+objectives are ~9× worse than baseline at 300 steps, so 300 steps simply sits in
+the "worse before better" regime and says nothing about the objective.
+
+What is genuinely established about β-NLL here: it runs, its gradients are finite
+and nonzero at both N=2 and N=8, and it drives the loss negative (expected — the
+`0.5(NIS + logdet S)` form is unbounded below in `logdet`, unlike a sum of
+squares). Whether it beats L2 needs a matched-step comparison that did not fit in
+this window.
 
 ---
 
