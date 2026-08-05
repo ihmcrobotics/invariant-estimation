@@ -41,7 +41,7 @@ class ContactNetConfig:
     # `rollout.make_segment_loss` raises NotImplementedError on it (the loss fn is
     # missing from losses.py, and the InEKF diagnostics publish no `logdet_S`).
     # `beta` is its plumbed-but-unused hyperparameter.
-    objective: str = "l2_velocity"
+    objective: str = "beta_nll"
     beta: float = 0.5
 
     # optimizer

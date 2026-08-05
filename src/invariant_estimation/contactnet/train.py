@@ -27,6 +27,7 @@ class Metrics(NamedTuple):
     applied_frac: Array
     cond_proxy_max: Array
     skipped: Array
+    logdet_mean : Array
 
 
 def decay_mask(params: ContactNetParams):
@@ -73,7 +74,8 @@ def make_train_step(batch_loss, tx, dof: int):
             nis_over_dof=jnp.mean(d.nis) / dof,
             applied_frac=jnp.mean(d.applied),
             cond_proxy_max=jnp.max(d.condition_proxy),
-            skipped=skipped
+            skipped=skipped,
+            logdet_mean = jnp.mean(d.logdet_s)
         )
         return params, opt_state, metrics, carry
     return train_step
