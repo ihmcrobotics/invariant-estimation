@@ -294,7 +294,13 @@ def main():
         cache = dataset.load_channel_cache(dataset.cache_path(vpath))
         base, learned = validate(vp, cache, norm, cfg, params, c.fused, P0, cfg.eps)
         seed = int(vp.name.split("seed")[1].split(".")[0])
-        label = VAL_MODES.get(seed, ("mixed", None))[0]
+        if args.pool:
+            # Under --pool the held-out set is one rollout PER TERRAIN, so the
+            # terrain IS the label -- that is what makes the per-terrain table in
+            # results.md possible instead of a single pooled average.
+            label = vp.name.split(f"_{args.pool}_")[0]
+        else:
+            label = VAL_MODES.get(seed, ("mixed", None))[0]
         print(f"  {vp.name}: baseline={base}  learned={learned}")
         val_metrics.append({"mode": label, "rollout": vp.name, "baseline": base, "learned": learned})
 
