@@ -42,6 +42,7 @@ orchestrator hoist the constant ``F`` out of the scan.
 """
 import jax.numpy as jnp
 from jax import Array
+from jax.typing import ArrayLike
 
 from .state import JointKFBuild, JointKFParams, JointKFState
 
@@ -75,7 +76,7 @@ def build_transition(build: JointKFBuild, params: JointKFParams) -> Array:
     return jnp.eye(dim, dtype=jnp.float64).at[rows, n + rows].set(params.dt)
 
 
-def predict(state: JointKFState, F: Array, Q: Array) -> JointKFState:
+def predict(state: JointKFState, F: ArrayLike, Q: ArrayLike) -> JointKFState:
     r"""One time update: ``x⁻ = F x``, ``P⁻ = F P Fᵀ + Q`` (Java `predict`).
 
     The covariance is symmetrised as ``½(P + Pᵀ)`` on the way out.  ``F P Fᵀ`` is
@@ -102,6 +103,7 @@ def predict(state: JointKFState, F: Array, Q: Array) -> JointKFState:
     JointKFState
         Predicted carry ``(x⁻, P⁻)``.
     """
+    F, Q = jnp.asarray(F), jnp.asarray(Q)   # numpy in, jax out; dtype preserved (I8)
     x = F @ state.x
     P = F @ state.P @ F.T + Q
     return JointKFState(x=x, P=0.5 * (P + P.T))

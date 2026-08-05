@@ -12,7 +12,14 @@ The generators in the first section are ported **bit-for-bit** from
 `JointLevelKFTestFixture.java` / `JointLevelKFUpdateTest.java`: they are pure
 `sin`-based fills, so they are language-agnostic and must match Java exactly.
 """
+from typing import TYPE_CHECKING, Any
+
 import numpy as np
+
+if TYPE_CHECKING:
+    # Type-only: the runtime import stays inside `stub_build`, so this module keeps
+    # importing nothing from the package under test (see the note above).
+    from invariant_estimation.jointKF.state import JointKFBuild
 
 # ---------------------------------------------------------------------------
 # Deterministic matrix generators — bit-for-bit ports (CLAUDE.md §5)
@@ -363,7 +370,7 @@ def shape_dims(shape: dict) -> tuple[int, int, int]:
     return n, m, 2 * n + 3 * m
 
 
-def stub_build(shape: dict, **overrides):
+def stub_build(shape: dict, **overrides) -> "JointKFBuild":
     """A `JointKFBuild` carrying **dimensions only** — no real geometry.
 
     The state / predict / Joseph-update tests are pure linear algebra over
@@ -384,7 +391,10 @@ def stub_build(shape: dict, **overrides):
 
     n, m = shape["n"], shape["m"]
     pairs = shape["pairs"]
-    fields = dict(
+    # Annotated because the values are heterogeneous (ints, name tuples, numpy arrays):
+    # left bare, this infers `dict[str, object]` and every one of the 14 array fields
+    # then reads as an `object` being passed to an `Array` parameter.
+    fields: dict[str, Any] = dict(
         n_joints=n,
         n_imus=m,
         n_pairs=len(pairs),

@@ -329,8 +329,11 @@ def linear_update(
     state : InEKFState
     diagnostics : UpdateDiagnostics
     """
-    if cond_max is None:
-        cond_max = section("inekf")["cond_max"]
+    # Bound to a separate `float` local rather than reassigning the `float | None`
+    # parameter: the config lookup is untyped, so reassigning leaves the parameter
+    # still Optional to a reader and to a type checker, and the gate comparison below
+    # silently inherits that.
+    cond_limit = float(section("inekf")["cond_max"] if cond_max is None else cond_max)
 
     S = H @ state.P @ H.T + R
     S = 0.5 * (S + S.T)
@@ -343,7 +346,7 @@ def linear_update(
     nis = residual @ cho_solve(factor, residual)   # prior P, prior residual
 
     applied = jnp.asarray(gate, dtype=jnp.float64) * (
-        condition_proxy < cond_max
+        condition_proxy < cond_limit
     ).astype(jnp.float64)
     K = applied * K
 
@@ -444,7 +447,7 @@ def contact_update(
     measurement: Array,
     body_covariance: Array,
     learned: bool = False,
-) -> tuple[InEKFState, Array]:
+) -> tuple[InEKFState, Array, UpdateDiagnostics]:
     r"""One single-contact FK update — Java `InvariantUpdater.update(...)`.
 
     Composes the seams above: residual → rotate noise to world → `linear_update`.

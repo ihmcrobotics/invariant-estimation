@@ -72,6 +72,7 @@ from typing import NamedTuple
 
 import jax.numpy as jnp
 from jax import Array
+from jax.typing import ArrayLike
 
 from .state import JointKFBuild, JointKFParams
 
@@ -169,7 +170,7 @@ def encoder_noise(build: JointKFBuild, params: JointKFParams | None = None) -> A
 # Pair geometry
 # ---------------------------------------------------------------------------
 
-def pair_frames(model, q: Array) -> tuple[Array, Array]:
+def pair_frames(model, q: ArrayLike) -> tuple[Array, Array]:
     r"""`(J_rel, R_rel)` for every pair, from ONE position-level model pass.
 
     * `J_rel` : `(n_pairs, 3, n)` -- `J_ang(q) S_ab` in the **child** frame.
@@ -193,7 +194,7 @@ def pair_frames(model, q: Array) -> tuple[Array, Array]:
 # The mixing operator L -- the object invariant I6 is about
 # ---------------------------------------------------------------------------
 
-def mixing_operator(build: JointKFBuild, R_rel: Array) -> Array:
+def mixing_operator(build: JointKFBuild, R_rel: ArrayLike) -> Array:
     r"""`L`, shape `(3*n_pairs, 3m)`: how per-IMU bias/noise enters the pair rows.
 
     Row block `e`, column block `k` is
@@ -214,6 +215,7 @@ def mixing_operator(build: JointKFBuild, R_rel: Array) -> Array:
     that could drift.
     """
     m = build.n_imus
+    R_rel = jnp.asarray(R_rel, dtype=jnp.float64)
     imu = jnp.arange(m)
     child_hot = (imu[None, :] == jnp.asarray(build.pair_child)[:, None]).astype(jnp.float64)
     parent_hot = (imu[None, :] == jnp.asarray(build.pair_parent)[:, None]).astype(jnp.float64)
@@ -224,7 +226,7 @@ def mixing_operator(build: JointKFBuild, R_rel: Array) -> Array:
     return blocks.transpose(0, 2, 1, 3).reshape(3 * build.n_pairs, 3 * m)
 
 
-def _block_diag_sigma(gyro_sigma: Array) -> Array:
+def _block_diag_sigma(gyro_sigma: ArrayLike) -> Array:
     """`blkdiag(Sigma_0, ..., Sigma_{m-1})`, shape `(3m, 3m)`.
 
     Per-IMU gyro noise is genuinely independent -- separate silicon, separate
@@ -232,6 +234,7 @@ def _block_diag_sigma(gyro_sigma: Array) -> Array:
     then produced by `L`, which is the point: the correlations are forced by the
     differencing, not assumed.
     """
+    gyro_sigma = jnp.asarray(gyro_sigma, dtype=jnp.float64)
     m = gyro_sigma.shape[0]
     dense = jnp.einsum("kl,kij->kilj", jnp.eye(m, dtype=jnp.float64), gyro_sigma)
     return dense.reshape(3 * m, 3 * m)
@@ -244,13 +247,13 @@ def _block_diag_sigma(gyro_sigma: Array) -> Array:
 def build_stacked(
     build: JointKFBuild,
     params: JointKFParams,
-    q: Array | None = None,
-    gyros: Array | None = None,
-    trusted_feet: Array | None = None,
+    q: ArrayLike | None = None,
+    gyros: ArrayLike | None = None,
+    trusted_feet: ArrayLike | None = None,
     *,
     model=None,
-    J_rel: Array | None = None,
-    R_rel: Array | None = None,
+    J_rel: ArrayLike | None = None,
+    R_rel: ArrayLike | None = None,
     anchor: AnchorBlock | None = None,
 ) -> StackedMeasurement:
     r"""Java `buildStackedMeasurementForTest` -- the pair rows plus the anchors.
@@ -300,8 +303,8 @@ def build_stacked(
     R_rel = jnp.asarray(R_rel, dtype=jnp.float64)
     gyros = jnp.asarray(gyros, dtype=jnp.float64)
 
-    n, m, P, K = build.n_joints, build.n_imus, build.n_pairs, build.n_anchors
-    dim, rows = build.dim, build.n_stacked_rows
+    n, P, K = build.n_joints, build.n_pairs, build.n_anchors
+    dim = build.dim
 
     # -- pair rows ----------------------------------------------------------
     # S_ab is applied again here even though the model already masks: it is a
@@ -319,11 +322,12 @@ def build_stacked(
     parent, child = jnp.asarray(build.pair_parent), jnp.asarray(build.pair_child)
     z_pair = (gyros[child] - jnp.einsum("eij,ej->ei", R_rel, gyros[parent])).reshape(3 * P)
 
-    # The exact congruence. Written as one triple product on purpose: assembling
-    # it per pair loses the shared-IMU cross-covariance, and on isotropic noise
-    # the two agree to 1e-20, so no test on a single pair would ever notice.
+    # The per-IMU gyro noise the congruence runs on. There is deliberately NO
+    # per-pair `L_pair Sigma L_pairᵀ` here: the congruence is taken once over the
+    # whole stacked `L` at the end of this function, because assembling it per pair
+    # loses the shared-IMU cross-covariance -- and on isotropic noise the two agree
+    # to 1e-20, so no test on a single pair would ever notice the difference.
     Sigma = _block_diag_sigma(jnp.asarray(build.gyro_sigma, dtype=jnp.float64))
-    R_pair = L_pair @ Sigma @ L_pair.T
 
     # -- anchor rows: fixed shape, masked, never reshaped -------------------
     if anchor is None:

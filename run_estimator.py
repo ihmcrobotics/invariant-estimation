@@ -70,7 +70,8 @@ class EstimatedLoop(rp.Loop):
     """
 
     def __init__(self, m, policy, maps, *, fused, reader, sources=DEFAULT_SOURCES, est_every=1,
-                 threaded=False, max_backlog_ticks=2):
+                 threaded=False, max_backlog_ticks=2,
+                 contactnet_scan=None, contactnet_state0=None):
         super().__init__(m, policy, maps)
         self.reader = reader
         self.sources = tuple(sources)
@@ -82,7 +83,14 @@ class EstimatedLoop(rp.Loop):
             raise ValueError(f"est_every must divide DECIMATION={rp.DECIMATION}")
         self.est_every = int(est_every)
         substeps = rp.DECIMATION // self.est_every
-        self.rt = EstimatorRuntime(fused, reader, substeps=substeps)
+        # ContactNet in the loop: swap in the runtime that feeds the network's learned
+        # `contact_chol` to the fused step instead of the analytic stance/swing heuristic.
+        if contactnet_scan is not None:
+            self.rt = ContactNetRuntime(fused, reader, substeps=substeps,
+                                        provider_scan=contactnet_scan,
+                                        online_state0=contactnet_state0)
+        else:
+            self.rt = EstimatorRuntime(fused, reader, substeps=substeps)
         self.rt.seed(self.d)
         # t=0 the robot is at rest and the sensors are already meaningful, so prime the batch
         # rather than special-casing the first tick.
@@ -266,11 +274,85 @@ def print_summary(history):
 # Wiring
 # ---------------------------------------------------------------------------
 
+class ContactNetRuntime(EstimatorRuntime):
+    """`EstimatorRuntime` that feeds a trained ContactNet's learned `contact_chol`
+    to the fused step instead of the analytic stance/swing heuristic.
+
+    The network's output is a pure function of the sensor window (never the filter
+    state, I1), so it is produced in its OWN `lax.scan` over the substep batch and
+    spliced into `FusedSensors.contact_chol` before the untouched fused advance
+    runs. `online.make_provider` falls back to the heuristic `sensors.contact_chol`
+    for the first H ticks, while its ring buffer fills.
+    """
+
+    def __init__(self, fused, reader, *, substeps, provider_scan, online_state0):
+        super().__init__(fused, reader, substeps=substeps)
+        self._provider_scan = provider_scan          # jitted (ostate, sensors) -> (ostate, chol)
+        self._ostate = online_state0
+
+    def advance(self, batch):
+        if self.carry is None:
+            raise RuntimeError("call seed() before advance()")
+        sensors = self._stack(batch)
+        self._ostate, contact_chol = self._provider_scan(self._ostate, sensors)
+        self.carry, out = self._advance(self.carry, sensors._replace(contact_chol=contact_chol))
+        self.last = self._view(out, batch[-1])
+        return self.last
+
+    def warmup(self, batch):
+        super().warmup(batch)                        # compile the fused advance
+        # Compile the provider scan too, without advancing the ring buffer (no side effect).
+        self._provider_scan.lower(self._ostate, self._stack(batch)).compile()
+
+
+def build_contactnet_provider(fused, reader, ckpt, norm_path, *, verbose=True):
+    """Load a `run_contactnet.py` checkpoint and return `(provider_scan, online_state0)`.
+
+    `provider_scan(ostate, stacked_sensors) -> (ostate, contact_chol)` is the jitted
+    per-batch form of `contactnet.online.make_provider`. `ContactNetConfig()` MUST be
+    the config the checkpoint was trained under — this run uses the defaults
+    (F=30, H=20, d_in=600); a mismatch silently shifts the network input.
+    """
+    import jax
+    import jax.numpy as jnp
+    from invariant_estimation.contactnet import (
+        online as cn_online, network as cn_network,
+        normalize as cn_normalize, train as cn_train, features as cn_features)
+    from invariant_estimation.contactnet.config import ContactNetConfig
+
+    cfg = ContactNetConfig()
+    # `run_contactnet.save_norm` writes only {mean, std, names, floored}; `normalize.load`
+    # additionally wants the provenance fields (n_ticks, source) that `apply`/the online
+    # provider never read. Load directly so either artifact format works.
+    z = np.load(norm_path, allow_pickle=False)
+    consts = cn_normalize.NormConstants(
+        mean=jnp.asarray(z["mean"], dtype=jnp.float64),
+        std=jnp.asarray(z["std"], dtype=jnp.float64),
+        names=tuple(str(s) for s in z["names"]),
+        floored=tuple(str(s) for s in z["floored"]),
+        n_ticks=int(z["n_ticks"]) if "n_ticks" in z.files else 0,
+        source=str(z["source"]) if "source" in z.files else str(norm_path))
+    like = cn_network.init(jax.random.PRNGKey(cfg.init_seed),
+                           cfg.d_in, cfg.widths, cfg.sigma_0, cfg.eps)
+    params = cn_train.load_params(ckpt, like)
+    sub = cn_features.subchain_for(fused, reader.unfiltered_names)
+    step = cn_online.make_provider(sub, int(fused.base_imu), fused.kinematics,
+                                   cfg, consts, params)
+    ostate0 = cn_online.init_state(cfg, len(sub))
+    provider_scan = jax.jit(lambda ostate, sensors: jax.lax.scan(step, ostate, sensors))
+    if verbose:
+        print(f"ContactNet: ATTACHED  ckpt={ckpt}  norm={norm_path}")
+        print(f"            cfg F={cfg.F} H={cfg.H} d_in={cfg.d_in} "
+              f"span={cfg.window_span_seconds * 1e3:.0f}ms contacts={len(sub)}")
+    return provider_scan, ostate0
+
+
 def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
                         noise=None, est_dt=None, contact_meas_var=0.0,
                         stance_chol=1.0e-4, swing_chol=1.0e1,
                         contact_fk_unfiltered=True, est_every=1, verbose=True,
-                        threaded=False, max_backlog_ticks=2):
+                        threaded=False, max_backlog_ticks=2,
+                        contactnet=None, contactnet_norm=None):
     t0 = time.time()
     policy = rp.load_policy(policy_name)
     m = rp.build_sim_model(policy, with_visuals=with_visuals, with_imu_sensors=True)
@@ -292,9 +374,16 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
         print(f"           policy reads {list(sources)} from the estimate; "
               f"noise={'on' if noise else 'off'}; contact FK uses "
               f"{'MEASURED' if fused.n_aux else 'qpos0-pinned'} off-path joints")
+    cn_scan = cn_state0 = None
+    if contactnet:
+        norm_path = contactnet_norm or os.path.join(os.path.dirname(contactnet),
+                                                    "norm_constants.npz")
+        cn_scan, cn_state0 = build_contactnet_provider(
+            fused, reader, contactnet, norm_path, verbose=verbose)
     loop = EstimatedLoop(m, policy, maps, fused=fused, reader=reader, sources=sources,
                          est_every=est_every, threaded=threaded,
-                         max_backlog_ticks=max_backlog_ticks)
+                         max_backlog_ticks=max_backlog_ticks,
+                         contactnet_scan=cn_scan, contactnet_state0=cn_state0)
     loop.rt.warmup(loop.batch)      # pay the ~11 s XLA compile here, not on the first tick
     if verbose:
         print(f"           built + compiled in {time.time() - t0:.1f}s")
@@ -435,6 +524,13 @@ if __name__ == "__main__":
     ap.add_argument("--max-backlog-ticks", type=int, default=2,
                     help="how far the estimator may fall behind before the sim thread waits for "
                          "it (default 5 = 100 ms). Samples are never dropped, only delayed")
+    ap.add_argument("--contactnet", default=None, metavar="PARAMS.npz",
+                    help="run a trained ContactNet in the loop: its learned contact_chol "
+                         "replaces the analytic stance/swing heuristic. Pass a params.npz "
+                         "from run_contactnet.py (built with the ContactNetConfig defaults)")
+    ap.add_argument("--contactnet-norm", default=None, metavar="NORM.npz",
+                    help="normalization constants the ContactNet was trained under "
+                         "(default: norm_constants.npz beside --contactnet)")
     args = ap.parse_args()
 
     video_size = tuple(int(v) for v in args.video_size.lower().split("x"))
@@ -458,7 +554,8 @@ if __name__ == "__main__":
         contact_meas_var=args.contact_meas_var,
         stance_chol=args.stance_chol, swing_chol=args.swing_chol,
         contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every,
-        threaded=args.realtime, max_backlog_ticks=args.max_backlog_ticks)
+        threaded=args.realtime, max_backlog_ticks=args.max_backlog_ticks,
+        contactnet=args.contactnet, contactnet_norm=args.contactnet_norm)
     # The ghost is a viewer feature: it draws, and headless has nothing to draw into.
     if args.ghost != "off" and headless:
         raise SystemExit("--ghost needs a viewer; drop --headless/--video")

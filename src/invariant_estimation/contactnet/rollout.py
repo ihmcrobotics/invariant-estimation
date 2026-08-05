@@ -1,0 +1,175 @@
+from typing import NamedTuple
+
+import jax
+from jax import Array
+import jax.numpy as jnp
+
+from ..inEKF.filter import InEKFInputs, init_carry, make_step
+from ..inEKF.state import InEKFState
+from .losses import l2_velocity
+from .network import ContactNetParams, forward
+
+class Segment(NamedTuple):
+    """
+    One training sample: `L` consecutive filter tasks.
+
+    A sesgment is a **trajectory**, not a window. `H` (history per evaluation)
+    and `L` are INDEPENDENT.
+
+    ``inputs`` has a leading time axis of length ``L`` on each leaf.
+        Its ``contact_chol`` field - the stance anchor **process noise**,
+        is  placeholder, and it is overwritten from the output of the network.
+
+    ``windows`` is ``(L, N_c, H, F)`` normalized feature windows; 
+    ``state0`` is the initial state of the filter at the start of the segment.
+    ``v_true`` is the groudn truth base velocity in world frame.
+    ``R_true`` is the rotation matrix of ground truth attitude, meant to convert
+        the world frame base velocity to body frame.
+    """
+    inputs: InEKFInputs
+    windows: Array
+    state0: InEKFState
+    v_true: Array
+    R_true: Array
+
+
+def contact_factors(
+    params: ContactNetParams,
+    windows :Array,
+    eps: float
+) -> Array:
+    """
+    Network over every tick and contact, all at once.
+
+    ``(L, N_c, H, F) -> (L, N_c, 3,3)``
+
+    The network only sees sensor history, never the filter state.
+
+    The flatten is ``(H, F) -> H * F ``.
+    """
+    L, N_c = windows.shape[0], windows.shape[1]
+    flat = windows.reshape(L, N_c, -1) # last dim is D_in = H * F, the flattening
+    over_contacts = jax.vmap(forward, in_axes=(None, 0, None))
+    over_time = jax.vmap(over_contacts, in_axes=(None, 0, None))
+    return over_time(params, flat, eps)
+
+def make_segment_loss(ekf, kinematics, eps, beta = 0.5, objective="l2_velocity", remat=True):
+    """Build the per-segment loss: ``(params, segment) -> (loss, (outputs, carry))``.
+
+    A factory matching `make_step`: `ekf`, `kinematics` and the scalars are static
+    and closed over, so the callable is differentiable in `params` and vmappable
+    over segments.
+
+    ``objective`` is selected at build time, outside the traced region, so it puts
+    no branch in the graph: run 1 reproduces CoCo-InEKF with ``l2_velocity``, run 2
+    onward is intended to use ``beta_nll`` -- which is NOT implemented yet, see
+    below.  ``remat`` wraps the scan body in `jax.checkpoint` (``prevent_cse=False``
+    is the correct setting under `scan`).
+    """
+    if objective not in ("beta_nll", "l2_velocity"):
+        raise ValueError(f"Unknown objective {objective!r}")
+    if objective == "beta_nll":
+        # Two pieces are missing, and neither is a one-liner to guess at:
+        #   * the loss itself (`beta_nll_from_diagnostics`) does not exist in
+        #     `losses.py` -- only `l2_velocity` does;
+        #   * it needs `log det S` per tick, and `UpdateDiagnostics` publishes
+        #     `applied / nis / condition_proxy / correction_rotation_norm` only.
+        #     `S`'s Cholesky is already formed in `inEKF/correct.linear_update`,
+        #     so exposing `logdet_S` is cheap -- but it widens the diagnostics
+        #     seam that the ported tests read (CLAUDE.md §4), so it is a decision,
+        #     not a fix.
+        # Raised HERE, at build time, because the alternative is a `NameError`
+        # from inside a traced scan on whoever first sets `objective: beta_nll`
+        # in the training config -- which `contactnet/config.py` still accepts.
+        raise NotImplementedError(
+            "objective='beta_nll' is not implemented: `beta_nll_from_diagnostics` is "
+            "missing from contactnet/losses.py and `UpdateDiagnostics` does not publish "
+            "`logdet_S`. Use objective='l2_velocity'."
+        )
+
+    step = make_step(ekf, kinematics)
+    if remat:
+        step = jax.checkpoint(step, prevent_cse=False)
+
+    def segment_loss(params: ContactNetParams, segment: Segment, carry0=None):
+        # Network first, over the full segment - see `contact_factors`
+        L_c = contact_factors(params, segment.windows, eps)
+
+        # The one field ContactNet has - the STANCE-ANCHOR PROCESS noise. It was
+        # `contact_meas_chol` through run 4; see `pipeline/main_estimator._boundary`
+        # for why the measurement socket cannot reach the drift being trained out.
+        inputs = segment.inputs._replace(contact_chol=L_c)
+
+        # `carry0=None` re-seeds from `segment.state0` (run-1 behaviour, and what
+        # the standalone tests use).  `ChainedBatcher` passes the previous
+        # segment's final carry instead, so the segment starts at the error the
+        # filter actually accumulated rather than at zero -- see dataset.py (f).
+        c0 = init_carry(segment.state0) if carry0 is None else carry0
+        carry, outputs = jax.lax.scan(step, c0, inputs)
+
+        # Only `l2_velocity` reaches here -- `beta_nll` is rejected at build time
+        # above. When it lands it belongs here, as a mean over per-tick terms
+        # (`l2_velocity` takes its own mean internally, beta-NLL would not).
+        #
+        # Body-frame, each side by its OWN attitude -- see `l2_velocity`.
+        loss = l2_velocity(
+            outputs.state.v, outputs.state.R, segment.v_true, segment.R_true
+        )
+        return loss, (outputs, carry)
+
+    return segment_loss
+
+
+def make_warm_in(ekf, kinematics, sigma_0: float | None = None):
+    r"""``(state0, inputs) -> carry``: run the filter forward without training on it.
+
+    `dataset.ChainedBatcher` uses this to grow a freshly seeded chain's error to
+    its natural level before the chain contributes a gradient.
+
+    ``sigma_0=None`` (the default) warms in on the recorded heuristic
+    ``inputs.contact_chol``, i.e. on the shipped filter, for the same reason
+    `online.make_provider`'s fallback defers to it: this socket has no
+    "reproduces the shipped filter" constant to hold, and a constant at the
+    *stance* value is `freeze_contact_chol` (see there for the measurement),
+    which would grow the chain's error under a filter the trained network never
+    runs inside.
+
+    Passing a float restores the old behaviour, broadcasting ``σ₀·I₃`` over the
+    warm-in slice. Note that `ContactNetConfig.sigma_0` is a **measurement**-socket
+    number; that argument does not transfer, so reusing it here is a deliberate
+    choice and not a default.
+
+    Built here rather than in `dataset` so that module keeps its "no MJX, no
+    estimator build" property.
+    """
+    step = make_step(ekf, kinematics)
+
+    @jax.jit
+    def warm_in(state0, inputs: InEKFInputs):
+        if sigma_0 is not None:
+            inputs = inputs._replace(contact_chol=jnp.broadcast_to(
+                sigma_0 * jnp.eye(3, dtype=jnp.float64), inputs.contact_chol.shape))
+        carry, _ = jax.lax.scan(step, init_carry(state0), inputs)
+        return carry
+
+    return warm_in
+
+def make_batch_loss(*args, **kwargs):
+    """`make_segment_loss` vmapped over a batch of `B` segments.
+
+    ``in_axes=(None, 0)``: one shared weight set, one independent trajectory per
+    batch element. A batch of `B` segments is ``B * L * N_c`` forward passes but
+    only **B independent samples** -- size the batch by this, not by the forward
+    pass count.
+    """
+    segment_loss = make_segment_loss(*args, **kwargs)
+
+    def batch_loss(params: ContactNetParams, batch: Segment, carry0=None):
+        if carry0 is None:
+            losses, aux = jax.vmap(segment_loss, in_axes=(None, 0))(params, batch)
+        else:
+            losses, aux = jax.vmap(segment_loss, in_axes=(None, 0, 0))(
+                params, batch, carry0)
+        return jnp.mean(losses), aux
+
+    return batch_loss

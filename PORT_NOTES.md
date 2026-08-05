@@ -1665,3 +1665,259 @@ precaution rather than a workaround, and `JAX_PLATFORMS=cuda uv run pytest` rema
 * The plan's note about re-recording `experiments/sim_runs/*.npz` after the ORT change was moot:
   that directory has never existed in the repo (it was an ad-hoc scratch path). The stale
   reference in `RUNNING.md` was removed instead.
+
+---
+
+## Lint + type-check baseline (2026-08-03)
+
+Repo-wide `ruff` / `pyright` sweep. Counts as measured with ruff 0.16.1 and pyright 1.1.411
+against `pyrightconfig.json` (default `typeCheckingMode`, no per-rule suppression).
+
+|                     | before | after |
+|---------------------|-------:|------:|
+| ruff (locked 0.15)  |      8 |     0 |
+| ruff (0.16 default) |    165 |     0 |
+| pyright             |   2469 |   194 |
+
+### Two version traps, not code problems
+
+* **84% of the pyright errors were in `typings/`** — stubgen output from `uv run gen-stubs`,
+  gitignored, never checked in. `mujoco_warp`'s warp-kernel annotations are not valid type
+  expressions, so the generated stubs carry ~2100 errors of their own. `pyrightconfig.json`
+  now `exclude`s the directory, which drops the diagnostics while leaving it on `stubPath` —
+  verified both ways: removing the stubs instead takes `run_policy.py` from 15 errors to 52.
+* **ruff 0.16 widened its default rule set from 56 rules to 414**, which is the entire
+  8-vs-165 gap: the locked 0.15.22 and an editor-bundled 0.16 disagree on the same tree.
+  `[tool.ruff.lint] select` is now pinned to the pre-0.16 default that the existing `ignore`
+  list was written against. The 0.16-only findings were read once before being pinned out;
+  all mechanical or false. In particular the 4 `B023` "closure over loop variable" hits in
+  `sim/collect.py` are the immediate-invocation false positive — the lambda goes to
+  `jax.tree.map`, which calls it eagerly in the same iteration.
+
+### `ArrayLike` on inputs, `Array` on outputs
+
+~200 of the real-code errors were one pattern: the ported oracles build `H`/`z`/`R`/`M` with
+**numpy** — deliberately, since an independent path from the filter's own jax algebra is what
+makes them oracles (CLAUDE.md §5) — and the filter seams were annotated `jax.Array`, which
+numpy arrays are not instances of.
+
+Resolved with JAX's own convention: **`jax.typing.ArrayLike` on function parameters, `Array` on
+returns**, plus a `jnp.asarray` at the top of the few bodies that touch `.shape`/`.dtype`/`.T`
+on a parameter. `asarray` without a `dtype` *preserves* dtype, so this cannot launder a float32
+leak into float64 — I8 still bites where it should. Widened: `joseph_update`,
+`joseph_covariance`, `predict`, `schur_complement`, `lambda_eff`, `qa_from_lambda_eff`,
+`equalized_sigma_tau`, `van_loan`, `qa_tripwire`, `pair_frames`, `mixing_operator`,
+`build_stacked`, the three `anchors.py` entry points, and `MjxModel`'s ten `q` methods.
+
+**The same widening is wrong on the NamedTuple fields, and this was measured, not assumed:**
+
+| widened                                     | pyright errors |
+|---------------------------------------------|---------------:|
+| (params only, baseline)                     |            280 |
+| `+ JointKFState.x/P → ArrayLike`            |            354 |
+| `+ JointKFBuild`/`JointKFParams` array fields |            325 |
+
+Both cascade, because consumers of a state or build field index it, matmul it and read `.shape`
+off it, and `ArrayLike` admits `float`/`int`. State and build tuples are the *output* side of the
+convention and keep `Array`. The ~120 remaining `reportArgumentType` errors are numpy arrays
+being passed to those constructors, across 62 sites; the honest fixes are per-site
+`jnp.asarray`, and they are left undone rather than papered over with a field-level widening
+that makes every downstream read worse.
+
+### Left deliberately
+
+* **~120 numpy-into-NamedTuple-constructor** errors, per above. Concentrated: `sim/collect.py`
+  building `FusedSensors` (18) and `jointKF/build.py` building `JointKFBuild` (8) are the two
+  production sites — note the latter means `JointKFBuild`'s `Array` fields hold **numpy** in
+  production, so the annotation is aspirational there.
+* **35 `reportOptionalMemberAccess`** in `run_policy.py` / `run_estimator.py` / tests: argparse
+  and `dict.get` results used without a `None` check. Real but confined to entry-point plumbing,
+  where the failure is an immediate `AttributeError` on a bad flag, not a silent wrong number.
+* **13 `reportAttributeAccessIssue`**, nearly all incomplete-stub artefacts:
+  `mujoco.Renderer` / `MjrContext` / `mjr_render` are absent from the generated `mujoco`
+  stubs (the pyright-generated `typings/mujoco/__init__.pyi` re-exports `Renderer` from
+  `mujoco.rendering.classic.renderer`, a path this mujoco version does not have). Regenerating
+  `typings/` does not fix it because `_stubs.py` never writes `mujoco/__init__.pyi`.
+* `jit(...)._cache_size()` is jax private API absent from the public stubs; the four I7
+  constant-graph tests carry a `# type: ignore[attr-defined]`. Note the assertions are `<= 1`,
+  never `== 1` — the jit cache is a process-global LRU and a full-suite run evicts the entry.
+
+### Fixed, and worth knowing about
+
+* `contactnet/rollout.make_segment_loss` defaulted to `objective="beta_nll"`, which called a
+  `beta_nll_from_diagnostics` that exists nowhere and read a `logdet_S` that `UpdateDiagnostics`
+  does not publish. It now raises `NotImplementedError` at build time; `ContactNetConfig` still
+  accepts the string, so this is the enforcement point.
+* `inEKF/correct.contact_update` was annotated as returning 2 values and returns 3.
+* `tests/contactnet/test_online.py` has been **deleted** (Lucas's call — the online provider path
+  is not being used). It had been erroring at fixture setup for all 5 tests since before this
+  branch: `qd_*` joined the channel set on 8/2, but the fixture still declared
+  `F = 12 + 2*J_SUB` against `channel_names()`'s `12 + 3*J_SUB` and left `encoders_vel` at its
+  `()` default. Both were fixed first and the tests passed, so the diagnosis is recorded here
+  rather than lost — the working file is recoverable from the commit titled *"fix the defects the
+  checkers were actually pointing at"* on `chore/lint-and-typecheck-cleanup` (referenced by title
+  rather than SHA, which a rebase invalidates), if `contactnet/online.py` is ever picked back up.
+  What went away with it is the "the deployed window must be the trained window" property;
+  nothing else asserts it.
+* `FusedSensors`' optional fields default to `()` and that is **load-bearing**: `()` is an empty
+  pytree, so an unpopulated field costs `lax.scan` no time axis, whereas `zeros(0)` would add a
+  leaf that scan demands a length-`T` axis on. The fields are consumed inconsistently
+  (`jnp.asarray` tolerates `()`, `jnp.concatenate` and `.shape` do not), so
+  `features.contact_channels` now names the unpopulated field instead of failing inside jax.
+
+---
+
+## World-frame NEES against a right-invariant tangent covariance (2026-08-03)
+
+Where this bites: any consistency check that compares the filter's estimate to
+world-frame ground truth — `scripts/run_contactnet.py:validate`, and the G10
+`eval/consistency.py` NIS/NEES bands. The InEKF's `P` is **not** the covariance of
+the world-frame error; reading it as if it were is a silent, one-sided bug.
+
+### The mapping
+
+`P` is the covariance of the right-invariant tangent vector `ξ`, ordered
+rotation-first (I4: rotation `0:3`, base velocity `3:6`, base position `6:9`,
+contact `i` at `9+3i`). The perturbation convention is I5, `X̂ = exp(ξ) X`
+(left multiplication). Writing the group element column-wise, `exp(ξ) ≈
+[I + (ξ_φ)_×, ξ_v, ξ_p, …]`, so the velocity column of `X̂ = exp(ξ)X` is
+
+```
+v̂ = (I + (ξ_φ)_×) v + ξ_v
+```
+
+and therefore the **world-frame** velocity error is
+
+```
+δv = v̂ − v = ξ_v + ξ_φ × v = ξ_v − (v)_× ξ_φ
+```
+
+i.e. `δv = J ξ_{0:6}` with `J = [ −(v)_×  I₃ ]`, giving
+
+```
+Σ_δv = J P[0:6, 0:6] Jᵀ
+     = (v)_× P_φφ (v)_×ᵀ − (v)_× P_φv − P_vφ (v)_×ᵀ + P_vv
+```
+
+The same construction gives the position error, `δp = ξ_p − (p)_× ξ_φ`, and the
+contact-landmark errors, `δd_i = ξ_{d_i} − (d_i)_× ξ_φ` — the Jacobian is always
+`[ −(x)_×  I₃ ]` on `(ξ_φ, ξ_x)`, because every translation-like column of the
+group element transforms the same way. Linearize about the estimate (`v̂`, `p̂`,
+`d̂`), which is what the filter actually has at runtime; with ground truth
+available the difference is second order.
+
+Then:
+
+* 3-DoF NEES `= δvᵀ Σ_δv⁻¹ δv`, `E[·] = 3`.
+* Per-world-axis NEES `= δv_i² / (Σ_δv)_ii`, `E[·] = 1` each. These are 1-DoF
+  **marginals**, so they do not sum to the 3-DoF value unless `Σ_δv` is diagonal —
+  which it is not. Per-axis is the diagnostic (which direction is mis-tuned);
+  3-DoF is the consistency test.
+
+### Why it matters, and the trap
+
+Using `P[3:6, 3:6]` alone — the covariance of `ξ_v`, not of `δv` — drops the
+attitude coupling. It is only correct when `v = 0`. While walking it
+**under-reports** the covariance and so **inflates** NEES: on a representative
+`(P, v)` (‖v‖ ≈ 1.4 m/s, attitude σ ~ mrad) the diagonal ratio
+`diag(Σ_δv)/diag(P_vv)` came out `[1.08, 1.96, 2.13]`, i.e. up to a 2× NEES
+inflation that is purely a frame-convention error, not filter inconsistency. That
+number is scenario-dependent — it grows with ‖v‖ and with attitude uncertainty —
+so the lesson is the mapping, not the constant.
+
+The inverse trap is equally available: comparing a **body-frame** error against
+either block. `ξ_v` is not the body-frame velocity error either. Body-frame wants
+`R̂ᵀ` applied to `δv` and the covariance rotated the same way,
+`R̂ᵀ Σ_δv R̂` — that is a third quantity. `run_contactnet.validate` reports
+body-frame *RMSE* alongside *world*-frame NEES; that mismatch is deliberate but
+worth naming, since RMSE needs no covariance and NEES does.
+
+### Verification
+
+Monte-Carlo property check (the reusable one, if this ever moves into
+`eval/consistency.py`): draw `ξ ~ N(0, P)` with a full, correlated `P`, push each
+draw through the real `group.exp_SEn3`, form `v̂` from the resulting group
+element, and compare the empirical `Cov(v̂ − v)` to `J P Jᵀ`. At 400k draws the
+max relative error was 2.6e-3 against a Monte-Carlo noise floor of
+`1/√M = 1.6e-3`. Nonzero `v` and off-diagonal `P_φv` are both required — either
+one zero and the wrong formula passes.
+
+`run_contactnet.validate` keeps the old number as `vel_nees_tangent` so runs
+predating this fix stay comparable; `vel_nees` is now the world-frame 3-DoF
+value and `vel_nees_{x,y,z}` the per-axis marginals.
+
+---
+
+## Dropping the boxcar and the strided window (2026-08-03)
+
+Lucas's call: the ContactNet features are a **short window of consecutive ticks**,
+so the window geometry that supported longer, decimated spans is gone. What went
+away, and what it cost.
+
+### What was there
+
+`ContactNetConfig` took a `window_span_s` (seconds the history reaches back) and
+*derived* `stride = round(window_span_s / ((H-1)*dt))` from it. `features.window`
+then did boxcar-smooth-by-`stride`, gather-every-`stride`-ticks — decimation with
+an anti-alias prefilter, which is why the config also carried `nyquist_hz` and
+warned when the torque channel's f99 = 4.25 Hz would fold.
+
+Since the coherent 1 kHz regime landed (`rp.DT = 1e-3`), `window_span_s = 0.019`
+with `H = 20` derives `stride == 1` exactly. At `stride == 1` `boxcar` early-returns
+its input and the gather is `k-H+1 … k`. **Every run on record was already the
+consecutive-tick window**; the machinery was inert.
+
+### Removed
+
+* `features.boxcar` — deleted. `features.window(channels, H)` and
+  `window_indices(T, H)` lost their `stride` parameter, as did
+  `make_feature_windows`.
+* `ContactNetConfig.window_span_s`, `.stride`, `.effective_rate_hz`, `.nyquist_hz`,
+  the Nyquist `RuntimeWarning`, and the `warnings` import. `.window_span_ticks`
+  (now `H`) and `.window_span_seconds` (now `(H-1)*dt`) survive as reporting
+  properties — `run_contactnet` prints and records the span, since "H=20" alone
+  does not say how far back the net looks.
+* `dataset.PreparedRollout.smoothed` → `.channels`; `prepare` no longer smooths.
+  `valid_start_range`'s lead-in is `H-1` rather than `(H-1)*stride`.
+* `online.py`'s cumsum: the ring buffer is now exactly `(H, N_c, F)` and **is** the
+  window, so `step` gathers nothing.
+
+### Numerically
+
+* Training/validation path: **bit-identical.** Checked directly — old
+  `features.window(x, H, stride=1)` vs new `features.window(x, H)` over a
+  (500, 2, 30) stream, `array_equal` True, max abs diff 0.0.
+* Online path: **not** identical, and the change is an improvement. The old code
+  reconstructed each sample as a difference of two cumsum partial sums; at
+  `stride == 1` that is algebraically the identity but not the floating-point
+  identity. On a worst-case buffer (values ~5e4, i.e. large partial sums) the old
+  path differed from the exact value by 1.3e-10 absolute / 2.6e-15 relative. The
+  new path returns the stored value.
+
+  This retires the first of `online.py`'s two documented "deliberate differences
+  from training" — the boxcar cumsum was the *only* reason the deployed window was
+  not bit-identical to the trained one. The remaining difference (a warm-up
+  instead of `window_indices`' head clamp) stands.
+
+### Test coverage
+
+`tests/contactnet/test_features.py` held one test, `test_boxcar`, which is now
+meaningless. Replaced with six covering what actually has to hold: window shape,
+newest-tick-last ordering (the network's input layout depends on it and nothing
+else asserted it), consecutive-raw-tick contents, head clamping, and —
+importantly — that a training segment's gather out of `PreparedRollout.channels`
+equals `features.window` over the whole stream at the same ticks. That last one
+is the property the *global* boxcar existed to preserve; with the boxcar gone it
+is free, because per-tick normalization has no state to lose at a slice boundary.
+It is still worth asserting: it is the "trained window == scored window"
+invariant, and `tests/contactnet/test_online.py` (deleted earlier, see the lint
+baseline notes) was the only other thing that touched it.
+
+### Watch for
+
+`ContactNetConfig(window_span_s=...)` is now a `TypeError`, not a silently-ignored
+kwarg. No caller in the tree passes it; older `results/*/summary.json` still record
+a `stride` key, which is now written as `window_span_s` instead. If a longer,
+genuinely decimated window is ever wanted again, restore the boxcar with it — a
+strided gather without the prefilter aliases the torque channel, which is what the
+deleted Nyquist warning was guarding.

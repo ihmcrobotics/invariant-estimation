@@ -116,6 +116,77 @@ the Java InEKF to 1e-18. **Caveat for a full trajectory replay:** the real InEKF
 consumes a *Mahony-prefiltered* pelvis gyro, not the raw `gyroscope_pelvis_imu`
 (see `PORT_NOTES.md` "G9 — real model").
 
+## Training ContactNet (the learned contact-noise socket)
+
+`scripts/run_contactnet.py` is the one-shot orchestrator — **collect → cache →
+normalize → train → validate**. It trains a network that emits the InEKF's
+per-contact `contact_chol` from sensor-history features only. It writes the
+**process** socket (the contact-anchor random-walk block of `Q_d`), never the
+measurement socket; features are F=30 (includes the raw q̇ channel) on a `stride=1`
+full-rate window, and the sim runs at a coherent 1 kHz (`rp.DT=0.001`,
+`rp.DECIMATION=20`).
+
+```bash
+uv run python scripts/run_contactnet.py --collect --steps 300 --seconds 45
+uv run python scripts/run_contactnet.py --collect --train-seeds 0 1 2 3 --val-seeds 4 5 \
+       --steps 300 --warmup-steps 50 --time-budget-s 3000     # the overnight run's args
+```
+
+`--collect` re-runs the sim to gather rollouts (it skips any seed already on disk);
+drop it to reuse `data/*.npz`. **Pass `--seconds 60` to match the collected set** —
+the default is 45 s, and mixing rollout lengths is a silent trap. The val seeds are
+disjoint from the train seeds, and held-out validation reports
+learned-vs-analytic-baseline **body-frame velocity RMSE**, velocity **NEES**
+(target 3), and **contact NIS/dof** (target 1). The per-mode validation labels
+(forward/backward/lateral_L/lateral_R/turn_L/turn_R) are keyed to the val seeds in
+`VAL_MODES` at the top of `run_contactnet.py` — the `--val-seeds` you pass MUST be
+those keys (currently **900–905**) or the rollouts collect with random commands and
+label as `"mixed"`.
+
+**GPU (large speedup — do this).** JAX falls back to CPU unless the CUDA plugin is
+installed; the project ships the extra. Sync once, then prefix runs with `--extra gpu`:
+
+```bash
+uv sync --extra gpu                                   # installs jax-cuda13-plugin (additive)
+uv run --extra gpu python scripts/run_contactnet.py … # collection ~2× ; training much faster
+uv run --extra gpu python -c "import jax; print(jax.devices())"   # -> [CudaDevice(id=0)]
+```
+
+Note the training clock (`--time-budget-s`, measured from process start) includes
+collection + the per-run cache rebuild (`build_channel_cache` is unconditional,
+~4 min/rollout, CPU-bound), so budget accordingly or collect in a prior pass.
+
+| path | what |
+|---|---|
+| `data/flat_seed*.npz` + `data/cache/*_feat.npz` | collected rollouts (~100 MB each) and F=30 feature caches — **gitignored** |
+| `results/<YYYY-MM-DD_HH-MM-SS>[_tag]/` | **one directory per run** — every artifact below lands here, so runs never overwrite each other |
+| `results/latest` | symlink repointed at the most recent run directory |
+| `…/summary.json` | the run's config + held-out metrics (baseline vs learned), plus a `run` block (timestamp, tag, full argv) identifying the run |
+| `…/{training,validation}.png` | loss / NIS / reseed curves; held-out RMSE / NEES / NIS bars |
+| `…/params.npz`, `…/norm_constants.npz` | trained weights and the **frozen** normalization pair (load them together — a mismatch silently shifts the input distribution) |
+| `RESULTS.md` | the written-up validation numbers + caveats (hand-authored, not emitted by the script) |
+
+Name a run with `--tag baseline-redo` (appended to the timestamp) or bypass the
+naming entirely with `--out-dir path/to/dir`. The validated run written up in
+`RESULTS.md` lives in `results/2026-08-03_11-45-30_coco-faithful-f30/` — it
+predates this layout and was moved into it by hand, so its `summary.json` has no
+`run` block.
+
+Last validated run (flat ground, seeds 0–3 train / 4–5 held out): velocity RMSE
+**0.086 → 0.028 m/s**, NEES **19.4 → 1.05** vs the analytic `contact_chol`
+baseline. Full numbers and caveats (flat-terrain only, etc.) in `RESULTS.md`.
+
+**Gate before pushing:** `bash scripts/verify.sh` — the Layer-1 deterministic
+checks (F=30, `d_in=600`, `stride=1`, channel order q,q̇,τ; process-socket-only;
+nothing under `tests/` modified; the `test_online` geometry). It only greps and
+asserts, so a red check means fix the code it points at — never the check.
+
+> **Known red gate:** `tests/contactnet/test_online.py` is a stale F=24 copy of the
+> pre-q̇ online test and fails against the F=30 set *by construction* (its `_cfg`
+> sets `F=12+2·J_SUB` and `_sensors` never populates `encoders_vel`). One-line human
+> fix: `2·J_SUB → 3·J_SUB` + populate `encoders_vel`. Left untouched per the
+> no-editing-tests rule; the online↔offline window agreement is verified separately.
+
 ## Watching an RL policy in a standalone MuJoCo sim (`run_policy.py`)
 
 `run_policy.py` (repo root) runs an IHMC pre-trained ONNX policy **directly** (via
@@ -374,6 +445,8 @@ uv run python run_estimator.py --policy baseline --headless --source truth      
 uv run python run_estimator.py ... --out run.npz                                    # per-tick log
 uv run python run_estimator.py --policy baseline --ticks 1500 --vx 0.6 \
        --video walk.mp4                                                             # 30 s video
+uv run --extra gpu python run_estimator.py --policy baseline --headless --ticks 500 \
+       --vx 0.45 --contactnet results/latest/params.npz                            # ContactNet in the loop
 ```
 
 Every run prints an error table against the sim's own state (tilt as the policy sees it,
@@ -385,6 +458,7 @@ attitude, gyro, velocity, position drift, joint state) over the whole run and ov
 | `--imu-noise` | constant per-IMU gyro bias + white noise on gyros/accel/encoders (`--noise-seed`) |
 | `--contact-fk measured\|pinned` | whether the InEKF contact FK uses the measured ankle angles (default) or pins them at `qpos0`, as the library default still does — worth ~2x on attitude error, see below |
 | `--stance-chol` / `--swing-chol` | the Σ_C factor for a trusted / airborne foot. The InEKF has **no contact mask**; contact condition rides entirely in Σ_C, so a swing foot needs a large factor or the filter keeps believing it is planted |
+| `--contactnet PARAMS.npz` (+ `--contactnet-norm`) | run a trained ContactNet in the loop: its learned per-tick `contact_chol` (via `contactnet.online.make_provider`) replaces the analytic stance/swing heuristic. Reads `norm_constants.npz` beside `PARAMS.npz` unless overridden; config is the `ContactNetConfig()` defaults the checkpoint trained under. Run the same command without the flag for the closed-loop A/B |
 | `--contact-meas-var` | flight's `1e-4` contact measurement-noise floor (port default 0) |
 | `--video walk.mp4` | record the run offscreen to H.264 (implies `--headless`, `--video-fps` / `--video-size` tune it) |
 | `--ghost [mode]` | draw a translucent robot at the estimated state: `full` (default) or `attitude`. Viewer only |

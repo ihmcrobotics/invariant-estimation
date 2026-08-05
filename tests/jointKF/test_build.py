@@ -106,7 +106,10 @@ def test_pair_velocity_masks_are_disjoint_for_a_shared_imu_star():
 # ---------------------------------------------------------------------------
 
 def test_self_pair_is_rejected():
-    tree = serial_chain(6)
+    # `imu_body=[2, 6]` are `serial_chain(6)` body indices (hinge `j` drives body
+    # `j + 2`), kept for provenance only: the self-pair is rejected on
+    # `parent == child` before `check_pair_graph` reads `imu_body` at all, so these
+    # two values need to be well-formed and nothing more.
     with pytest.raises(ValueError, match="self-pair"):
         check_pair_graph([(0, 0)], 2, [2, 6])
 
