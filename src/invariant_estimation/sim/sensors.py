@@ -33,6 +33,8 @@ from typing import Sequence
 import mujoco
 import numpy as np
 
+from ..pipeline import main_estimator as _me
+
 __all__ = ["add_imu_sensors", "SimSensorReader", "ContactTrust", "IMUNoise"]
 
 
@@ -222,7 +224,24 @@ class SimSensorReader:
         self.foot_gids = np.array(
             [sid(g, mujoco.mjtObj.mjOBJ_GEOM) for g in foot_geoms], dtype=int)
         self.weight = float(m.body_mass.sum()) * 9.81
-        self.trust = ContactTrust(n_feet=len(self.foot_gids), dt=dt)
+
+        # How many contact slots each foot owns is DERIVED from what the estimator
+        # was built with (never a literal): N=2 -> 1 slot/foot, N=8 -> 4 corners.
+        n_feet = len(self.foot_gids)
+        n_c = int(fused.n_contacts)
+        per, rem = divmod(n_c, n_feet)
+        if rem or per < 1:
+            raise ValueError(
+                f"estimator has N={n_c} contacts but the sim has {n_feet} foot geoms; "
+                f"N must be a positive multiple of the foot count")
+        self.contacts_per_foot = per
+        # Body frame + box centre for bucketing sim contacts onto corners. The centre
+        # comes from the SAME constant the corner FK offsets do (invariant 6).
+        self.foot_bids = np.array([m.geom_bodyid[g] for g in self.foot_gids], dtype=int)
+        self.foot_box_center = np.asarray(_me.ALEX_FOOT_BOX_CENTER, dtype=float)
+        # Trust is per SLOT, not per foot: a foot on its heel must be able to report
+        # its toe corners untrusted.
+        self.trust = ContactTrust(n_feet=n_feet * per, dt=dt)
 
         # -- ground truth, for scoring ---------------------------------------
         self.base_bid = sid("PELVIS_LINK", mujoco.mjtObj.mjOBJ_BODY)
@@ -230,8 +249,61 @@ class SimSensorReader:
 
     # -- pieces ------------------------------------------------------------
 
-    def foot_loads(self, d: mujoco.MjData) -> np.ndarray:
-        """Normalised per-foot normal load, `f_n / (0.5·m·g)`, clipped to [0, 1]."""
+    def corner_of(self, k: int, pos_world: np.ndarray) -> int:
+        """Which corner of foot `k` a world-frame contact point belongs to.
+
+        The contact is projected into the foot (ankle-roll) frame and bucketed on
+        `sign(x - cx), sign(y - cy)` about the box centre, in the SAME order
+        `main_estimator.alex_foot_corner_offsets` emits: `(x-,y-), (x-,y+),
+        (x+,y-), (x+,y+)`. So bucket j here IS contact slot j there -- that
+        agreement is what makes the learned per-corner Sigma_C mean anything.
+        """
+        bid = self.foot_bids[k]
+        R = self._xmat[bid].reshape(3, 3)
+        loc = R.T @ (np.asarray(pos_world, float) - self._xpos[bid])
+        cx, cy, _ = self.foot_box_center
+        return 2 * int(loc[0] > cx) + int(loc[1] > cy)
+
+    def contact_forces(self, d: mujoco.MjData) -> np.ndarray:
+        """RAW normal force [N] per contact slot, foot-major. No normalisation.
+
+        Split out from `contact_loads` so the conservation oracle can compare raw
+        newtons: the clip in `contact_loads` saturates a heavily-loaded corner, so
+        summing CLIPPED corners does not equal a CLIPPED foot and a conservation
+        check written on loads silently tests nothing.
+        """
+        cpf = self.contacts_per_foot
+        f = np.zeros(len(self.foot_gids) * cpf)
+        frc = np.zeros(6)
+        # cached once per call: mj_contactForce does not need them, corner_of does
+        self._xmat, self._xpos = d.xmat, d.xpos
+        for i in range(d.ncon):
+            c = d.contact[i]
+            for k, gid in enumerate(self.foot_gids):
+                if c.geom1 == gid or c.geom2 == gid:
+                    mujoco.mj_contactForce(self.m, d, i, frc)
+                    j = 0 if cpf == 1 else self.corner_of(k, c.pos)
+                    f[k * cpf + j] += abs(frc[0])
+        return f
+
+    def contact_loads(self, d: mujoco.MjData) -> np.ndarray:
+        """Normalised normal load per contact SLOT, foot-major, clipped to [0, 1].
+
+        With `contacts_per_foot == 1` this is bit-identical to the old per-foot
+        `f_n / (0.5·m·g)` (invariant 5). With 4 corners the normaliser divides by
+        the corner count as well, so a flat-planted foot -- whose load splits four
+        ways -- still drives every one of its corners over the Schmitt `enter`
+        threshold rather than sitting permanently untrusted.
+        """
+        cpf = self.contacts_per_foot
+        return np.clip(self.contact_forces(d) / (0.5 * self.weight / cpf), 0.0, 1.0)
+
+    def foot_forces(self, d: mujoco.MjData) -> np.ndarray:
+        """RAW normal force [N] per FOOT — the pre-N=8 readout, re-derived.
+
+        Deliberately re-reads `d.contact` instead of summing `contact_forces`, so
+        Gate B's conservation oracle compares two independent computations.
+        """
         f = np.zeros(len(self.foot_gids))
         frc = np.zeros(6)
         for i in range(d.ncon):
@@ -240,7 +312,11 @@ class SimSensorReader:
                 if c.geom1 == gid or c.geom2 == gid:
                     mujoco.mj_contactForce(self.m, d, i, frc)
                     f[k] += abs(frc[0])
-        return np.clip(f / (0.5 * self.weight), 0.0, 1.0)
+        return f
+
+    def foot_loads(self, d: mujoco.MjData) -> np.ndarray:
+        """Per-FOOT normalised load, `f_n / (0.5·m·g)`, clipped to [0, 1]."""
+        return np.clip(self.foot_forces(d) / (0.5 * self.weight), 0.0, 1.0)
 
     def read(self, d: mujoco.MjData):
         """One `FusedSensors` (NumPy leaves) from the current `MjData`."""
@@ -267,7 +343,7 @@ class SimSensorReader:
             q_u = self.noise.corrupt_encoders(q_u)
             tau = self.noise.corrupt_torques(tau)
 
-        trusted = self.trust.update(self.foot_loads(d))
+        trusted = self.trust.update(self.contact_loads(d))
         # The InEKF has NO contact mask: contact condition rides ENTIRELY in
         # Sigma_C (`inEKF/filter.py`, the DECISION note). A swing foot therefore
         # needs a LARGE factor here, or the filter keeps believing it is planted.
@@ -279,7 +355,7 @@ class SimSensorReader:
             accel_base=accel,
             qd_unfiltered=qd_u,
             contact=trusted,
-            contact_chol=chol * np.tile(np.eye(3), (len(self.foot_gids), 1, 1)),
+            contact_chol=chol * np.tile(np.eye(3), (len(trusted), 1, 1)),
             q_unfiltered=q_u,
             torques=tau,
         )

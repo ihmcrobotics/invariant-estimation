@@ -132,7 +132,7 @@ def make_batch_loss(*args, **kwargs):
     segment_loss = make_segment_loss(*args, **kwargs)
 
     def batch_loss(params: ContactNetParams, batch: Segment, carry0=None):
-        i4f carry0 is None:
+        if carry0 is None:
             losses, aux = jax.vmap(segment_loss, in_axes=(None, 0))(params, batch)
         else:
             losses, aux = jax.vmap(segment_loss, in_axes=(None, 0, 0))(

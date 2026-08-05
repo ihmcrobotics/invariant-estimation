@@ -105,13 +105,73 @@ ALEX_EXTRA_SITES: dict[str, str | tuple[str, tuple[float, float, float]]] = {
     "right_sole": ("RIGHT_FOOT", ALEX_SOLE_OFFSET),
 }
 
+# --- the SCS2 sim collision box, in the `*_FOOT` (ankle-roll) frame ---------
+# THE single source of truth for the foot's contact geometry: `run_policy`
+# builds its LEFT/RIGHT_FOOT entries of `SCS2_COLLISION_GEOMS` from these, so the
+# estimator's corner FK and the box the sim actually collides with cannot
+# silently desync (that consistency is what the whole N=8 result rides on).
+#
+# NOTE this is deliberately NOT `ALEX_SOLE_OFFSET`. That offset is the *URDF*
+# foot (0.197 long, sole 0.072 below the ankle); the sim collides with the SCS2
+# box (0.26 long, bottom 0.0775 below the ankle). The N=2 sole sites keep the
+# URDF convention -- they reproduce the shipped filter and the Java parity test
+# -- while the N=8 corners use SCS2, because they are attributed against sim
+# contacts. Mixing the two is the Gate A trap.
+ALEX_FOOT_BOX_HALF: tuple[float, float, float] = (0.13, 0.07, 0.0275)
+ALEX_FOOT_BOX_CENTER: tuple[float, float, float] = (0.045, 0.0, -0.05)
 
-def alex_site_names() -> tuple[str, ...]:
-    """The full site-name tuple for the Alex `MjxModel` (IMUs, body frame, soles)."""
-    return ALEX_IMU_SITES + ("base_body",) + ALEX_FOOT_SITES
+
+def alex_foot_corner_offsets() -> tuple[tuple[float, float, float], ...]:
+    """The 4 bottom-face corners of the SCS2 foot box, in the `*_FOOT` frame.
+
+    Order is `(x-,y-), (x-,y+), (x+,y-), (x+,y+)` -- i.e. heel-right, heel-left,
+    toe-right, toe-left -- and `sim.sensors` buckets sim contacts on
+    `sign(x), sign(y)` in this same order, so index i here IS corner i there.
+    """
+    cx, cy, cz = ALEX_FOOT_BOX_CENTER
+    hx, hy, hz = ALEX_FOOT_BOX_HALF
+    return tuple(
+        (cx + sx * hx, cy + sy * hy, cz - hz)
+        for sx in (-1.0, 1.0)
+        for sy in (-1.0, 1.0)
+    )
 
 
-def build_alex_fused_estimator(spec, **overrides) -> "FusedEstimator":
+def alex_foot_sites(contacts_per_foot: int = 1) -> tuple[str, ...]:
+    """Contact-site names, **foot-major**: all of left's before any of right's.
+
+    `contacts_per_foot=1` is the shipped N=2 sole pair (unchanged, so every N=2
+    fixture and the replay parity test keep passing); `4` is the N=8 corner set.
+    N is never written down -- it is `2 * contacts_per_foot`, derived here.
+    """
+    if contacts_per_foot == 1:
+        return ALEX_FOOT_SITES
+    if contacts_per_foot != 4:
+        raise ValueError(f"contacts_per_foot must be 1 or 4, got {contacts_per_foot}")
+    return tuple(
+        f"{side}_c{i}" for side in ("left", "right")
+        for i in range(len(alex_foot_corner_offsets()))
+    )
+
+
+def alex_extra_sites(contacts_per_foot: int = 1) -> dict:
+    """`extra_sites` for `urdf2mjcf`, carrying the contact set of the given size."""
+    if contacts_per_foot == 1:
+        return dict(ALEX_EXTRA_SITES)
+    corners = alex_foot_corner_offsets()
+    sites: dict = {"base_body": "PELVIS_LINK"}
+    for side, link in (("left", "LEFT_FOOT"), ("right", "RIGHT_FOOT")):
+        for i, off in enumerate(corners):
+            sites[f"{side}_c{i}"] = (link, off)
+    return sites
+
+
+def alex_site_names(contacts_per_foot: int = 1) -> tuple[str, ...]:
+    """The full site-name tuple for the Alex `MjxModel` (IMUs, body frame, contacts)."""
+    return ALEX_IMU_SITES + ("base_body",) + alex_foot_sites(contacts_per_foot)
+
+
+def build_alex_fused_estimator(spec, contacts_per_foot: int = 1, **overrides) -> "FusedEstimator":
     """Build the fused estimator for real Alex from an `AlexModelSpec`.
 
     `spec` must come from `urdf2mjcf.convert_log_model(log_dir,
@@ -120,15 +180,17 @@ def build_alex_fused_estimator(spec, **overrides) -> "FusedEstimator":
     replay test share one definition; `**overrides` pass straight through to
     `build_fused_estimator` (e.g. `contact_meas_var=1e-4`, `dt=...`).
     """
-    model = MjxModel.from_xml_string(spec.mjcf, site_names=alex_site_names(), pairs=ALEX_PAIRS)
+    foot_sites = alex_foot_sites(contacts_per_foot)
+    model = MjxModel.from_xml_string(
+        spec.mjcf, site_names=alex_site_names(contacts_per_foot), pairs=ALEX_PAIRS)
     return build_fused_estimator(
-        model, imu_sites=ALEX_IMU_SITES, pairs=ALEX_PAIRS, foot_sites=ALEX_FOOT_SITES,
+        model, imu_sites=ALEX_IMU_SITES, pairs=ALEX_PAIRS, foot_sites=foot_sites,
         base_imu=0, base_body_site="base_body", effort_limits=spec.effort_limits,
         **overrides,
     )
 
 
-def alex_spec_from_urdf(urdf_path):
+def alex_spec_from_urdf(urdf_path, contacts_per_foot: int = 1):
     """`AlexModelSpec` from a standalone `.urdf` (the config rotor table + Alex sites).
 
     The URDF analogue of `convert_log_model`: reads the file, writes the rotor
@@ -144,11 +206,12 @@ def alex_spec_from_urdf(urdf_path):
         pathlib.Path(urdf_path).read_text(),
         rotor_inertia=jk["rotor_inertia"],
         rotor_inertia_default=jk["rotor_inertia_default"],
-        extra_sites=ALEX_EXTRA_SITES,
+        extra_sites=alex_extra_sites(contacts_per_foot),
     )
 
 
-def build_alex_fused_estimator_from_urdf(urdf_path, **overrides) -> "FusedEstimator":
+def build_alex_fused_estimator_from_urdf(urdf_path, contacts_per_foot: int = 1,
+                                         **overrides) -> "FusedEstimator":
     """Build the Alex fused estimator directly from a standalone URDF file.
 
     The production path when the model comes from a `.urdf` (the RL training body
@@ -157,7 +220,8 @@ def build_alex_fused_estimator_from_urdf(urdf_path, **overrides) -> "FusedEstima
     and site FK bit-for-bit — the permanent lock on the training↔hardware
     cross-check. `**overrides` pass through to `build_fused_estimator`.
     """
-    return build_alex_fused_estimator(alex_spec_from_urdf(urdf_path), **overrides)
+    return build_alex_fused_estimator(
+        alex_spec_from_urdf(urdf_path, contacts_per_foot), contacts_per_foot, **overrides)
 
 
 # ---------------------------------------------------------------------------

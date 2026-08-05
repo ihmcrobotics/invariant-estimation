@@ -80,11 +80,17 @@ TERRAIN_GROUP = dict(contype="2", conaffinity="1")
 # The collision set SCS2 actually emits, from `AlexSimulationCollisionModel` — NOT the URDF
 # `<collision>` tags, whose foot box is 29% narrower. MuJoCo sizes: box = half-extents,
 # capsule = (radius, half-length). Poses are in the ankle-roll frame = the `*_FOOT` body frame.
+_FOOT_BOX_SIZE = " ".join(repr(v) for v in me.ALEX_FOOT_BOX_HALF)
+_FOOT_BOX_POS = " ".join(repr(v) for v in me.ALEX_FOOT_BOX_CENTER)
+
 SCS2_COLLISION_GEOMS = (
     ("PELVIS_LINK",          "capsule", "0.135 0.025",      "-0.06 0 -0.02",
      "0.70710678118654746 -0.70710678118654768 0 0"),
-    ("LEFT_FOOT",            "box",     "0.13 0.07 0.0275", "0.045 0 -0.05", "1 0 0 0"),
-    ("RIGHT_FOOT",           "box",     "0.13 0.07 0.0275", "0.045 0 -0.05", "1 0 0 0"),
+    # Half-extents/center come from `main_estimator`, which is also where the N=8
+    # corner FK offsets are derived from -- one constant, so a geom change moves
+    # the estimator's corners with it instead of silently desyncing them.
+    ("LEFT_FOOT",            "box",     _FOOT_BOX_SIZE, _FOOT_BOX_POS, "1 0 0 0"),
+    ("RIGHT_FOOT",           "box",     _FOOT_BOX_SIZE, _FOOT_BOX_POS, "1 0 0 0"),
     ("TORSO_LINK",           "capsule", "0.1 0.05",         "-0.01 0 0.22",  "1 0 0 0"),
     ("LEFT_GRIPPER_Z_LINK",  "capsule", "0.06 0.03",        "0 0 0",         "1 0 0 0"),
     ("RIGHT_GRIPPER_Z_LINK", "capsule", "0.06 0.03",        "0 0 0",         "1 0 0 0"),
