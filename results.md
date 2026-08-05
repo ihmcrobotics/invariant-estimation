@@ -14,10 +14,14 @@
 > 4. **The N=8 conditioning gate does not collapse** — `applied = 1.00` on every
 >    run and terrain, contradicting my own conservative prediction (§3).
 >
-> **What is NOT established:** whether N=8 *improves* the estimate. R3b is still
-> ~1.4–1.6× worse than the analytic baseline while R0 (N=2, flat) beat it — but N,
-> dataset and step count all differ at once. The missing run is N=2 on the same DR
-> pool.
+> 5. **N=8 improves the estimator by 1.81×** — measured against N=2 on *identical*
+>    held-out rollouts (R2b control, §5c). This is the plan's core question and the
+>    answer is yes, but the gain is in the **analytic** filter, not the learned one:
+>    ContactNet beats its own baseline at N=2 (1.22×) and does **not** at N=8
+>    (0.64×), because N=8's analytic starting point is already much stronger.
+>
+> **What is NOT established:** whether ContactNet can beat the N=8 analytic filter
+> given enough training. R3b was still improving at 6000 steps.
 >
 > **Also:** four defects in the *inherited* base had to be fixed before any of this
 > was measurable, including one that had never executed and one that spawned the
@@ -37,7 +41,7 @@ estimator". The honest answer this run supports:
 | Does β-NLL help? | **No — it costs 2.5–6.7× velocity** | R3 vs R3b, objective is the only difference (§5) |
 | Did DR work as shipped? | **No — three separate defects** | §1, §4; incl. robot spawned buried in terrain |
 | Is per-corner Σ_C degenerate? | **No — 33 % spread, heel/toe split** | §5b |
-| Does N=8 improve the estimate? | **Not established** | N, data and steps all differ at once (§5) |
+| Does N=8 improve the estimate? | **Yes — 1.81×**, via the analytic filter | R2b control, identical rollouts (§5c) |
 
 ---
 
@@ -200,7 +204,8 @@ so the comparison stands.
 | R1 | 2 | flat | β-NLL | 300 | 0.83 | 2.36 | 1.00 | *undertrained* |
 | R0′ control | 2 | flat | L2 | 300 | 0.79 | 2.17 | 1.00 | *undertrained* |
 | **R3** | 8 | DR | β-NLL | 6000 | **0.20 – 0.59** | 1.31 – 3.21 | 1.00 | **mean-excuse** |
-| **R3b** | 8 | DR | L2 | 6000 | **0.079 – 0.104** | 0.17 – 0.73 | 1.00 | **2.5–6.7× better than R3** |
+| **R3b** | 8 | DR | L2 | 6000 | **0.088** mean | 0.17 – 0.73 | 1.00 | **2.5–6.7× better than R3** |
+| **R2b** | 2 | DR | L2 | 5085 | **0.084** mean | 0.070 | 1.00 | **the N=8 control** (§5c) |
 
 ### R3 (N=8 + DR + β-NLL), per terrain — the plan's required breakdown
 
@@ -264,6 +269,43 @@ this window.
 
 ---
 
+## 5c. R2b — the N=2-on-DR control: **does N=8 help?**
+
+The control the earlier draft said "did not fit tonight". It did fit. R2b is N=2 on
+the **same DR pool**, same terrains, same seeds, same L2 objective, validated on the
+**identical four held-out rollouts** as R3b. The only differences are the contact
+count and the step count (5085 vs 6000 — R2b hit its time budget; noted, not hidden).
+
+| held-out rollout | N=2 analytic | N=2 learned | N=8 analytic | N=8 learned |
+|---|---|---|---|---|
+| flat/seed8 | 0.1087 | 0.0768 | **0.0572** | 0.0814 |
+| hard_stepping/seed7 | 0.0866 | 0.0942 | **0.0552** | 0.0791 |
+| stepping_stones/seed10 | 0.1272 | 0.1017 | **0.0639** | 0.1042 |
+| waves/seed9 | 0.0879 | 0.0643 | **0.0511** | 0.0885 |
+| **MEAN** | 0.1026 | 0.0843 | **0.0568** | 0.0883 |
+
+Three readings, in order of importance:
+
+1. **The analytic N=8 filter is 1.81× better than analytic N=2** (0.0568 vs 0.1026
+   m/s), on identical data. **More contact points genuinely improve the estimator.**
+   Four corners per foot give the InEKF a far better-constrained contact geometry
+   than a single sole point, and it shows without any learning at all.
+2. **The two learned nets are level** (0.0883 vs 0.0843, 0.95×) — so the learned
+   result is *not* what N=8 buys.
+3. **ContactNet beats its baseline at N=2 (1.22×) and loses to it at N=8 (0.64×).**
+   The N=8 analytic filter is simply a much harder target, and 6000 steps was not
+   enough to reach it. Recall R0 needed 8000 steps at N=2 on an *easier* baseline.
+
+So the honest split: **N=8 is a win for the filter; it is not yet a win for the
+learned socket.** Nothing here says the socket cannot get there — R3b's loss was
+still falling — but on this budget it did not.
+
+Note the N=2 and N=8 analytic baselines differ because `contact_chol` is N-shaped;
+each run's "analytic" column is the shipped heuristic at *its own* contact count,
+which is the correct reference for that configuration.
+
+---
+
 ## 5b. Per-corner Σ_C is NOT degenerate — the research question, answered
 
 This was the plan's open question and the stated PARTIAL criterion ("Σ_C
@@ -317,9 +359,10 @@ no new feature channels — and emphatically without a contact-force channel
 
 ## 7. Recommended next steps, in priority order
 
-1. **Run N=2 on the DR pool at 6000 steps.** One run, ~90 min, and it is the only
-   thing standing between this and a clean verdict on N=8. Everything else is
-   already in place — the pool, the split, the evaluator, the figures.
+1. **Train the N=8 socket longer.** This is now the open question: N=8's analytic
+   filter is 1.81× better than N=2's, and ContactNet has not yet caught up to it
+   (0.64× at 6000 steps, while it beat the easier N=2 baseline at 5085). R0 needed
+   8000 steps against a weaker target. Budget 12–16k steps before concluding.
 2. **Do not ship β-NLL as configured.** Use the hybrid (L2 anchor + innovation
    term) from plan §6, or re-derive the weighting. The pure stacked
    `det(S)^{β/dof}` form is unbounded below in `logdet`, drives the loss negative,
