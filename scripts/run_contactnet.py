@@ -340,18 +340,25 @@ def main():
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print("== summary ==")
     print(json.dumps(summary, indent=2))
-    make_plots(hist, val_metrics, out)
+    make_plots(hist, val_metrics, out, cfg.objective)
 
 
-def make_plots(hist, val_metrics, out):
+def make_plots(hist, val_metrics, out, objective="l2_velocity"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     if hist.size:
         fig, ax = plt.subplots(1, 3, figsize=(15, 4))
-        ax[0].plot(hist[:, 0]); ax[0].set_title("training loss (l2_velocity)")
-        ax[0].set_xlabel("step"); ax[0].set_ylabel("loss"); ax[0].set_yscale("log")
+        ax[0].plot(hist[:, 0])
+        # The objective is NOT always l2_velocity, and beta_nll's loss is NEGATIVE
+        # (0.5*(NIS + logdet S) is unbounded below in logdet). A hardcoded log scale
+        # drops every point and renders an EMPTY panel -- which is exactly what the
+        # first N=8 beta-NLL run produced. Log only when the curve is all-positive.
+        ax[0].set_title(f"training loss ({objective})")
+        ax[0].set_xlabel("step"); ax[0].set_ylabel("loss")
+        if np.all(hist[:, 0] > 0):
+            ax[0].set_yscale("log")
         ax[1].plot(hist[:, 2]); ax[1].axhline(1.0, ls="--", c="k", lw=0.8)
         ax[1].set_title("contact NIS / dof"); ax[1].set_xlabel("step")
         ax[2].plot(hist[:, 4]); ax[2].set_title("cumulative reseeds"); ax[2].set_xlabel("step")
