@@ -99,9 +99,19 @@ def save_norm(norm, path):
 
 
 def _windows_full(cache, norm, cfg):
-    """(T, N_c, H, F) normalized feature windows over the whole stream."""
-    x = normalize.apply(jnp.asarray(cache["channels"]), norm)
-    return np.asarray(features.window(x, cfg.H))
+    """(T, N_c, H, F) normalized feature windows over the whole stream.
+
+    Forced onto the CPU device. This materialises T*N_c*H*F float64 -- 0.6 GB at
+    T=62k, N=2, and 2.4 GB at N=8 -- plus a transpose copy, and doing that on the
+    accelerator OOM'd a 12 GB card mid-validation after training had already
+    finished, losing the run. It is a one-shot gather with no math in it, so the
+    GPU buys nothing here; the result is handed back as NumPy and only the sliced
+    usable region is put back on device by the caller.
+    """
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        x = normalize.apply(jnp.asarray(cache["channels"], dtype=jnp.float64), norm)
+        return np.asarray(features.window(x, cfg.H))
 
 
 def validate(prep, cache, norm, cfg, params, fused, P0, eps):

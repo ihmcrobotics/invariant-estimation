@@ -246,7 +246,11 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
     loop.d.qpos[0:2] = (x0, y0)
     loop.d.qpos[3:7] = (np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2))
     if use_terrain:
-        loop.d.qpos[2] = float(field.max()) + 0.02
+        # RAISE the spawn clear of the relief -- `+=`, not `=`. Assigning put the
+        # pelvis at field.max()+0.02 ~ 0.12 m instead of its nominal ~0.9 m, i.e.
+        # spawned the robot buried to the chest, so every terrain rollout fell
+        # instantly and looked like "the policy cannot walk terrain".
+        loop.d.qpos[2] += float(field.max()) + 0.02
     mujoco.mj_forward(m, loop.d)
     loop.set_height_target(loop.height_target)
 
