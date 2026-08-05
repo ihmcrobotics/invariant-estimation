@@ -94,7 +94,7 @@ class Collector:
 
 def build_collector(policy_name: str = "baseline", *, dt: float = None,
                     chunk_ticks: int = 10_000, contact_meas_var: float = 0.0,
-                    verbose: bool = True) -> Collector:
+                    contacts_per_foot: int = 1, verbose: bool = True) -> Collector:
     """Load the policy and build the fused estimator.
 
     contact_fk_unfiltered=True is NOT optional: without it FusedSensors.q_unfiltered
@@ -106,7 +106,7 @@ def build_collector(policy_name: str = "baseline", *, dt: float = None,
     t0 = time.time()
     policy = rp.load_policy(policy_name)
     fused = me.build_alex_fused_estimator_from_urdf(
-        rp.cycloid_forearm_urdf(rp.URDF), dt=dt,
+        rp.cycloid_forearm_urdf(rp.URDF), contacts_per_foot=contacts_per_foot, dt=dt,
         contact_meas_var=contact_meas_var, contact_fk_unfiltered=True)
     c = Collector(policy=policy, fused=fused, dt=dt, chunk_ticks=int(chunk_ticks),
                   policy_name=policy_name, build_s=time.time() - t0)
@@ -340,7 +340,11 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
     roll = Rollout(sensors=sensors, inputs=inputs, truth=truth, aux=aux, meta=meta)
     _assert_float64(roll)
     if out_dir is not None:
-        path = Path(out_dir) / f"{terrain}_seed{seed:03d}.npz"
+        # N is in the filename: raw sensors are N-agnostic but `InEKFInputs` and
+        # `contact_chol` are not, so an N=2 pool must never be picked up by an N=8
+        # run. The N=2 name is left bare so the existing flat pool stays valid.
+        tag = "" if c.fused.n_contacts == 2 else f"_n{c.fused.n_contacts}"
+        path = Path(out_dir) / f"{terrain}{tag}_seed{seed:03d}.npz"
         save_rollout(roll, path)
         if verbose:
             print(f"    -> {path}  ({path.stat().st_size / 1e6:.0f} MB)")
