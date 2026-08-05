@@ -111,11 +111,27 @@ cond(S), stacked 8-contact innovation : 1.09e9
 config cond_s_max                     : 1.0e9
 ```
 
-**The conditioning gate is therefore expected to fire on flat ground at N=8.**
-Per plan §6 this is escalated, not fixed: widening the floor would mask the very
-effect under test, and the learned Σ_C is the intended remedy. A control test
-confirms *independent* contacts stay well conditioned at both N=2 and N=8, so the
-result is about corner correlation specifically, not about N=8 per se.
+A control test confirms *independent* contacts stay well conditioned at both N=2
+and N=8, so the result is about corner correlation specifically, not about N=8
+per se.
+
+### …but it does NOT fire in practice — measured
+
+The prediction above was made with a deliberately near-rigid corner correlation.
+On the real N=8 DR training run the applied rate is:
+
+```
+applied = 1.00  (every logged step, R3)
+```
+
+**The gate never fires.** The physical covariances the filter actually carries are
+not rigid enough to push `S` past the 1e9 floor, so the "update collapses on flat
+ground" failure mode the plan warned about did not materialise. This is worth
+stating plainly because the synthetic number alone would have justified widening
+the gate — and doing so would have been fixing a problem that does not exist.
+
+The 1.09e9 figure remains the right *bound*: it says how little margin there is,
+and that a stiffer contact model (or a genuinely rigid foot) would cross it.
 
 ---
 

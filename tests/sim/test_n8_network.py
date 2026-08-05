@@ -134,9 +134,9 @@ def test_gradients_are_finite_and_nonzero_through_the_n8_scan(objective):
 
     dataset.build_channel_cache([path], c, verbose=False)
     norm = dataset.fit_normalization([path])
-    prep = dataset.prepare([path], norm, c, cfg)[0]
+    prep = dataset.prepare([path], norm, cfg)[0]
     P0 = dataset.measure_p0(c.fused, prep, cfg)
-    seg = dataset.make_segment(prep, t0=prep.warmup + 1, cfg=cfg, P0=P0)
+    seg = dataset.make_segment(prep, t0=prep.t_lo, cfg=cfg, P0=P0)
 
     params = network.init(jax.random.PRNGKey(0), d_in=cfg.d_in, widths=cfg.widths,
                           sigma_0=cfg.sigma_0, eps=cfg.eps)
