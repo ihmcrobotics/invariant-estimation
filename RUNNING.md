@@ -480,8 +480,16 @@ uv run python run_estimator.py ... --out run.npz                                
 uv run python run_estimator.py --policy baseline --ticks 1500 --vx 0.6 \
        --video walk.mp4                                                             # 30 s video
 uv run --extra gpu python run_estimator.py --policy baseline --headless --ticks 500 \
-       --vx 0.45 --contactnet results/latest/params.npz                            # ContactNet in the loop
+       --vx 0.45 --contacts-per-foot 4 \
+       --contactnet results/latest/params.npz                                       # ContactNet in the loop
 ```
+
+`--contacts-per-foot` must match what the checkpoint trained under — the current
+ladder arms (A/B/C/D) are all N=8, so they need `4`. It is not optional and not
+inferable: the network's per-contact input is foot-major duplicated, so it accepts
+either N without a shape error and simply applies corner-calibrated Σ_C to
+whole-sole anchors. `run_estimator.py` reads the training geometry from the
+checkpoint's `summary.json` and refuses the mismatch rather than let it run.
 
 Every run prints an error table against the sim's own state (tilt as the policy sees it,
 attitude, gyro, velocity, position drift, joint state) over the whole run and over its last half.
@@ -493,6 +501,7 @@ attitude, gyro, velocity, position drift, joint state) over the whole run and ov
 | `--contact-fk measured\|pinned` | whether the InEKF contact FK uses the measured ankle angles (default) or pins them at `qpos0`, as the library default still does — worth ~2x on attitude error, see below |
 | `--stance-chol` / `--swing-chol` | the Σ_C factor for a trusted / airborne foot. The InEKF has **no contact mask**; contact condition rides entirely in Σ_C, so a swing foot needs a large factor or the filter keeps believing it is planted |
 | `--contactnet PARAMS.npz` (+ `--contactnet-norm`) | run a trained ContactNet in the loop: its learned per-tick `contact_chol` (via `contactnet.online.make_provider`) replaces the analytic stance/swing heuristic. Reads `norm_constants.npz` beside `PARAMS.npz` unless overridden; config is the `ContactNetConfig()` defaults the checkpoint trained under. Run the same command without the flag for the closed-loop A/B |
+| `--contacts-per-foot 1\|4` | contact slots per foot: `1` = the shipped N=2 sole pair (default), `4` = the N=8 box corners. Must match a `--contactnet` checkpoint's training geometry, which is enforced against its `summary.json` |
 | `--contact-meas-var` | flight's `1e-4` contact measurement-noise floor (port default 0) |
 | `--video walk.mp4` | record the run offscreen to H.264 (implies `--headless`, `--video-fps` / `--video-size` tune it) |
 | `--ghost [mode]` | draw a translucent robot at the estimated state: `full` (default) or `attitude`. Viewer only |

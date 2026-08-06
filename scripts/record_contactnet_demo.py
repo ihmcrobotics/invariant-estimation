@@ -10,7 +10,7 @@ doing forward / backward / strafe L,R / turn L,R with the learned contact-noise
 model in the loop.
 
     uv run --extra gpu python scripts/record_contactnet_demo.py \
-        --contactnet results/latest/params.npz \
+        --contactnet results/latest/params.npz --contacts-per-foot 4 \
         --out results/latest/closed_loop/contactnet_demo_ghost.mp4
 
 Drop --contactnet for the analytic-baseline version. `--ghost attitude` pins the
@@ -60,6 +60,10 @@ def main():
     ap.add_argument("--contactnet", default=None, metavar="PARAMS.npz",
                     help="run the trained ContactNet in the loop (omit for the analytic baseline)")
     ap.add_argument("--contactnet-norm", default=None)
+    ap.add_argument("--contacts-per-foot", type=int, choices=(1, 4), default=1,
+                    help="contact slots per foot; must match the checkpoint's training "
+                         "geometry (the N=8 ladder arms need 4). run_estimator.py "
+                         "enforces this against the checkpoint's summary.json")
     ap.add_argument("--out", required=True, metavar="PATH.mp4")
     ap.add_argument("--ghost", choices=("full", "attitude"), default="full")
     ap.add_argument("--seconds", type=float, default=None,
@@ -71,7 +75,8 @@ def main():
     w, h = (int(v) for v in args.size.lower().split("x"))
     loop = re_mod.make_estimated_loop(
         "baseline", with_visuals=True, contactnet=args.contactnet,
-        contactnet_norm=args.contactnet_norm, verbose=True)
+        contactnet_norm=args.contactnet_norm, verbose=True,
+        contacts_per_foot=args.contacts_per_foot)
     ghost = Ghost(loop.m, loop.maps, loop.filtered_slots, mode=args.ghost)
 
     rec = rp.VideoRecorder(loop.m, args.out, body=loop.maps["BASE_BID"],

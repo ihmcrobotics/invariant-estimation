@@ -11,7 +11,10 @@ Also writes `sigma_diag.npz` (Sigma_C, per-corner contact force, conditioning an
 applied mask over a window) which `plot_sigma_c.py` turns into the Gate G figures.
 
 Usage:
-    uv run python scripts/evaluate_run.py --run results/<dir> [--pool n8] [--contacts-per-foot 4]
+    uv run python scripts/evaluate_run.py --run results/<dir> [--pool n8]
+
+`--contacts-per-foot` and `--objective` default to whatever the run recorded in its
+`summary.json`; pass them only to deliberately evaluate off-geometry, which warns.
 """
 import argparse
 import json
@@ -40,6 +43,40 @@ sys.path.insert(0, str(REPO / "scripts"))
 import run_contactnet as R                                   # reuse validate()
 
 
+def resolve_run_geometry(run, cpf_arg, objective_arg):
+    """`(contacts_per_foot, objective)` for `run`, explicit flags winning.
+
+    `run_contactnet.py` writes both into `summary.json`; the pre-ladder default was
+    `(1, "l2_velocity")`, which is wrong for every N=8 arm. Falls back to that old
+    default only for checkpoints that predate the summary, and says so.
+    """
+    cpf, objective = cpf_arg, objective_arg
+    summary = run / "summary.json"
+    trained_cpf = trained_obj = None
+    if summary.exists():
+        try:
+            s = json.loads(summary.read_text())
+            trained_cpf = int(s["run"]["args"]["contacts_per_foot"])
+            trained_obj = str(s["cfg"]["objective"])
+        except (KeyError, ValueError):
+            pass
+    if cpf is None:
+        cpf = trained_cpf if trained_cpf is not None else 1
+    if objective is None:
+        objective = trained_obj if trained_obj is not None else "l2_velocity"
+    if trained_cpf is None:
+        print(f"WARNING: {summary} missing/unreadable -- falling back to "
+              f"contacts_per_foot={cpf}, objective={objective}")
+    else:
+        for name, got, want in (("contacts_per_foot", cpf, trained_cpf),
+                                ("objective", objective, trained_obj)):
+            if got != want:
+                print(f"WARNING: evaluating with {name}={got} but {run.name} trained "
+                      f"with {want} -- the numbers will not describe this checkpoint")
+    print(f"geometry: N={cpf * 2} ({cpf}/foot), objective={objective}")
+    return cpf, objective
+
+
 def load_params(path):
     z = np.load(path, allow_pickle=True)
     if "tree" in z:                       # pytree pickled whole
@@ -54,15 +91,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", type=str, required=True)
     ap.add_argument("--pool", type=str, default=None)
-    ap.add_argument("--contacts-per-foot", type=int, default=1)
-    ap.add_argument("--objective", type=str, default="l2_velocity")
+    ap.add_argument("--contacts-per-foot", type=int, choices=(1, 4), default=None,
+                    help="default: whatever the run trained under, per its summary.json")
+    ap.add_argument("--objective", type=str, default=None,
+                    help="default: whatever the run trained under, per its summary.json")
     ap.add_argument("--val-seeds", type=int, nargs="+", default=[24, 25, 26, 27])
     ap.add_argument("--diag-ticks", type=int, default=4000)
     args = ap.parse_args()
 
     run = Path(args.run)
-    cfg = ContactNetConfig(objective=args.objective)
-    c = collect.build_collector(contacts_per_foot=args.contacts_per_foot, verbose=True)
+    # Both of these silently produce plausible-but-wrong numbers when they disagree
+    # with training: the contact geometry because the network's per-contact input is
+    # foot-major duplicated and so accepts either N without a shape error, and the
+    # objective because it only selects which loss terms `validate()` reports. The
+    # run already records both -- read them rather than make the caller remember.
+    cpf, objective = resolve_run_geometry(run, args.contacts_per_foot, args.objective)
+    cfg = ContactNetConfig(objective=objective)
+    c = collect.build_collector(contacts_per_foot=cpf, verbose=True)
 
     if args.pool:
         pool = sorted(collect.DATA_DIR.glob(f"*_{args.pool}_seed*.npz"))
