@@ -1,0 +1,138 @@
+[
+  {
+    "label": "flat",
+    "rollout": "flat_n8fix_seed028.npz",
+    "filter": {
+      "contacts_per_foot": 4,
+      "n_contacts": 8,
+      "objective": "l2_vel_pos_ori",
+      "rolling": {
+        "enabled": false,
+        "tau": 0.25,
+        "sigma_r": 0.0985
+      }
+    },
+    "baseline": {
+      "vel_rmse": 0.05253012530668276,
+      "vel_nees": 4.423670029161776,
+      "vel_nees_tangent": 5.648761641114143,
+      "vel_nees_x": 0.06734077100285836,
+      "vel_nees_y": 0.08090681217893256,
+      "vel_nees_z": 2.288100288592147,
+      "nis_over_dof": 0.04313127506831605,
+      "applied": 0.9999999999999999
+    },
+    "learned": {
+      "vel_rmse": 0.04441085755983748,
+      "vel_nees": 2.3331165824645246,
+      "vel_nees_tangent": 4.245908748587825,
+      "vel_nees_x": 0.06582923550941229,
+      "vel_nees_y": 0.07370122218472158,
+      "vel_nees_z": 1.1421895087394973,
+      "nis_over_dof": 0.07960601841010201,
+      "applied": 0.9999999999999999
+    }
+  },
+  {
+    "label": "hard_stepping",
+    "rollout": "hard_stepping_n8fix_seed027.npz",
+    "filter": {
+      "contacts_per_foot": 4,
+      "n_contacts": 8,
+      "objective": "l2_vel_pos_ori",
+      "rolling": {
+        "enabled": false,
+        "tau": 0.25,
+        "sigma_r": 0.0985
+      }
+    },
+    "baseline": {
+      "vel_rmse": 0.05861641772108379,
+      "vel_nees": 5.3117494303817665,
+      "vel_nees_tangent": 7.139055209253232,
+      "vel_nees_x": 0.055716098838922104,
+      "vel_nees_y": 0.07532532129707459,
+      "vel_nees_z": 3.408705397564296,
+      "nis_over_dof": 0.04267794474464954,
+      "applied": 0.9999999999999999
+    },
+    "learned": {
+      "vel_rmse": 0.05175281756007067,
+      "vel_nees": 2.8715069343351174,
+      "vel_nees_tangent": 4.501648859616201,
+      "vel_nees_x": 0.048690174162744404,
+      "vel_nees_y": 0.06824020510853696,
+      "vel_nees_z": 1.6157408758636196,
+      "nis_over_dof": 0.10357570840519269,
+      "applied": 0.9999999999999999
+    }
+  },
+  {
+    "label": "stepping_stones",
+    "rollout": "stepping_stones_n8fix_seed022.npz",
+    "filter": {
+      "contacts_per_foot": 4,
+      "n_contacts": 8,
+      "objective": "l2_vel_pos_ori",
+      "rolling": {
+        "enabled": false,
+        "tau": 0.25,
+        "sigma_r": 0.0985
+      }
+    },
+    "baseline": {
+      "vel_rmse": 0.05320932503931196,
+      "vel_nees": 4.409116537025393,
+      "vel_nees_tangent": 5.754430101503535,
+      "vel_nees_x": 0.06904899617925227,
+      "vel_nees_y": 0.054289204600018154,
+      "vel_nees_z": 2.751017177373122,
+      "nis_over_dof": 0.038404208578881466,
+      "applied": 0.9999999999999999
+    },
+    "learned": {
+      "vel_rmse": 0.04563628136681647,
+      "vel_nees": 2.421724817533397,
+      "vel_nees_tangent": 3.796565533587502,
+      "vel_nees_x": 0.07296213175071298,
+      "vel_nees_y": 0.05567739185435483,
+      "vel_nees_z": 1.333094696165561,
+      "nis_over_dof": 0.07409312548486562,
+      "applied": 0.9999999999999999
+    }
+  },
+  {
+    "label": "waves",
+    "rollout": "waves_n8fix_seed025.npz",
+    "filter": {
+      "contacts_per_foot": 4,
+      "n_contacts": 8,
+      "objective": "l2_vel_pos_ori",
+      "rolling": {
+        "enabled": false,
+        "tau": 0.25,
+        "sigma_r": 0.0985
+      }
+    },
+    "baseline": {
+      "vel_rmse": 0.05202061992576179,
+      "vel_nees": 4.435966073885887,
+      "vel_nees_tangent": 5.725910476366132,
+      "vel_nees_x": 0.06803579626981014,
+      "vel_nees_y": 0.04400291730120928,
+      "vel_nees_z": 2.56209808982023,
+      "nis_over_dof": 0.040764830348543286,
+      "applied": 0.9999999999999999
+    },
+    "learned": {
+      "vel_rmse": 0.04060030712601659,
+      "vel_nees": 2.182901184903709,
+      "vel_nees_tangent": 3.1013782367530314,
+      "vel_nees_x": 0.033764651531806376,
+      "vel_nees_y": 0.027919220762154362,
+      "vel_nees_z": 1.2728719716565702,
+      "nis_over_dof": 0.08053806502420668,
+      "applied": 0.9999999999999999
+    }
+  }
+]

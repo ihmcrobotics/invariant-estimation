@@ -94,26 +94,36 @@ class Collector:
 
 def build_collector(policy_name: str = "baseline", *, dt: float = None,
                     chunk_ticks: int = 10_000, contact_meas_var: float = 0.0,
-                    contacts_per_foot: int = 1, verbose: bool = True) -> Collector:
+                    contacts_per_foot: int = 1, rolling=None,
+                    verbose: bool = True) -> Collector:
     """Load the policy and build the fused estimator.
 
     contact_fk_unfiltered=True is NOT optional: without it FusedSensors.q_unfiltered
     is empty, the contact FK stands on qpos0 ankles, and ContactNet's ankle q/tau
     channels do not exist (features raises rather than narrowing silently).
     contact_meas_var=0.0 is the isotropic floor ContactNet replaces (process socket).
+
+    `rolling` (a `RollingAnchorParams`, or None for the config default = off) is a
+    BUILD-TIME flag: it selects the contact kinematics that also emit `omega_rel`
+    and adds the rolling-anchor density to Σ_C inside the scanned step. It must
+    therefore be set here, on the collector's fused estimator, for ContactNet to
+    train *through* the term rather than against a filter that lacks it.
     """
     dt = float(rp.DT) if dt is None else float(dt)
     t0 = time.time()
     policy = rp.load_policy(policy_name)
     fused = me.build_alex_fused_estimator_from_urdf(
         rp.cycloid_forearm_urdf(rp.URDF), contacts_per_foot=contacts_per_foot, dt=dt,
-        contact_meas_var=contact_meas_var, contact_fk_unfiltered=True)
+        contact_meas_var=contact_meas_var, contact_fk_unfiltered=True, rolling=rolling)
     c = Collector(policy=policy, fused=fused, dt=dt, chunk_ticks=int(chunk_ticks),
                   policy_name=policy_name, build_s=time.time() - t0)
     if verbose:
+        ra = fused.ekf.rolling
+        roll = (f"rolling-anchor ON (tau={ra.tau}, sigma_r={ra.sigma_r})"
+                if ra.enabled else "rolling-anchor off")
         print(f"collector: {fused.n_joints} filtered joints, {fused.build.n_imus} IMUs, "
               f"{fused.n_contacts} contacts, {fused.n_aux} off-path joints, dt={dt} "
-              f"({1 / dt:.0f} Hz)  [built in {c.build_s:.1f}s]")
+              f"({1 / dt:.0f} Hz), {roll}  [built in {c.build_s:.1f}s]")
     return c
 
 @dataclass

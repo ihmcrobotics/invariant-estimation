@@ -319,3 +319,208 @@ helps most (0.057 → 0.040).
 Runs: `results/2026-08-06_*_{A_l2vel,B_l2velpos,C_l2velori,D_l2velposori}/`
 (each with `summary.json`, `training.png`, `validation.png`); combined summary in
 `results/l2_options_summary.png`.
+
+---
+
+# Rolling-anchor density under ContactNet — arm E (2026-08-06)
+
+> ## VERDICT: **NULL RESULT.** Training arm D through the rolling-anchor contact
+> density does **not** fix the closed-loop sink, and costs held-out velocity RMSE.
+>
+> The sink improves 1.75× on one closed-loop condition and gets **1.42× worse** on
+> the other — a coin flip on n=2, not an effect. **An earlier report of "1.75×
+> better" was read off condition 1 alone and is retracted**; the retraction is the
+> useful part of this run. The one reproducible effect is a **horizontal
+> regression, 6–9× on both conditions**. And the reason the open-loop numbers do
+> not translate is the finding worth keeping: **analytic Σ_C and learned Σ_C are
+> substitutes, not complements** — the rolling term buys the *analytic* filter 1.8×
+> on `vel_nees_z` and the *learned* filter ~nothing, because ContactNet had already
+> absorbed the same effect into its own Σ_C.
+
+## Setup
+
+* **Arm E** = arm D's objective (`l2_vel_pos_ori`), same `n8fix` pool, same N=8
+  (`--contacts-per-foot 4`), retrained with `--rolling`: the filter it is trained
+  *through* carries `Σ_C += τ σ_r² (‖ω‖² I − ω ωᵀ)`
+  (`inEKF/contact.py::rolling_anchor_density`), τ = 0.25 s, σ_r = 0.0985 m — both
+  config defaults, untuned. 12000/12000 steps, 8229 s wall, `w_pos = 4.7185`,
+  `w_ori = 14.14`.
+* **Both arms are evaluated against their own filter.** E's "analytic baseline" is
+  the rolling filter with the heuristic Σ_C; D's is the non-rolling one. The
+  learned-vs-analytic ratios are therefore within-arm; the cross-arm *learned*
+  comparison is the one that carries the rolling effect.
+* `summary.json` now carries a top-level **`filter`** block recording the resolved
+  build (`{rolling: {enabled, tau, sigma_r}}`). Arms A–D predate it.
+  `run_estimator.py::_check_contact_geometry` refuses a rolling mismatch in either
+  direction, and `scripts/evaluate_run.py` now reads the same block rather than
+  silently rebuilding a non-rolling collector (it did, until this run).
+
+## Held-out (4 terrains, 4 held-out rollouts, means)
+
+| metric | D analytic | D learned | E analytic | E learned | rolling did what |
+|---|---|---|---|---|---|
+| `vel_rmse` [m/s] | 0.0541 | **0.0456** | 0.0531 | 0.0492 | analytic −2%, learned **+8% worse** |
+| `vel_nees` (3 dof) | 4.645 | 2.452 | 3.038 | 2.370 | analytic **1.53×** better, learned 1.03× |
+| `vel_nees_z` | 2.753 | 1.341 | 1.525 | 1.218 | analytic **1.80×** better, learned 1.10× |
+| `nis_over_dof` | 0.0412 | 0.0845 | 0.0219 | 0.0683 | S grows either way (unchanged story) |
+
+### Per-terrain learned velocity RMSE (each against its own analytic baseline)
+
+| terrain | D analytic | **D learned** | E analytic | **E learned** |
+|---|---|---|---|---|
+| flat | 0.0525 | **0.0444** | 0.0514 | **0.0468** |
+| hard_stepping | 0.0586 | **0.0518** | 0.0564 | **0.0530** |
+| stepping_stones | 0.0532 | **0.0456** | 0.0533 | **0.0481** |
+| waves | 0.0520 | **0.0406** | 0.0514 | **0.0489** |
+| mean | 0.0541 | **0.0456** | 0.0531 | **0.0492** |
+
+E's learned arm loses to D's on **every** terrain, worst on `waves` (0.0406 →
+0.0489, the terrain where the position term had helped most). E still beats its
+own analytic baseline everywhere, so the socket is not broken — it is just worse.
+
+## Closed loop — the sink, which is what this arm was FOR
+
+30 s (1500 control ticks @ 50 Hz), policy driven by the estimate, `--imu-noise`
+off, one deterministic run per arm per condition.
+
+| condition | metric | D (rolling off) | E (rolling on) | |
+|---|---|---|---|---|
+| vx 0.4 | vertical drift rate | −0.0177 m/s | **−0.0101 m/s** | 1.75× better |
+| | final z error | −0.513 m | **−0.290 m** | |
+| vx 0.4 + yaw 0.3 | vertical drift rate | −0.0127 m/s | **−0.0180 m/s** | **1.42× worse** |
+| | final z error | −0.385 m | **−0.522 m** | |
+| vx 0.4 | final horiz err / ground track | 0.103 m / 12.22 m = **0.84%** | 0.974 m / 12.34 m = **7.90%** | **9.4× worse** |
+| vx 0.4 + yaw 0.3 | final horiz err / ground track | 0.018 m / 12.28 m = **0.15%** | 0.108 m / 12.41 m = **0.87%** | **5.9× worse** |
+
+Error signature (linear-fit vs √t-fit residual RMS on `z`) stayed **LINEAR
+(biased)** on both arms in both conditions. Touchdown concentration (share of
+`|Δz|` within ±40 ms of a contact rising edge, over the share of ticks) 1.44× (D)
+vs 1.85× (E) on condition 1 — i.e. **more** of the error lands at touchdown with
+rolling on, not less.
+
+This is the direct contradiction of the open-loop N=2 result in
+`RESEED_ROLLING_ANCHOR_README.md`, where the rolling anchor took the drift to
+0.18×/0.11× **and flipped the signature to SQRT (diffusive)** and collapsed the
+touchdown concentration 3.0× → 0.2×. None of those three signatures reproduces
+here. What changed between the two measurements: N=2 → N=8, open-loop replay →
+closed loop, analytic Σ_C → ContactNet Σ_C.
+
+## Σ_C diagnostics (Gate G) — the mechanism behind the null result
+
+`scripts/evaluate_run.py` → `sigma_diag.npz` → `scripts/plot_sigma_c.py`, run for
+**both** arms on the **same** held-out rollout (`flat_n8fix_seed028`, first 4000
+ticks, foot 0), so the two figures are directly comparable.
+
+| quantity (stance ticks unless noted) | D (rolling off) | E (rolling on) |
+|---|---|---|
+| median `det(Σ_C)^{1/3}` | 2.38e-7 m | **9.45e-9 m** (25× smaller) |
+| swing/stance modulation of `tr Σ_C` | **336×** | **120×** |
+| median `cond(Σ_C)` = λ_max/λ_min | 8.3e8 | **2.9e12** |
+| median eigenvalues | (4.2e-12, 3.3e-6, 4.5e-3) | (4.8e-16, 1.4e-6, 1.6e-3) |
+| per-corner relative spread (script stat) | **0.565** | **0.093** |
+| numerically singular ticks (`det ≤ 1e-300`) | 0.00% | **0.88%**, all in swing |
+
+Look at the two `sigma_c_over_stride.png` side by side: **D's Σ_C sweeps ~8 orders
+of magnitude over the gait cycle** (1e-7 in stance up to ~1e0 in swing) with the
+four corners visibly separated. **E's is nearly flat at ~1e-8** across the whole
+cycle, the four corners lie on top of each other, and it drops to numerically
+singular for short flickers in mid-swing.
+
+That is finding 3 in the network's own output: given a filter that already
+supplies an ω-driven, phase-modulated contact density analytically, the net
+**stopped producing one**. It collapsed onto a near-constant, near-rank-2 floor —
+including losing most of the per-corner discrimination that was the open question
+from the N=8 verdict above (0.565 → 0.093). The learned and analytic terms are
+filling the same hole, and only one of them fills it at a time. (The singular
+ticks are swing-only, where contacts are untrusted and Σ_C is irrelevant to the
+update, so they are a symptom rather than a bug — but a near-rank-2 Σ_C in
+**stance**, cond 2.9e12, is not something to leave unwatched.)
+
+## Reading it
+
+1. **The sink is not fixed.** −0.0101 vs −0.0177 on one condition, −0.0180 vs
+   −0.0127 on the other. Two conditions, opposite signs, one deterministic run
+   each: that is a coin flip, and the honest summary is "no effect established".
+   The earlier "1.75× better" headline came from condition 1 alone, before
+   condition 2 existed — **retracted**. Any future single-condition drift number
+   should be treated the same way until a second condition agrees with it.
+2. **The horizontal regression is the one reproducible effect.** 9.4× and 5.9× on
+   two independent conditions, same sign, large. *Hypothesis, not a finding:* the
+   density `τ σ_r² (‖ω‖² I − ω ωᵀ)` is rank 2 with its null direction along `ω`.
+   Walking `ω` is pitch-dominated (`≈ e_y`), so the term inflates Σ_C in exactly
+   the `x`–`z` plane and leaves `y` alone — it loosens the anchor along the
+   direction of travel. That predicts a horizontal (fore–aft) cost as the price of
+   the vertical relief, which is what the table shows. It is falsifiable: split the
+   horizontal error into fore-aft and lateral, and check the ratio tracks `ω`'s
+   direction.
+3. **Analytic and learned Σ_C are substitutes, not complements.** The rolling term
+   moves the *analytic* filter a lot (`vel_nees_z` 2.75 → 1.53, **1.8×**) and the
+   *learned* filter almost not at all (1.34 → 1.22, 1.10×), while **costing**
+   velocity RMSE (0.0456 → 0.0492) despite E getting **22% more training steps**.
+   ContactNet had already learned to emit whatever Σ_C the analytic path was
+   missing; adding an analytic term that supplies the same thing spends network
+   capacity on double-counting, and the residual capacity buys less accuracy. The
+   Σ_C diagnostics above show it directly — E's learned Σ_C went flat and
+   near-rank-2 where D's modulated over the stride.
+   This generalises past the rolling anchor: **any Σ_C improvement measured on the
+   analytic filter must be re-measured under the net before it is believed.**
+
+## Caveats (do not over-read)
+
+* **E got 12000 steps, D got 9839** (D was time-truncated). E had **more**
+  training and still lost on RMSE, which *strengthens* the negative result rather
+  than confounding it — but the two are not step-matched, and that is stated here
+  so nobody re-derives it as a surprise.
+* **The training losses are not strictly comparable.** At matched step 9839 E's
+  loss was 2.40e-3 vs D's 1.88e-3, but `w_ori` is auto-sized per run (14.14 for E
+  vs 9.85 for D), so the two composites weight the orientation term differently.
+  Ranking by held-out RMSE, not by loss.
+* **The closed-loop evidence is n=2 conditions, not a distribution.** One
+  deterministic run per arm per condition, `--imu-noise` off. No seeds, no
+  terrain variation, no error bars. Two conditions disagreeing is exactly what
+  n=2 looks like when the effect is small or absent.
+* **`σ_r` was left at the config default 0.0985 m** — the **N=2 sole-centre**
+  value. `RESEED_ROLLING_ANCHOR_README.md` caveat 2 says it must be re-derived for
+  per-corner anchors before flipping `--rolling` and N=8 on together; the
+  `RollingAnchorParams` docstring argues the opposite (the prior on `‖r_i‖` is not
+  smaller at a corner — the far edge is still a foot away — what N=8 buys is
+  observability of `r_i`, not a tighter prior). **That disagreement is unresolved,
+  and this arm ran with it unresolved.** A σ_r sweep is the cheapest way to find
+  out which side is right.
+* **Closed-loop contact NIS moved the opposite way to held-out NIS/dof** (median
+  0.073 → 1.28 on condition 1, 0.052 → 0.96 on condition 2, D → E; held-out
+  `nis_over_dof` *fell*, 0.0845 → 0.0683). Unexplained; single runs; noted so it
+  is not rediscovered as new.
+* **`results/l2_options_summary.png` was NOT regenerated.** It has no generating
+  script in the repo, and arm E does not belong on it under its existing
+  conventions anyway: the grey bars and the dashed line are the *non-rolling*
+  analytic baseline, and E's analytic reference is a different filter. Putting E's
+  bar next to D's grey would compare against the wrong baseline — the exact
+  confound this section is about. Arms A–D only in that figure.
+
+## Recommended next
+
+1. **Do not adopt `--rolling` for ContactNet training.** Arm D stays the reference
+   N=8 checkpoint. The flag remains correct and useful for the *analytic* filter
+   (1.8× on `vel_nees_z` is real), just not underneath a trained socket.
+2. **Re-derive σ_r for corner anchors, or sweep it** (0.02–0.10 m), and settle the
+   README-vs-docstring disagreement before any further rolling arm. Rerunning arm E
+   at a σ_r the corner geometry actually justifies is the only version of this
+   experiment worth the 2.3 h.
+3. **Test the rank-2 hypothesis directly** — decompose the closed-loop horizontal
+   error into fore-aft and lateral and check it aligns with `ω`'s null direction.
+   Cheap (the `.npz` files already hold `est_p`/`true_p`), and it either promotes
+   finding 2 to a mechanism or kills it.
+4. **Make the closed-loop sink measurement a distribution, not a run.** ≥4 seeds ×
+   ≥2 command conditions before any drift claim is quoted again. This run cost a
+   retraction because n=1 looked like a result.
+
+Runs: `results/2026-08-06_12-41-11_E_l2velposori_rolling/` (`summary.json` with
+the new `filter` block, `training.png`, `validation.png`, `eval.json`,
+`sigma_diag.npz`, `sigma_c_over_stride.png`, `sigma_c_stats.json`,
+`closed_loop/contactnet_demo_ghost_n8_rolling.{mp4,gif}`) against
+`results/2026-08-06_06-42-29_D_l2velposori/` (same eval artifacts, regenerated
+here so the two Σ_C figures are comparable); closed-loop sink traces in
+`results/sink{,2}_{D_rolling_off,E_rolling_on}.npz`. Both evals reproduce their
+run's own `summary.json` validation numbers to ~1e-12, which is the check that the
+rebuilt collector matched the trained filter in each case.

@@ -40,6 +40,7 @@ from invariant_estimation.contactnet.config import ContactNetConfig
 from invariant_estimation.contactnet.losses import (
     l2_velocity, l2_position, so3_log_orientation)
 from invariant_estimation.inEKF.filter import init_carry, make_step
+from invariant_estimation import inEKF as inekf_mod
 
 RESULTS_ROOT = REPO / "results"
 
@@ -258,6 +259,17 @@ def main():
                     help="rollout pool tag, e.g. 'n8'. Selects data/*_<tag>_seed*.npz "
                          "and holds out one rollout PER TERRAIN for validation. "
                          "Omit for the flat N=2 pool addressed by --train-seeds.")
+    ap.add_argument("--rolling", action="store_true",
+                    help="train THROUGH the rolling-anchor contact density "
+                         "(inEKF/contact.py): Sigma_C += tau*sigma_r^2*(|w|^2 I - w w^T). "
+                         "Build-time, so it is on for P0, the pose-weight sizing, every "
+                         "training rollout AND both validation arms. Off = the shipped "
+                         "filter every previous arm was trained against.")
+    ap.add_argument("--rolling-tau", type=float, default=None, metavar="SECONDS",
+                    help="rolling-anchor correlation time; default from filter_cfg.yaml (0.25)")
+    ap.add_argument("--rolling-sigma-r", type=float, default=None, metavar="METRES",
+                    help="rolling-anchor lever-arm prior std; default from filter_cfg.yaml "
+                         "(0.0985 = half the URDF foot length)")
     args = ap.parse_args()
 
     overrides = {}
@@ -275,8 +287,16 @@ def main():
     started_at = datetime.now().isoformat(timespec="seconds")
     out = make_run_dir(RESULTS_ROOT, tag=args.tag, explicit=args.out_dir)
     print(f"== run directory: {out} ==")
+    # BUILD-TIME (I7): `rolling` selects the kinematics that emit omega_rel and the
+    # Σ_C density inside the scanned step, so it has to be fixed before anything
+    # traces. One collector => P0, the pose-weight sizing, training and both
+    # validation arms all see the same filter.
+    rolling = (inekf_mod.default_rolling_anchor_params(
+        enabled=True, tau=args.rolling_tau, sigma_r=args.rolling_sigma_r)
+        if args.rolling else None)
     c = collect.build_collector(policy_name="baseline", chunk_ticks=10_000,
-                                contacts_per_foot=args.contacts_per_foot)
+                                contacts_per_foot=args.contacts_per_foot,
+                                rolling=rolling)
 
     if args.collect:
         print("== collecting ==")
@@ -385,6 +405,12 @@ def main():
                 "args": vars(args)},
         "n_train": len(train_preps), "n_val": len(val_preps),
         "steps_run": len(history), "final_reseeds": reseeds,
+        # RESOLVED filter build, not the flags: --rolling-tau/--rolling-sigma-r
+        # default to None in `args` and are filled from filter_cfg.yaml, so the
+        # args block alone does not say what was actually trained through.
+        "filter": {"contacts_per_foot": args.contacts_per_foot,
+                   "n_contacts": int(c.fused.n_contacts),
+                   "rolling": c.fused.ekf.rolling._asdict()},
         "floored": list(norm.floored),
         "cfg": {"F": cfg.F, "d_in": cfg.d_in, "H": cfg.H,
                 "window_span_s": cfg.window_span_seconds,

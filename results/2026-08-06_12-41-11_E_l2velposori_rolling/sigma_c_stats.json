@@ -1,0 +1,10 @@
+{
+  "median_relative_spread_across_corners": 0.09295386201398395,
+  "max_relative_spread_across_corners": 1.7320508075688774,
+  "corner_scale_median": [
+    1.2226473623874747e-08,
+    1.286797064220662e-08,
+    1.2360366421736755e-08,
+    1.3387806302867716e-08
+  ]
+}

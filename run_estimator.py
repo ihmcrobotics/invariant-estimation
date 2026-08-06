@@ -306,7 +306,7 @@ class ContactNetRuntime(EstimatorRuntime):
         self._provider_scan.lower(self._ostate, self._stack(batch)).compile()
 
 
-def _check_contact_geometry(ckpt, n_deployed):
+def _check_contact_geometry(ckpt, n_deployed, rolling_deployed=None):
     """Refuse to deploy a checkpoint onto a different N than it trained under.
 
     Nothing about the shapes catches this: the per-contact feature rows are
@@ -316,6 +316,13 @@ def _check_contact_geometry(ckpt, n_deployed):
     output *means* -- Σ_C calibrated for a corner anchor, applied to a whole-sole
     anchor -- and that only shows up as quietly worse numbers.
 
+    The rolling-anchor flag is the same trap one level up: the network is trained
+    to supply whatever Σ_C the *rest* of the filter does not, so a net trained
+    through `Σ_C += τσ_r²(‖ω‖²I − ωωᵀ)` has learned to leave that term to the
+    analytic path. Deploy it without `--rolling` and the density is simply gone;
+    deploy an old net *with* `--rolling` and the term is double-counted. Shapes
+    are identical either way, so nothing else catches it.
+
     `run_contactnet.py` records the training geometry in `summary.json` beside the
     params. Older checkpoints predate it; those skip the check rather than block.
     """
@@ -324,7 +331,8 @@ def _check_contact_geometry(ckpt, n_deployed):
         return
     try:
         with open(summary) as fh:
-            trained = json.load(fh)["run"]["args"]["contacts_per_foot"]
+            blob = json.load(fh)
+        trained = blob["run"]["args"]["contacts_per_foot"]
     except (KeyError, ValueError):
         return
     n_trained = int(trained) * 2      # two feet
@@ -333,6 +341,17 @@ def _check_contact_geometry(ckpt, n_deployed):
             f"ContactNet geometry mismatch: {ckpt} trained with N={n_trained} "
             f"({trained} contacts/foot) but the estimator was built with "
             f"N={n_deployed}. Pass --contacts-per-foot {trained}.")
+
+    # Pre-rolling checkpoints have no "filter" block: skip rather than block.
+    trained_rolling = blob.get("filter", {}).get("rolling", {}).get("enabled")
+    if trained_rolling is None or rolling_deployed is None:
+        return
+    if bool(trained_rolling) != bool(rolling_deployed):
+        raise SystemExit(
+            f"ContactNet rolling-anchor mismatch: {ckpt} trained with "
+            f"rolling={'ON' if trained_rolling else 'off'} but the estimator was "
+            f"built with rolling={'ON' if rolling_deployed else 'off'}. "
+            f"{'Pass --rolling.' if trained_rolling else 'Drop --rolling.'}")
 
 
 def build_contactnet_provider(fused, reader, ckpt, norm_path, *, verbose=True):
@@ -366,7 +385,7 @@ def build_contactnet_provider(fused, reader, ckpt, norm_path, *, verbose=True):
                            cfg.d_in, cfg.widths, cfg.sigma_0, cfg.eps)
     params = cn_train.load_params(ckpt, like)
     sub = cn_features.subchain_for(fused, reader.unfiltered_names)
-    _check_contact_geometry(ckpt, len(sub))
+    _check_contact_geometry(ckpt, len(sub), bool(fused.ekf.rolling.enabled))
     step = cn_online.make_provider(sub, int(fused.base_imu), fused.kinematics,
                                    cfg, consts, params)
     ostate0 = cn_online.init_state(cfg, len(sub))

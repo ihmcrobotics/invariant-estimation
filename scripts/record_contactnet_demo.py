@@ -64,6 +64,12 @@ def main():
                     help="contact slots per foot; must match the checkpoint's training "
                          "geometry (the N=8 ladder arms need 4). run_estimator.py "
                          "enforces this against the checkpoint's summary.json")
+    ap.add_argument("--rolling", action="store_true",
+                    help="enable the rolling-anchor contact density; must match the "
+                         "checkpoint's training filter (run_estimator._check_contact_"
+                         "geometry enforces this against summary.json)")
+    ap.add_argument("--rolling-tau", type=float, default=None, metavar="SECONDS")
+    ap.add_argument("--rolling-sigma-r", type=float, default=None, metavar="METRES")
     ap.add_argument("--out", required=True, metavar="PATH.mp4")
     ap.add_argument("--ghost", choices=("full", "attitude"), default="full")
     ap.add_argument("--seconds", type=float, default=None,
@@ -76,7 +82,10 @@ def main():
     loop = re_mod.make_estimated_loop(
         "baseline", with_visuals=True, contactnet=args.contactnet,
         contactnet_norm=args.contactnet_norm, verbose=True,
-        contacts_per_foot=args.contacts_per_foot)
+        contacts_per_foot=args.contacts_per_foot,
+        rolling=(re_mod.me.inekf_mod.default_rolling_anchor_params(
+            enabled=True, tau=args.rolling_tau, sigma_r=args.rolling_sigma_r)
+            if args.rolling else None))
     ghost = Ghost(loop.m, loop.maps, loop.filtered_slots, mode=args.ghost)
 
     rec = rp.VideoRecorder(loop.m, args.out, body=loop.maps["BASE_BID"],

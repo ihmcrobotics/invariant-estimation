@@ -1,0 +1,138 @@
+[
+  {
+    "label": "flat",
+    "rollout": "flat_n8fix_seed028.npz",
+    "filter": {
+      "contacts_per_foot": 4,
+      "n_contacts": 8,
+      "objective": "l2_vel_pos_ori",
+      "rolling": {
+        "enabled": true,
+        "tau": 0.25,
+        "sigma_r": 0.0985
+      }
+    },
+    "baseline": {
+      "vel_rmse": 0.05135908606135745,
+      "vel_nees": 3.3752444880330366,
+      "vel_nees_tangent": 4.498696643112936,
+      "vel_nees_x": 0.06435701875414224,
+      "vel_nees_y": 0.06723087590428706,
+      "vel_nees_z": 1.5446734389460695,
+      "nis_over_dof": 0.026389610476727682,
+      "applied": 0.9999999999999999
+    },
+    "learned": {
+      "vel_rmse": 0.046751461008445905,
+      "vel_nees": 2.3226984291701886,
+      "vel_nees_tangent": 3.3538723313508316,
+      "vel_nees_x": 0.06602141183589702,
+      "vel_nees_y": 0.05848566024161913,
+      "vel_nees_z": 1.120205194470828,
+      "nis_over_dof": 0.07922130143762628,
+      "applied": 0.9999999999999999
+    }
+  },
+  {
+    "label": "hard_stepping",
+    "rollout": "hard_stepping_n8fix_seed027.npz",
+    "filter": {
+      "contacts_per_foot": 4,
+      "n_contacts": 8,
+      "objective": "l2_vel_pos_ori",
+      "rolling": {
+        "enabled": true,
+        "tau": 0.25,
+        "sigma_r": 0.0985
+      }
+    },
+    "baseline": {
+      "vel_rmse": 0.05641358173218446,
+      "vel_nees": 2.8462966279884543,
+      "vel_nees_tangent": 4.4019371495676785,
+      "vel_nees_x": 0.045164998464494725,
+      "vel_nees_y": 0.0745847177819803,
+      "vel_nees_z": 1.473623402195773,
+      "nis_over_dof": 0.018959586505583017,
+      "applied": 0.9999999999999999
+    },
+    "learned": {
+      "vel_rmse": 0.05304022792801957,
+      "vel_nees": 2.3711237259403046,
+      "vel_nees_tangent": 3.5661176803512538,
+      "vel_nees_x": 0.05642626741114063,
+      "vel_nees_y": 0.08930627223094044,
+      "vel_nees_z": 1.1581774415612645,
+      "nis_over_dof": 0.06316320663317831,
+      "applied": 0.9999999999999999
+    }
+  },
+  {
+    "label": "stepping_stones",
+    "rollout": "stepping_stones_n8fix_seed022.npz",
+    "filter": {
+      "contacts_per_foot": 4,
+      "n_contacts": 8,
+      "objective": "l2_vel_pos_ori",
+      "rolling": {
+        "enabled": true,
+        "tau": 0.25,
+        "sigma_r": 0.0985
+      }
+    },
+    "baseline": {
+      "vel_rmse": 0.053337348852582483,
+      "vel_nees": 2.8173634603521975,
+      "vel_nees_tangent": 4.3330330015936624,
+      "vel_nees_x": 0.06822346781094625,
+      "vel_nees_y": 0.05412204095016631,
+      "vel_nees_z": 1.4394385641082699,
+      "nis_over_dof": 0.018725069713971407,
+      "applied": 0.9999999999999999
+    },
+    "learned": {
+      "vel_rmse": 0.04805205456243547,
+      "vel_nees": 2.3320979404832007,
+      "vel_nees_tangent": 3.403203810908691,
+      "vel_nees_x": 0.07461342867060446,
+      "vel_nees_y": 0.04744843512329174,
+      "vel_nees_z": 1.2357158736664922,
+      "nis_over_dof": 0.06653974292864613,
+      "applied": 0.9999999999999999
+    }
+  },
+  {
+    "label": "waves",
+    "rollout": "waves_n8fix_seed025.npz",
+    "filter": {
+      "contacts_per_foot": 4,
+      "n_contacts": 8,
+      "objective": "l2_vel_pos_ori",
+      "rolling": {
+        "enabled": true,
+        "tau": 0.25,
+        "sigma_r": 0.0985
+      }
+    },
+    "baseline": {
+      "vel_rmse": 0.05138880370803123,
+      "vel_nees": 3.113005031728128,
+      "vel_nees_tangent": 4.569566658483979,
+      "vel_nees_x": 0.03850911282181278,
+      "vel_nees_y": 0.04160195888984574,
+      "vel_nees_z": 1.6437223237761895,
+      "nis_over_dof": 0.023646457778301697,
+      "applied": 0.9999999999999999
+    },
+    "learned": {
+      "vel_rmse": 0.04886866486785805,
+      "vel_nees": 2.455752375415067,
+      "vel_nees_tangent": 3.634840975575207,
+      "vel_nees_x": 0.040750892002467745,
+      "vel_nees_y": 0.040094884300747716,
+      "vel_nees_z": 1.357698731605384,
+      "nis_over_dof": 0.06435574793876096,
+      "applied": 0.9999999999999999
+    }
+  }
+]
