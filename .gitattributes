@@ -12,3 +12,17 @@
 # to their source on a CRLF checkout, which matters because these are vendored copies.
 *.obj binary
 *.onnx binary
+
+# Experiment outputs (see RESULTS.md / EXPERIMENTS.md for what each run directory means).
+#
+# Every run under results/ drops a fixed set of artifacts: .npz/.npy trajectory dumps, .png/.gif/
+# .mp4 renders, and a couple of .json metric/config sidecars. Git already treats the arrays and
+# renders as binary, but the JSON is text, so a PR that adds four ablation arms shows ~44 changed
+# files and several hundred lines that nobody reviews line-by-line -- they are recorded output, not
+# authored code, and they drown the source diff they exist to justify.
+#
+# `linguist-generated=true` is GitHub's marker for exactly this: the files stay in the repo and are
+# fetched on clone as before, but the PR's "Files changed" view collapses them behind a "Load diff"
+# link and skips them when tallying review coverage. Nothing about storage, checkout, or local
+# `git diff` changes -- this is purely how GitHub renders the review.
+results/** linguist-generated=true

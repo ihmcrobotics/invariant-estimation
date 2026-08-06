@@ -37,6 +37,8 @@ from invariant_estimation.sim import collect
 from invariant_estimation.contactnet import (
     dataset, features, network, normalize, train as cn_train, rollout as cn_rollout)
 from invariant_estimation.contactnet.config import ContactNetConfig
+from invariant_estimation.contactnet.losses import (
+    l2_velocity, l2_position, so3_log_orientation)
 from invariant_estimation.inEKF.filter import init_carry, make_step
 
 RESULTS_ROOT = REPO / "results"
@@ -99,9 +101,19 @@ def save_norm(norm, path):
 
 
 def _windows_full(cache, norm, cfg):
-    """(T, N_c, H, F) normalized feature windows over the whole stream."""
-    x = normalize.apply(jnp.asarray(cache["channels"]), norm)
-    return np.asarray(features.window(x, cfg.H))
+    """(T, N_c, H, F) normalized feature windows over the whole stream.
+
+    Forced onto the CPU device. This materialises T*N_c*H*F float64 -- 0.6 GB at
+    T=62k, N=2, and 2.4 GB at N=8 -- plus a transpose copy, and doing that on the
+    accelerator OOM'd a 12 GB card mid-validation after training had already
+    finished, losing the run. It is a one-shot gather with no math in it, so the
+    GPU buys nothing here; the result is handed back as NumPy and only the sliced
+    usable region is put back on device by the caller.
+    """
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        x = normalize.apply(jnp.asarray(cache["channels"], dtype=jnp.float64), norm)
+        return np.asarray(features.window(x, cfg.H))
 
 
 def validate(prep, cache, norm, cfg, params, fused, P0, eps):
@@ -171,6 +183,51 @@ def validate(prep, cache, norm, cfg, params, fused, P0, eps):
     return baseline, learned
 
 
+_POSE_USE = {"l2_vel_pos": (True, False),
+             "l2_vel_ori": (False, True),
+             "l2_vel_pos_ori": (True, True)}
+
+
+def resolve_pose_weights(cfg, params, fused, train_preps, P0, warm_in):
+    """Return the frozen ``(w_pos, w_ori)`` for the composite pose objectives.
+
+    For an active term whose config weight is unset (``None``), measure
+    ``L_vel / L_pos / L_ori`` on ONE warm batch with the init network and size the
+    weight so that term starts at ``pose_weight_ratio x L_vel``; then it is frozen
+    for the whole run (measure-once, not per-step adaptive). Explicit
+    ``--w-pos/--w-ori`` pass straight through. Non-pose objectives return ``(0, 0)``.
+    """
+    use_pos, use_ori = _POSE_USE.get(cfg.objective, (False, False))
+    if not (use_pos or use_ori):
+        return 0.0, 0.0
+
+    need_measure = (use_pos and cfg.w_pos is None) or (use_ori and cfg.w_ori is None)
+    L_vel = L_pos = L_ori = None
+    if need_measure:
+        # A throwaway batcher on the same seed: its first (warm-in) batch is the
+        # same one training will see, and the real batcher stays untouched.
+        meas = dataset.ChainedBatcher(train_preps, cfg, P0, warm_in, seed=cfg.batcher_seed)
+        mb, mc = meas.batch()
+        measure_loss = cn_rollout.make_batch_loss(
+            fused.ekf, fused.kinematics, cfg.eps, beta=cfg.beta,
+            objective="l2_velocity", remat=cfg.remat)
+        _, (mout, _c) = measure_loss(params, mb, mc)
+        L_vel = float(l2_velocity(mout.state.v, mout.state.R, mb.v_true, mb.R_true))
+        L_pos = float(l2_position(mout.state.p, mb.p_true))
+        L_ori = float(so3_log_orientation(mout.state.R, mb.R_true))
+        print(f"  pose-weight measurement (warm batch, init net): "
+              f"L_vel={L_vel:.3e} L_pos={L_pos:.3e} L_ori={L_ori:.3e}")
+
+    r = cfg.pose_weight_ratio
+    w_pos = (cfg.w_pos if cfg.w_pos is not None
+             else r * L_vel / max(L_pos, 1e-12)) if use_pos else 0.0
+    w_ori = (cfg.w_ori if cfg.w_ori is not None
+             else r * L_vel / max(L_ori, 1e-12)) if use_ori else 0.0
+    print(f"  pose weights (frozen): w_pos={w_pos:.4e} w_ori={w_ori:.4e} "
+          f"(ratio={r}, objective={cfg.objective})")
+    return float(w_pos), float(w_ori)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--collect", action="store_true")
@@ -184,15 +241,42 @@ def main():
                     help="suffix appended to the timestamped run directory name")
     ap.add_argument("--out-dir", type=str, default=None,
                     help="write artifacts here instead of results/<timestamp>/")
+    ap.add_argument("--contacts-per-foot", type=int, default=1,
+                    help="1 = the shipped N=2 soles, 4 = the N=8 corner set")
+    ap.add_argument("--objective", type=str, default=None,
+                    choices=["l2_velocity", "beta_nll",
+                             "l2_vel_pos", "l2_vel_ori", "l2_vel_pos_ori"],
+                    help="override ContactNetConfig.objective (the run-ladder knob)")
+    ap.add_argument("--w-pos", type=float, default=None,
+                    help="explicit position-term weight (overrides the auto-measure)")
+    ap.add_argument("--w-ori", type=float, default=None,
+                    help="explicit orientation-term weight (overrides the auto-measure)")
+    ap.add_argument("--pose-weight-ratio", type=float, default=None,
+                    help="target: each active pose term starts at ratio x L_vel "
+                         "(default 0.5); used only when --w-pos/--w-ori are unset")
+    ap.add_argument("--pool", type=str, default=None,
+                    help="rollout pool tag, e.g. 'n8'. Selects data/*_<tag>_seed*.npz "
+                         "and holds out one rollout PER TERRAIN for validation. "
+                         "Omit for the flat N=2 pool addressed by --train-seeds.")
     args = ap.parse_args()
 
-    cfg = ContactNetConfig()
+    overrides = {}
+    if args.objective is not None:
+        overrides["objective"] = args.objective
+    if args.w_pos is not None:
+        overrides["w_pos"] = args.w_pos
+    if args.w_ori is not None:
+        overrides["w_ori"] = args.w_ori
+    if args.pose_weight_ratio is not None:
+        overrides["pose_weight_ratio"] = args.pose_weight_ratio
+    cfg = ContactNetConfig(**overrides)
 
     t_start = time.time()
     started_at = datetime.now().isoformat(timespec="seconds")
     out = make_run_dir(RESULTS_ROOT, tag=args.tag, explicit=args.out_dir)
     print(f"== run directory: {out} ==")
-    c = collect.build_collector(policy_name="baseline", chunk_ticks=10_000)
+    c = collect.build_collector(policy_name="baseline", chunk_ticks=10_000,
+                                contacts_per_foot=args.contacts_per_foot)
 
     if args.collect:
         print("== collecting ==")
@@ -200,8 +284,23 @@ def main():
         collect_rollouts(c, args.train_seeds, args.seconds, cfg)
         collect_rollouts(c, args.val_seeds, args.seconds, cfg, val_cmd)
 
-    train_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.train_seeds]
-    val_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.val_seeds]
+    if args.pool:
+        # Hold out one rollout PER TERRAIN, not a random slice: Gate G evaluates on
+        # terrain specifically, and a pooled split can leave a terrain unrepresented
+        # in val, which is exactly the averaging that hides the terrain effect.
+        pool = sorted(collect.DATA_DIR.glob(f"*_{args.pool}_seed*.npz"))
+        if not pool:
+            raise SystemExit(f"no rollouts matching *_{args.pool}_seed*.npz in {collect.DATA_DIR}")
+        by_terrain = {}
+        for p in pool:
+            by_terrain.setdefault(p.name.split(f"_{args.pool}_")[0], []).append(p)
+        val_paths = [v[-1] for v in by_terrain.values() if v]
+        train_paths = [p for p in pool if p not in set(val_paths)]
+        print(f"pool '{args.pool}': {len(pool)} rollouts over "
+              f"{ {k: len(v) for k, v in by_terrain.items()} }")
+    else:
+        train_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.train_seeds]
+        val_paths = [collect.DATA_DIR / f"flat_seed{s:03d}.npz" for s in args.val_seeds]
     train_paths = [p for p in train_paths if p.exists()]
     val_paths = [p for p in val_paths if p.exists()]
     print(f"train rollouts: {[p.name for p in train_paths]}")
@@ -229,11 +328,16 @@ def main():
 
     print("== building network + batcher ==")
     params = network.init(jax.random.PRNGKey(cfg.init_seed), cfg.d_in, cfg.widths, cfg.sigma_0, cfg.eps)
-    batch_loss = cn_rollout.make_batch_loss(
-        c.fused.ekf, c.fused.kinematics, cfg.eps, beta=cfg.beta,
-        objective=cfg.objective, remat=cfg.remat)
     warm_in = cn_rollout.make_warm_in(c.fused.ekf, c.fused.kinematics)
     batcher = dataset.ChainedBatcher(train_preps, cfg, P0, warm_in, seed=cfg.batcher_seed)
+
+    # Size + freeze the pose-loss weights for the composite objectives (no-op for
+    # l2_velocity / beta_nll). Measured once here so the graph carries constants.
+    w_pos, w_ori = resolve_pose_weights(cfg, params, c.fused, train_preps, P0, warm_in)
+
+    batch_loss = cn_rollout.make_batch_loss(
+        c.fused.ekf, c.fused.kinematics, cfg.eps, beta=cfg.beta,
+        objective=cfg.objective, remat=cfg.remat, w_pos=w_pos, w_ori=w_ori)
 
     # Fast-fail: one train step before committing to the full run.
     print("== training ==")
@@ -266,7 +370,13 @@ def main():
         cache = dataset.load_channel_cache(dataset.cache_path(vpath))
         base, learned = validate(vp, cache, norm, cfg, params, c.fused, P0, cfg.eps)
         seed = int(vp.name.split("seed")[1].split(".")[0])
-        label = VAL_MODES.get(seed, ("mixed", None))[0]
+        if args.pool:
+            # Under --pool the held-out set is one rollout PER TERRAIN, so the
+            # terrain IS the label -- that is what makes the per-terrain table in
+            # results.md possible instead of a single pooled average.
+            label = vp.name.split(f"_{args.pool}_")[0]
+        else:
+            label = VAL_MODES.get(seed, ("mixed", None))[0]
         print(f"  {vp.name}: baseline={base}  learned={learned}")
         val_metrics.append({"mode": label, "rollout": vp.name, "baseline": base, "learned": learned})
 
@@ -279,6 +389,8 @@ def main():
         "cfg": {"F": cfg.F, "d_in": cfg.d_in, "H": cfg.H,
                 "window_span_s": cfg.window_span_seconds,
                 "L": cfg.L, "B": cfg.B, "objective": cfg.objective,
+                "w_pos": w_pos, "w_ori": w_ori,
+                "pose_weight_ratio": cfg.pose_weight_ratio,
                 "episode_s": cfg.episode_s, "warm_in_s": cfg.warm_in_s,
                 "peak_lr": cfg.peak_lr,
                 "init_seed": cfg.init_seed, "batcher_seed": cfg.batcher_seed,
@@ -296,18 +408,25 @@ def main():
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
     print("== summary ==")
     print(json.dumps(summary, indent=2))
-    make_plots(hist, val_metrics, out)
+    make_plots(hist, val_metrics, out, cfg.objective)
 
 
-def make_plots(hist, val_metrics, out):
+def make_plots(hist, val_metrics, out, objective="l2_velocity"):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     if hist.size:
         fig, ax = plt.subplots(1, 3, figsize=(15, 4))
-        ax[0].plot(hist[:, 0]); ax[0].set_title("training loss (l2_velocity)")
-        ax[0].set_xlabel("step"); ax[0].set_ylabel("loss"); ax[0].set_yscale("log")
+        ax[0].plot(hist[:, 0])
+        # The objective is NOT always l2_velocity, and beta_nll's loss is NEGATIVE
+        # (0.5*(NIS + logdet S) is unbounded below in logdet). A hardcoded log scale
+        # drops every point and renders an EMPTY panel. Log only when the curve is
+        # all-positive (the composite pose objectives are sums of squares -> positive).
+        ax[0].set_title(f"training loss ({objective})")
+        ax[0].set_xlabel("step"); ax[0].set_ylabel("loss")
+        if np.all(hist[:, 0] > 0):
+            ax[0].set_yscale("log")
         ax[1].plot(hist[:, 2]); ax[1].axhline(1.0, ls="--", c="k", lw=0.8)
         ax[1].set_title("contact NIS / dof"); ax[1].set_xlabel("step")
         ax[2].plot(hist[:, 4]); ax[2].set_title("cumulative reseeds"); ax[2].set_xlabel("step")

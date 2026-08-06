@@ -13,6 +13,7 @@ Building the Alex estimator traces MJX kinematics over 49 links (~45 s), so the 
 module-scoped and the module is marked `slow`.
 """
 
+import json
 import time
 
 import numpy as np
@@ -240,6 +241,39 @@ def test_threaded_mode_loses_no_sensor_sample():
     assert consumed + backlog == submitted, (
         f"submitted {submitted} but accounted {consumed}+{backlog}; a sample was lost")
     assert consumed % te.substeps == 0, "the worker consumed a partial chunk (XLA retrace)"
+
+
+def test_contactnet_geometry_mismatch_is_refused(tmp_path):
+    """An N=8-trained checkpoint must not run on an N=2 estimator.
+
+    This one is silent by construction, which is why it needs a test rather than a
+    reviewer: `build_subchain_indices` repeats each foot's chain per contact slot, so
+    the network's `(N_c, d_in)` input is shape-valid at either N. It runs, and simply
+    applies corner-calibrated Sigma_C to whole-sole anchors. The four L2-options arms
+    all trained at N=8 while `run_estimator.py` defaulted to N=2, so every closed-loop
+    number and the committed demo video were taken off-geometry.
+    """
+    def _ckpt(dirname, cpf):
+        d = tmp_path / dirname
+        d.mkdir()
+        (d / "params.npz").write_bytes(b"")          # the check never opens it
+        if cpf is not None:
+            (d / "summary.json").write_text(
+                json.dumps({"run": {"args": {"contacts_per_foot": cpf}}}))
+        return str(d / "params.npz")
+
+    trained_n8 = _ckpt("n8", 4)
+    re_._check_contact_geometry(trained_n8, 8)       # matching: no opinion
+    with pytest.raises(SystemExit, match="geometry mismatch"):
+        re_._check_contact_geometry(trained_n8, 2)
+
+    trained_n2 = _ckpt("n2", 1)
+    re_._check_contact_geometry(trained_n2, 2)
+    with pytest.raises(SystemExit, match="geometry mismatch"):
+        re_._check_contact_geometry(trained_n2, 8)
+
+    # Checkpoints predating summary.json must stay runnable, not become un-loadable.
+    re_._check_contact_geometry(_ckpt("legacy", None), 2)
 
 
 def test_headless_stays_synchronous_by_default():

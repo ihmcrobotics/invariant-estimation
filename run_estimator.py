@@ -25,6 +25,7 @@ cost lands there and not as an 11 s freeze on the first tick. See RUNNING.md for
 Read `run_policy.py` first — the sim, the policy contract and every magic number live there.
 """
 import argparse
+import json
 import os
 import sys
 import time
@@ -305,6 +306,35 @@ class ContactNetRuntime(EstimatorRuntime):
         self._provider_scan.lower(self._ostate, self._stack(batch)).compile()
 
 
+def _check_contact_geometry(ckpt, n_deployed):
+    """Refuse to deploy a checkpoint onto a different N than it trained under.
+
+    Nothing about the shapes catches this: the per-contact feature rows are
+    foot-major duplicates (`build_subchain_indices` repeats each foot's chain
+    `contacts_per_foot` times), so the network sees an identical `(N_c, d_in)`
+    input at N=2 and N=8 and runs happily either way. What changes is what its
+    output *means* -- Σ_C calibrated for a corner anchor, applied to a whole-sole
+    anchor -- and that only shows up as quietly worse numbers.
+
+    `run_contactnet.py` records the training geometry in `summary.json` beside the
+    params. Older checkpoints predate it; those skip the check rather than block.
+    """
+    summary = os.path.join(os.path.dirname(ckpt), "summary.json")
+    if not os.path.exists(summary):
+        return
+    try:
+        with open(summary) as fh:
+            trained = json.load(fh)["run"]["args"]["contacts_per_foot"]
+    except (KeyError, ValueError):
+        return
+    n_trained = int(trained) * 2      # two feet
+    if n_trained != n_deployed:
+        raise SystemExit(
+            f"ContactNet geometry mismatch: {ckpt} trained with N={n_trained} "
+            f"({trained} contacts/foot) but the estimator was built with "
+            f"N={n_deployed}. Pass --contacts-per-foot {trained}.")
+
+
 def build_contactnet_provider(fused, reader, ckpt, norm_path, *, verbose=True):
     """Load a `run_contactnet.py` checkpoint and return `(provider_scan, online_state0)`.
 
@@ -336,6 +366,7 @@ def build_contactnet_provider(fused, reader, ckpt, norm_path, *, verbose=True):
                            cfg.d_in, cfg.widths, cfg.sigma_0, cfg.eps)
     params = cn_train.load_params(ckpt, like)
     sub = cn_features.subchain_for(fused, reader.unfiltered_names)
+    _check_contact_geometry(ckpt, len(sub))
     step = cn_online.make_provider(sub, int(fused.base_imu), fused.kinematics,
                                    cfg, consts, params)
     ostate0 = cn_online.init_state(cfg, len(sub))
@@ -352,7 +383,7 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
                         stance_chol=1.0e-4, swing_chol=1.0e1,
                         contact_fk_unfiltered=True, est_every=1, verbose=True,
                         threaded=False, max_backlog_ticks=2,
-                        contactnet=None, contactnet_norm=None):
+                        contactnet=None, contactnet_norm=None, contacts_per_foot=1):
     t0 = time.time()
     policy = rp.load_policy(policy_name)
     m = rp.build_sim_model(policy, with_visuals=with_visuals, with_imu_sensors=True)
@@ -361,7 +392,7 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
     urdf = rp.cycloid_forearm_urdf(rp.URDF)
     dt = est_dt or rp.DT * est_every
     fused = me.build_alex_fused_estimator_from_urdf(
-        urdf, dt=dt, contact_meas_var=contact_meas_var,
+        urdf, contacts_per_foot, dt=dt, contact_meas_var=contact_meas_var,
         contact_fk_unfiltered=contact_fk_unfiltered)
     reader = SimSensorReader(m, fused, foot_geoms=rp.FOOT_GEOMS, dt=dt, noise=noise,
                              stance_chol=stance_chol, swing_chol=swing_chol)
@@ -412,10 +443,17 @@ def run_headless(loop, ticks, cmd=None, out=None, every=25, video=None, video_fp
         print(f"  recording {w}x{h} @ {control_hz / stride:.0f} fps -> {video}")
     x0, y0 = loop.d.qpos[0], loop.d.qpos[1]
     t0 = time.time()
+    def _overlay(scn):
+        """Draw the estimate's ghost into the offscreen scene, if one is configured."""
+        est = loop.current_estimate()
+        if loop.ghost is not None and est is not None:
+            loop.ghost.update(est, loop.d)
+            loop.ghost.draw(scn)
+
     for k in range(ticks):
         loop.control_tick()
         if rec is not None and k % stride == 0:
-            rec.capture(loop.d)
+            rec.capture(loop.d, overlay=_overlay if loop.ghost is not None else None)
         if k % every == 0:
             print(f"  t={k * rp.DECIMATION * rp.DT:5.2f}s  {loop.status()}\n"
                   f"            {loop.est_status()}")
@@ -528,6 +566,10 @@ if __name__ == "__main__":
                     help="run a trained ContactNet in the loop: its learned contact_chol "
                          "replaces the analytic stance/swing heuristic. Pass a params.npz "
                          "from run_contactnet.py (built with the ContactNetConfig defaults)")
+    ap.add_argument("--contacts-per-foot", type=int, choices=(1, 4), default=1,
+                    help="contact slots per foot: 1 = the shipped N=2 sole pair "
+                         "(default), 4 = the N=8 box corners. Must match what a "
+                         "--contactnet checkpoint trained under")
     ap.add_argument("--contactnet-norm", default=None, metavar="NORM.npz",
                     help="normalization constants the ContactNet was trained under "
                          "(default: norm_constants.npz beside --contactnet)")
@@ -555,11 +597,15 @@ if __name__ == "__main__":
         stance_chol=args.stance_chol, swing_chol=args.swing_chol,
         contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every,
         threaded=args.realtime, max_backlog_ticks=args.max_backlog_ticks,
-        contactnet=args.contactnet, contactnet_norm=args.contactnet_norm)
-    # The ghost is a viewer feature: it draws, and headless has nothing to draw into.
-    if args.ghost != "off" and headless:
-        raise SystemExit("--ghost needs a viewer; drop --headless/--video")
-    if not headless:
+        contactnet=args.contactnet, contactnet_norm=args.contactnet_norm,
+        contacts_per_foot=args.contacts_per_foot)
+    # The ghost draws into an `mjvScene`. The viewer has one; so does an offscreen
+    # `mujoco.Renderer`, so --ghost now composes with --video (that is how the
+    # validation recording is made). It still has nothing to draw into on a bare
+    # --headless run with no recording.
+    if args.ghost != "off" and headless and not args.video:
+        raise SystemExit("--ghost needs a viewer or --video; drop --headless")
+    if not headless or args.video:
         loop.ghost = Ghost(loop.m, loop.maps, loop.filtered_slots,
                            offset=args.ghost_offset, mode=args.ghost)
     if headless:

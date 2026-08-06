@@ -78,6 +78,29 @@ def skew(phi: Array) -> Array:
     ])
 
 
+def so3_log(R: Array) -> Array:
+    r"""Rotation-vector logarithm ``log(R)^∨ ∈ R³`` of ``SO(3)`` matrices.
+
+    Wraps ``jaxlie.SO3`` (robust small-angle, differentiable) — the same primitive
+    `log_SEn3` uses for its rotation block — and vmaps over any leading batch axes,
+    so a single ``(3, 3)`` or a batched ``(…, 3, 3)`` both work and return
+    ``(…, 3)``. Centralised here so the ContactNet orientation loss and the group
+    log share one convention.
+
+    Parameters
+    ----------
+    R : Array, shape (…, 3, 3)
+
+    Returns
+    -------
+    Array, shape (…, 3)
+    """
+    batch = R.shape[:-2]
+    flat = R.reshape((-1, 3, 3))
+    logs = vmap(lambda M: SO3.from_matrix(M).log())(flat)
+    return logs.reshape(batch + (3,))
+
+
 def _theta_safe(phi: Array) -> tuple[Array, Array, Array, Array]:
     """Return ``(θ, θ²_safe, θ²_raw, is_small)`` for the double-where trick.
 

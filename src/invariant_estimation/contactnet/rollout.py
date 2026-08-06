@@ -6,7 +6,7 @@ import jax.numpy as jnp
 
 from ..inEKF.filter import InEKFInputs, init_carry, make_step
 from ..inEKF.state import InEKFState
-from .losses import l2_velocity
+from .losses import l2_velocity, beta_nll_from_diagnostics, pose_l2
 from .network import ContactNetParams, forward
 
 class Segment(NamedTuple):
@@ -25,12 +25,15 @@ class Segment(NamedTuple):
     ``v_true`` is the groudn truth base velocity in world frame.
     ``R_true`` is the rotation matrix of ground truth attitude, meant to convert
         the world frame base velocity to body frame.
+    ``p_true`` is the ground truth base position in world frame, used by the
+        segment-relative position loss (`losses.l2_position`).
     """
     inputs: InEKFInputs
     windows: Array
     state0: InEKFState
     v_true: Array
     R_true: Array
+    p_true: Array
 
 
 def contact_factors(
@@ -53,7 +56,18 @@ def contact_factors(
     over_time = jax.vmap(over_contacts, in_axes=(None, 0, None))
     return over_time(params, flat, eps)
 
-def make_segment_loss(ekf, kinematics, eps, beta = 0.5, objective="l2_velocity", remat=True):
+# objective -> (use_pos, use_ori) for the composite pose objectives. Resolved at
+# build time (outside the traced region) so the branch never enters the graph.
+_POSE_OBJECTIVES = {
+    "l2_vel_pos": (True, False),
+    "l2_vel_ori": (False, True),
+    "l2_vel_pos_ori": (True, True),
+}
+VALID_OBJECTIVES = ("beta_nll", "l2_velocity") + tuple(_POSE_OBJECTIVES)
+
+
+def make_segment_loss(ekf, kinematics, eps, beta=0.5, objective="l2_velocity",
+                      remat=True, w_pos=0.0, w_ori=0.0):
     """Build the per-segment loss: ``(params, segment) -> (loss, (outputs, carry))``.
 
     A factory matching `make_step`: `ekf`, `kinematics` and the scalars are static
@@ -61,64 +75,41 @@ def make_segment_loss(ekf, kinematics, eps, beta = 0.5, objective="l2_velocity",
     over segments.
 
     ``objective`` is selected at build time, outside the traced region, so it puts
-    no branch in the graph: run 1 reproduces CoCo-InEKF with ``l2_velocity``, run 2
-    onward is intended to use ``beta_nll`` -- which is NOT implemented yet, see
-    below.  ``remat`` wraps the scan body in `jax.checkpoint` (``prevent_cse=False``
-    is the correct setting under `scan`).
+    no branch in the graph. ``l2_velocity`` reproduces CoCo-InEKF; ``beta_nll`` is
+    the Seitzer innovation NLL; ``l2_vel_pos`` / ``l2_vel_ori`` / ``l2_vel_pos_ori``
+    add the segment-relative position and/or orientation terms
+    (`losses.pose_l2`), weighted by the run-frozen ``w_pos`` / ``w_ori``. ``remat``
+    wraps the scan body in `jax.checkpoint` (``prevent_cse=False`` is the correct
+    setting under `scan`).
     """
-    if objective not in ("beta_nll", "l2_velocity"):
-        raise ValueError(f"Unknown objective {objective!r}")
-    if objective == "beta_nll":
-        # Two pieces are missing, and neither is a one-liner to guess at:
-        #   * the loss itself (`beta_nll_from_diagnostics`) does not exist in
-        #     `losses.py` -- only `l2_velocity` does;
-        #   * it needs `log det S` per tick, and `UpdateDiagnostics` publishes
-        #     `applied / nis / condition_proxy / correction_rotation_norm` only.
-        #     `S`'s Cholesky is already formed in `inEKF/correct.linear_update`,
-        #     so exposing `logdet_S` is cheap -- but it widens the diagnostics
-        #     seam that the ported tests read (CLAUDE.md §4), so it is a decision,
-        #     not a fix.
-        # Raised HERE, at build time, because the alternative is a `NameError`
-        # from inside a traced scan on whoever first sets `objective: beta_nll`
-        # in the training config -- which `contactnet/config.py` still accepts.
-        raise NotImplementedError(
-            "objective='beta_nll' is not implemented: `beta_nll_from_diagnostics` is "
-            "missing from contactnet/losses.py and `UpdateDiagnostics` does not publish "
-            "`logdet_S`. Use objective='l2_velocity'."
-        )
-
     step = make_step(ekf, kinematics)
-    if remat:
-        step = jax.checkpoint(step, prevent_cse=False)
+    if objective not in VALID_OBJECTIVES:
+        raise ValueError(f"unknown objective {objective}")
+    use_pos, use_ori = _POSE_OBJECTIVES.get(objective, (False, False))
 
     def segment_loss(params: ContactNetParams, segment: Segment, carry0=None):
-        # Network first, over the full segment - see `contact_factors`
         L_c = contact_factors(params, segment.windows, eps)
-
-        # The one field ContactNet has - the STANCE-ANCHOR PROCESS noise. It was
-        # `contact_meas_chol` through run 4; see `pipeline/main_estimator._boundary`
-        # for why the measurement socket cannot reach the drift being trained out.
         inputs = segment.inputs._replace(contact_chol=L_c)
-
-        # `carry0=None` re-seeds from `segment.state0` (run-1 behaviour, and what
-        # the standalone tests use).  `ChainedBatcher` passes the previous
-        # segment's final carry instead, so the segment starts at the error the
-        # filter actually accumulated rather than at zero -- see dataset.py (f).
         c0 = init_carry(segment.state0) if carry0 is None else carry0
         carry, outputs = jax.lax.scan(step, c0, inputs)
-
-        # Only `l2_velocity` reaches here -- `beta_nll` is rejected at build time
-        # above. When it lands it belongs here, as a mean over per-tick terms
-        # (`l2_velocity` takes its own mean internally, beta-NLL would not).
-        #
-        # Body-frame, each side by its OWN attitude -- see `l2_velocity`.
-        loss = l2_velocity(
-            outputs.state.v, outputs.state.R, segment.v_true, segment.R_true
-        )
+        if objective == "beta_nll":
+            d = outputs.contact_diagnostics
+            dof = 3 * outputs.state.d.shape[-2]
+            loss = beta_nll_from_diagnostics(
+                d.nis, d.logdet_s, d.applied, beta, dof
+            )
+        elif objective == "l2_velocity":
+            loss = l2_velocity(
+                outputs.state.v, outputs.state.R, segment.v_true, segment.R_true
+            )
+        else:
+            loss = pose_l2(
+                outputs.state.v, outputs.state.R, outputs.state.p,
+                segment.v_true, segment.R_true, segment.p_true,
+                w_pos=w_pos, w_ori=w_ori, use_pos=use_pos, use_ori=use_ori,
+            )
         return loss, (outputs, carry)
-
     return segment_loss
-
 
 def make_warm_in(ekf, kinematics, sigma_0: float | None = None):
     r"""``(state0, inputs) -> carry``: run the filter forward without training on it.

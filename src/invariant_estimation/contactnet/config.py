@@ -37,12 +37,26 @@ class ContactNetConfig:
     L: int = 128                   # ticks the gradient traverses
     B: int = 32                    # segments per batch
 
-    # objective. "beta_nll" is accepted vocabulary but NOT implemented --
-    # `rollout.make_segment_loss` raises NotImplementedError on it (the loss fn is
-    # missing from losses.py, and the InEKF diagnostics publish no `logdet_S`).
-    # `beta` is its plumbed-but-unused hyperparameter.
+    # objective. Both are implemented: `l2_velocity` is the CoCo-faithful run-1
+    # objective and the trusted baseline; `beta_nll` is the Seitzer beta-weighted
+    # innovation NLL. The comment here used to say beta_nll was NOT implemented
+    # while the default had already been flipped TO it -- so a run that meant to
+    # be the L2 baseline silently trained beta_nll. Pass --objective explicitly.
     objective: str = "l2_velocity"
     beta: float = 0.5
+
+    # pose-loss weights for the composite objectives
+    # (`l2_vel_pos` / `l2_vel_ori` / `l2_vel_pos_ori`): loss = L_vel + w_pos*L_pos
+    # + w_ori*L_ori. `None` => sized ONCE on the first warm batch so each added term
+    # starts at `pose_weight_ratio` x the velocity term, then FROZEN for the run
+    # (measure-once, not per-step adaptive). An explicit float overrides the
+    # auto-measure. Velocity stays the lead term; ratio 0.5 gives the pose terms
+    # comparable-but-secondary pull. The added terms are segment-relative
+    # (displacement / incremental rotation) because base position and yaw are
+    # unobservable and their absolute error drifts unbounded (see losses.py).
+    w_pos: float | None = None
+    w_ori: float | None = None
+    pose_weight_ratio: float = 0.5
 
     # optimizer
     peak_lr: float = 1.0e-4
@@ -85,6 +99,24 @@ class ContactNetConfig:
     init_seed: int = 0
     batcher_seed: int = 0
 
+    # environment variables for domain randomization
+    env_dr: bool = False
+    friction_range: tuple = (0.6, 1.2)
+    friction_low_tail_prob: float = 0.25
+    # MEASURED, 2026-08-05: the original (0.15, 0.45) tail put mu as low as 0.15 --
+    # effectively ice -- and the flat-trained policy fell on it. An axis ablation
+    # through the real collect path (friction-only vs pushes-only) attributed the
+    # falls to FRICTION, not to the pushes: with pushes at their configured
+    # 30-120 N the robot stayed up. 7 of the first 8 DR rollouts were lost this
+    # way, INCLUDING one on flat ground, which is what ruled the terrain out.
+    # 0.45-0.70 against a ~1.0 nominal is still a real slip regime; a tail the
+    # policy cannot survive yields no data at all, which trains nothing.
+    friction_low_tail: tuple = (0.45, 0.70)
+    disturb_rate_hz: float = 0.4
+    disturb_mag_N: tuple = (30.0, 120.0)
+    disturb_dur_s: float = 0.1
+    terrain_mix: tuple = (("flat", 0.25), ("waves", 0.25), ("stepping_stones",0.25), ("hard_stepping",0.25))
+
     @property
     def d_in(self) -> int:
         return self.F * self.H
@@ -121,10 +153,16 @@ class ContactNetConfig:
             )
         if self.L <= 0 or self.B <= 0:
             raise ValueError(f"L and B must be positive, got L={self.L} and B={self.B}")
-        if self.objective not in ("beta_nll", "l2_velocity"):
+        if self.objective not in (
+            "beta_nll", "l2_velocity",
+            "l2_vel_pos", "l2_vel_ori", "l2_vel_pos_ori",
+        ):
             raise ValueError(f"Unknown objective: {self.objective!r}")
         if not 0.0 <= self.beta <= 1.0:
             raise ValueError(f"Beta must be in [0,1], got {self.beta}")
+        if not self.pose_weight_ratio > 0.0:
+            raise ValueError(
+                f"pose_weight_ratio must be positive, got {self.pose_weight_ratio}")
         if self.warmup_steps >= self.total_steps:
             raise ValueError(
                 f"warmup_steps ({self.warmup_steps}) must be < total_steps"

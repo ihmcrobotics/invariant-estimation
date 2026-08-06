@@ -172,6 +172,40 @@ naming entirely with `--out-dir path/to/dir`. The validated run written up in
 predates this layout and was moved into it by hand, so its `summary.json` has no
 `run` block.
 
+### Loss-function options (velocity + position + orientation)
+
+`--objective` selects the training loss. Beyond `l2_velocity` (body-frame velocity
+MSE, the trusted baseline) and `beta_nll`, three composites add **segment-relative**
+pose terms on top of the velocity loss:
+
+| objective | loss |
+|---|---|
+| `l2_velocity` | `L_vel` (unchanged) |
+| `l2_vel_pos` | `L_vel + w_pos·L_pos` |
+| `l2_vel_ori` | `L_vel + w_ori·L_ori` |
+| `l2_vel_pos_ori` | `L_vel + w_pos·L_pos + w_ori·L_ori` |
+
+`L_pos` is the world-frame **displacement** MSE over the segment and `L_ori` is
+`‖Log(ΔR_estᵀ ΔR_true)^∨‖²`, the SO(3) log-map error of the **incremental** rotation.
+Both are segment-relative on purpose: base position and yaw are unobservable, so
+their *absolute* error drifts unbounded in chained BPTT and would swamp `L_vel`
+(see `contactnet/losses.py`). The weights default to **auto-measure**: on the first
+warm batch each active term is sized to `--pose-weight-ratio` (default 0.5) × `L_vel`
+and then frozen for the run (logged to `summary.json`'s `cfg`). Override with
+`--w-pos` / `--w-ori`. Validation metrics are objective-independent, so all arms stay
+directly comparable.
+
+**Overnight 4-arm ladder.** `scripts/overnight_loss_ladder.sh [STOP_BY_HHMM]` (default
+`08:45`) collects a fresh, fixed-terrain (`waves` seed bug fixed) N=8 DR pool under
+tag `n8fix`, pre-builds channel caches once, then trains all four arms back-to-back.
+It is **deadline-aware** — each arm gets an equal slice of the time left before
+`STOP_BY`, so the ladder always finishes on time whatever collection costs:
+
+```bash
+nohup scripts/overnight_loss_ladder.sh 08:45 > results/ladder.out 2>&1 &
+# env knobs: POOL_TAG CONTACTS SECONDS_PER COLLECT_SEEDS STEPS_CAP WARMUP VAL_RESERVE
+```
+
 Last validated run (flat ground, seeds 0–3 train / 4–5 held out): velocity RMSE
 **0.086 → 0.028 m/s**, NEES **19.4 → 1.05** vs the analytic `contact_chol`
 baseline. Full numbers and caveats (flat-terrain only, etc.) in `RESULTS.md`.
@@ -446,8 +480,16 @@ uv run python run_estimator.py ... --out run.npz                                
 uv run python run_estimator.py --policy baseline --ticks 1500 --vx 0.6 \
        --video walk.mp4                                                             # 30 s video
 uv run --extra gpu python run_estimator.py --policy baseline --headless --ticks 500 \
-       --vx 0.45 --contactnet results/latest/params.npz                            # ContactNet in the loop
+       --vx 0.45 --contacts-per-foot 4 \
+       --contactnet results/latest/params.npz                                       # ContactNet in the loop
 ```
+
+`--contacts-per-foot` must match what the checkpoint trained under — the current
+ladder arms (A/B/C/D) are all N=8, so they need `4`. It is not optional and not
+inferable: the network's per-contact input is foot-major duplicated, so it accepts
+either N without a shape error and simply applies corner-calibrated Σ_C to
+whole-sole anchors. `run_estimator.py` reads the training geometry from the
+checkpoint's `summary.json` and refuses the mismatch rather than let it run.
 
 Every run prints an error table against the sim's own state (tilt as the policy sees it,
 attitude, gyro, velocity, position drift, joint state) over the whole run and over its last half.
@@ -459,6 +501,7 @@ attitude, gyro, velocity, position drift, joint state) over the whole run and ov
 | `--contact-fk measured\|pinned` | whether the InEKF contact FK uses the measured ankle angles (default) or pins them at `qpos0`, as the library default still does — worth ~2x on attitude error, see below |
 | `--stance-chol` / `--swing-chol` | the Σ_C factor for a trusted / airborne foot. The InEKF has **no contact mask**; contact condition rides entirely in Σ_C, so a swing foot needs a large factor or the filter keeps believing it is planted |
 | `--contactnet PARAMS.npz` (+ `--contactnet-norm`) | run a trained ContactNet in the loop: its learned per-tick `contact_chol` (via `contactnet.online.make_provider`) replaces the analytic stance/swing heuristic. Reads `norm_constants.npz` beside `PARAMS.npz` unless overridden; config is the `ContactNetConfig()` defaults the checkpoint trained under. Run the same command without the flag for the closed-loop A/B |
+| `--contacts-per-foot 1\|4` | contact slots per foot: `1` = the shipped N=2 sole pair (default), `4` = the N=8 box corners. Must match a `--contactnet` checkpoint's training geometry, which is enforced against its `summary.json` |
 | `--contact-meas-var` | flight's `1e-4` contact measurement-noise floor (port default 0) |
 | `--video walk.mp4` | record the run offscreen to H.264 (implies `--headless`, `--video-fps` / `--video-size` tune it) |
 | `--ghost [mode]` | draw a translucent robot at the estimated state: `full` (default) or `attitude`. Viewer only |
