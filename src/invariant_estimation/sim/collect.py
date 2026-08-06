@@ -202,7 +202,7 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
                     settle_s: float = SETTLE_S, imu_noise: bool = True,
                     stance_chol: float = 1.0e-4, swing_chol: float = 1.0e1,
                     spawn_radius: float = SPAWN_RADIUS, max_tilt_deg: float = MAX_TILT_DEG,
-                    warmup_ticks: int | None = None,
+                    warmup_ticks: int | None = None, name_tag: str = "",
                     out_dir: Path | str | None = DATA_DIR, cfg: ContactNetConfig = ContactNetConfig(),
                     cmd_override = None, verbose: bool = True) -> Rollout:
     """Walk for `seconds`, record at 1/rp.DT Hz, run the estimator once, save.
@@ -346,8 +346,13 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
     if out_dir is not None:
         # N is in the filename: raw sensors are N-agnostic but `InEKFInputs` and
         # `contact_chol` are not, so an N=2 pool must never be picked up by an N=8
-        # run. The N=2 name is left bare so the existing flat pool stays valid.
-        tag = "" if c.fused.n_contacts == 2 else f"_n{c.fused.n_contacts}"
+        # run. The N=2 name is left bare so the existing flat pool stays valid --
+        # which is exactly why `name_tag` exists: a SECOND pool at the same N (e.g.
+        # a re-collected fixed-terrain set) would otherwise write over the pool an
+        # earlier run trained on.
+        tag = name_tag if name_tag else ("" if c.fused.n_contacts == 2
+                                         else f"n{c.fused.n_contacts}")
+        tag = f"_{tag}" if tag else ""
         path = Path(out_dir) / f"{terrain}{tag}_seed{seed:03d}.npz"
         save_rollout(roll, path)
         if verbose:

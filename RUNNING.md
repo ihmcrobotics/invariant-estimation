@@ -172,6 +172,40 @@ naming entirely with `--out-dir path/to/dir`. The validated run written up in
 predates this layout and was moved into it by hand, so its `summary.json` has no
 `run` block.
 
+### Loss-function options (velocity + position + orientation)
+
+`--objective` selects the training loss. Beyond `l2_velocity` (body-frame velocity
+MSE, the trusted baseline) and `beta_nll`, three composites add **segment-relative**
+pose terms on top of the velocity loss:
+
+| objective | loss |
+|---|---|
+| `l2_velocity` | `L_vel` (unchanged) |
+| `l2_vel_pos` | `L_vel + w_pos·L_pos` |
+| `l2_vel_ori` | `L_vel + w_ori·L_ori` |
+| `l2_vel_pos_ori` | `L_vel + w_pos·L_pos + w_ori·L_ori` |
+
+`L_pos` is the world-frame **displacement** MSE over the segment and `L_ori` is
+`‖Log(ΔR_estᵀ ΔR_true)^∨‖²`, the SO(3) log-map error of the **incremental** rotation.
+Both are segment-relative on purpose: base position and yaw are unobservable, so
+their *absolute* error drifts unbounded in chained BPTT and would swamp `L_vel`
+(see `contactnet/losses.py`). The weights default to **auto-measure**: on the first
+warm batch each active term is sized to `--pose-weight-ratio` (default 0.5) × `L_vel`
+and then frozen for the run (logged to `summary.json`'s `cfg`). Override with
+`--w-pos` / `--w-ori`. Validation metrics are objective-independent, so all arms stay
+directly comparable.
+
+**Overnight 4-arm ladder.** `scripts/overnight_loss_ladder.sh [STOP_BY_HHMM]` (default
+`08:45`) collects a fresh, fixed-terrain (`waves` seed bug fixed) N=8 DR pool under
+tag `n8fix`, pre-builds channel caches once, then trains all four arms back-to-back.
+It is **deadline-aware** — each arm gets an equal slice of the time left before
+`STOP_BY`, so the ladder always finishes on time whatever collection costs:
+
+```bash
+nohup scripts/overnight_loss_ladder.sh 08:45 > results/ladder.out 2>&1 &
+# env knobs: POOL_TAG CONTACTS SECONDS_PER COLLECT_SEEDS STEPS_CAP WARMUP VAL_RESERVE
+```
+
 Last validated run (flat ground, seeds 0–3 train / 4–5 held out): velocity RMSE
 **0.086 → 0.028 m/s**, NEES **19.4 → 1.05** vs the analytic `contact_chol`
 baseline. Full numbers and caveats (flat-terrain only, etc.) in `RESULTS.md`.

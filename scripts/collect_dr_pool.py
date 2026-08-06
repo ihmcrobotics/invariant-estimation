@@ -44,6 +44,10 @@ def main():
                     default=["flat", "waves", "stepping_stones", "hard_stepping"])
     ap.add_argument("--out-dir", type=str, default=str(REPO / "data"))
     ap.add_argument("--time-budget-s", type=float, default=7200.0)
+    ap.add_argument("--name-tag", type=str, default="",
+                    help="filename tag, e.g. n8fix. Use to keep a re-collected pool "
+                         "(e.g. after the waves-seed fix) from writing over an "
+                         "existing same-N pool.")
     args = ap.parse_args()
 
     cfg = ContactNetConfig(env_dr=True)
@@ -63,7 +67,7 @@ def main():
         try:
             roll = collect.collect_rollout(
                 seed, args.seconds, terrain=terrain, collector=c, cfg=cfg,
-                out_dir=args.out_dir, verbose=True)
+                out_dir=args.out_dir, name_tag=args.name_tag, verbose=True)
             metas.append(roll.meta)
             print(f"  [{k + 1}/{args.seeds}] {terrain}/seed{seed} OK "
                   f"({time.time() - t0:.0f}s, mu={roll.meta['friction_mu']:.2f})", flush=True)
