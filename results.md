@@ -224,3 +224,98 @@ this window.
    independent contact constraints.
 3. Per-corner discrimination, if pursued, should come from a **deployable**
    signal — torque-derived, never contact force (invariant 4).
+
+---
+
+# L2-options ablation — position and orientation loss terms (2026-08-06)
+
+> ## VERDICT: **the position term is the win.**
+>
+> Extending the L2-velocity objective with a **segment-relative position** term
+> makes the learned N=8 socket **beat the analytic N=8 baseline** for the first
+> time (0.0483 vs 0.0541 m/s, **0.89×**) — the open question from rec #1 above.
+> An **orientation** (SO(3)-log) term **alone hurts** velocity slightly (1.33×),
+> but the two together are **best** (0.0456, **0.84×**): orientation only becomes
+> net-positive once position anchors the trajectory. This also lands with the
+> FIX_CHECKLIST **B1** (waves-seed) and **B2** (25-rollout pool) data fixes, so it
+> is measured on a pool without the train/val terrain leak and without the 5-
+> rollout overfit that confounded R3b.
+
+## Setup
+
+Four arms, identical but for the training objective, on **one fresh DR pool**:
+
+* **Pool `n8fix`** — 25 rollouts (21 train / 4 held-out, one per terrain), N=8, env-DR,
+  collected with the **B1 waves-seed fix** in place (verified: the previously
+  identical `waves/seed5`–`waves/seed9` fields now differ by 0.107; every waves
+  seed distinct). Directly addresses **B2**: 21 train rollouts vs R3b's 5.
+* **Objectives.** `L_vel` is the shipped body-frame velocity MSE (arm A ≡ R3b's
+  objective). The added terms are **segment-relative** — displacement `Δp` and
+  incremental rotation `ΔR` over the L-tick window — because base position and yaw
+  are unobservable, so their *absolute* error drifts unbounded in chained BPTT and
+  would swamp `L_vel`. Orientation is the proper log-map `‖Log(ΔR_estᵀ ΔR_true)^∨‖²`.
+* **Weights** are sized once on a warm batch so each added term starts at
+  `0.5·L_vel`, then frozen: `w_pos = 4.70`, `w_ori = 9.85` (deterministic, logged).
+
+## Held-out velocity RMSE (learned vs the analytic N=8 baseline = 0.0541 m/s)
+
+| arm | objective | steps | w_pos | w_ori | learned RMSE | learned/analytic | NIS/dof |
+|---|---|---|---|---|---|---|---|
+| A | `l2_velocity` (= R3b) | 7639 | — | — | 0.0678 | 1.25× | 0.352 |
+| **B** | `l2_vel_pos` | 7995 | 4.70 | — | **0.0483** | **0.89×** | 0.192 |
+| C | `l2_vel_ori` | 8608 | — | 9.85 | 0.0718 | 1.33× | 0.312 |
+| **D** | `l2_vel_pos_ori` | 9839 | 4.70 | 9.85 | **0.0456** | **0.84×** | 0.084 |
+
+Note arm A (0.0678) already beats R3b (0.088) at the same objective — that gap is
+the **B2** data fix alone (21 train rollouts vs 5), before any new loss term.
+
+### Per terrain (learned velocity RMSE)
+
+| terrain | analytic | A vel | B vel+pos | C vel+ori | D vel+pos+ori |
+|---|---|---|---|---|---|
+| flat | 0.0525 | 0.0759 | 0.0494 | 0.0745 | **0.0444** |
+| hard_stepping | 0.0586 | 0.0770 | 0.0576 | 0.0769 | **0.0518** |
+| stepping_stones | 0.0532 | 0.0615 | 0.0457 | 0.0659 | **0.0456** |
+| waves | 0.0520 | 0.0566 | 0.0404 | 0.0699 | **0.0406** |
+
+`waves` is now a *valid* held-out terrain (B1), and it is where the position term
+helps most (0.057 → 0.040).
+
+## Reading it
+
+1. **Position is complementary to velocity.** `L_pos ≈ dt·Σ(v_est − v_true)` is an
+   integral-of-velocity-error signal: it penalises sustained, low-frequency
+   velocity bias that the per-tick velocity MSE under-weights. Adding it cuts mean
+   RMSE 29% (A→B) and clears the analytic baseline the socket had never beaten.
+2. **Orientation alone competes with velocity.** Attitude is already partly
+   constrained (gravity leveling + the `Rᵀv` coupling in `L_vel`), so an explicit
+   attitude penalty steals a little velocity capacity — arm C is *worse* than A.
+3. **The interaction is the interesting part.** Orientation is net-**positive**
+   only once position is present (B→D: 0.0483 → 0.0456): with the trajectory
+   anchored by `L_pos`, the attitude term refines without robbing velocity. Both
+   together is the best arm.
+
+## Caveats (do not over-read)
+
+* **Step spread.** Later arms got more steps as caches warmed (A 7639 → D 9839,
+  ~29%). All converged (final loss 1.6e-3–3.1e-3), and the ranking is robust — C
+  had *more* steps than A and still lost — but D's edge over B is **partly** more
+  steps, not purely the orientation term. A matched-step rerun would settle it.
+* **Calibration moved the wrong way.** NIS/dof fell from 0.35 (A) to 0.08 (D):
+  the pose terms improve the **mean** (accuracy), not the covariance — S stays too
+  large (the Block-C R-too-large signature; orthogonal to this ablation).
+* **One held-out seed per terrain.** The per-terrain numbers are single rollouts;
+  the mean is a 4-rollout average. Trend, not a tight interval.
+
+## Recommended next
+
+1. **Adopt `l2_vel_pos` as the default composite** — it is the clean win (beats
+   analytic, no orientation ambiguity, fewer knobs).
+2. **Matched-step A/B/C/D rerun** to remove the step-count confound before quoting
+   D over B.
+3. The calibration (NIS/dof ≪ 1) is now the limiting factor, not the mean — pursue
+   the Block-C noise-model reconciliation next, not more loss terms.
+
+Runs: `results/2026-08-06_*_{A_l2vel,B_l2velpos,C_l2velori,D_l2velposori}/`
+(each with `summary.json`, `training.png`, `validation.png`); combined summary in
+`results/l2_options_summary.png`.
