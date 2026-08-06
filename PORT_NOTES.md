@@ -1386,3 +1386,282 @@ noise (asserted).
   impossible; tier 2 is a divergence test, weaker than tier 1's per-module
   localisation, and best built once the `diag(Qa)` and sensor-noise oracles are
   green (they now are).
+
+## G9 — the fused estimator step (`pipeline/main_estimator.py`)
+
+G9 fuses the two already-validated filters into one constant-XLA-graph `lax.scan`
+body: joint KF (at the carry's `q̂_prev`) → `(q̂, q̇̂, Σ_q, Σ_q̇, b̂)` → the boundary
+→ InEKF → pelvis pose. The only genuinely new code is `_boundary`: bias-correct
+the base gyro in the IMU frame (I1), rotate IMU→body (`R_mount`), route the full
+`Σ_q`/`Σ_q̇` (never diagonalised). Gate: `tests/pipeline/test_main_estimator.py`
+(9 green) — the jaxpr-constancy proof (I7) + a `_cache_size()==1` no-recompile
+check + five scenarios (static equilibrium, no-contact yaw integration, free fall,
+poisoned-encoder recovery, bias-correction wiring), all against a synthetic
+floating-base biped MJX model.
+
+### Deviations and decisions (DoD §8)
+
+* **The build guide's premise was stale.** `~/Documents/g910_guide.md` says to
+  fuse two Tier-2 replay drivers `replay/{jointkf,inekf}_driver.py`; those files
+  do not exist (the harness is Tier-1 stateless, `tests/replay/`). The real
+  assembly patterns are `tests/jointKF/_fixture.py::kinematic_tree` (the
+  mj_model→`KinematicTree` adapter, generalised here as `kinematic_tree_from_mj`)
+  and `tests/inEKF/test_filter.py` (the contact-FK closure + jaxpr-constancy
+  pattern). The guide's `jkf.step(..., vel_ch)` 6th arg and `SensorInputs.velocity`
+  field also do not exist — the direct-velocity channel is not wired into the
+  current `jointKF.filter.step`, so the fused step does not use it.
+* **G9 gate is synthetic, not the hardware replay.** The guide's stronger "diff
+  the fused step against `jointKF_*`/`invariantFilter*` on the log" gate needs the
+  9GB Alex001 log + `ihmc-log` skill (CI-excluded). Deferred to the same Tier-2
+  replay above; the synthetic scenarios are the self-contained gate.
+* **Landmine #1 (Q_bb=0) is wired.** `build_fused_estimator(imu_bias_process_var
+  =0.0)` overrides the config's test-locked `1e-4` at the fusion boundary (flight
+  value; config value would make the joint-KF bias ~200× too noisy).
+* **Landmine #2 (contact measurement-noise floor) is a socket, default off.**
+  `contact_meas_var` (default `0.0` = current port behaviour) adds an isotropic
+  floor to `Σ_q` before the InEKF contact update, standing in for flight's
+  `ConstantContactMeasurementNoiseProvider`. It affects velocity/position, not
+  roll/pitch; wiring the flight value waits on the Tier-2 velocity check.
+* **`R_mount` unverified for real Alex.** The synthetic model's base IMU is
+  axis-aligned, so `R_mount=I`. Real Alex is a +90° pelvis-IMU yaw; the frame
+  step (`_boundary`) MUST be cross-checked against `invariantRootAngularVelocityBody*`
+  on the log before trusting fused velocity/position. Roll/pitch are `R_mount`-robust.
+* **Benign one-time recompile fixed by `device_put`.** The init carry mixes device
+  commitment (contacts `d0` come off an MJX-FK `einsum`, committed; `jnp.eye`/`zeros`
+  leaves uncommitted), which forced a second `fused_step` compile with an identical
+  jaxpr but a different `Argument mapping`. `init_fused_carry` now `device_put`s the
+  whole carry to one device, so it is a single executable. This is not an I7
+  violation (contact/gate flips do not recompile); it is sharding bookkeeping.
+* **`J_dot = 0` in the contact-FK closure.** The InEKF velocity-noise term
+  (`N^v = J_Ċ Σ_q̇ J_Ċᵀ`) is deferred, same as the standalone `inEKF/filter.py`
+  TODO; `Σ_q̇` is carried through the boundary so adding it later is local.
+
+### G9 on the real Alex model (2026-07-23) — wired and frame-verified
+
+`fused_step` now runs on the actual 2026-07-17 Alex001 model (the log's own
+`model.sdf`), not just the synthetic biped. `build_alex_fused_estimator` +
+`ALEX_*` in `main_estimator.py` encode the topology; `tests/replay/
+test_fused_real_model.py` is the gate (skips without the log). Three things fell
+out, one of them a real bug fix:
+
+* **Resolved the `imu_pairs: []` TODO (CLAUDE.md §2b).** The IMU set is *forced*
+  by two facts from the log: `jointKFNumberOfIMUs = 8`, and the pair-chain union
+  must equal the 9 logged `FILTERED_JOINTS` (spine + legs, no arms/head). The only
+  set that satisfies both is a **star on `pelvis_imu`** paired with `torso_imu`
+  and each leg's `hip_x / thigh / shin` IMUs. Verified: it reproduces exactly the
+  9 filtered joints, `dof_nuisance` is base-6-only (no gap joints — matches the
+  `diag(Qa)` parity harness), and the ankles fall out as the 4-joint unfiltered
+  anchor split. The leg IMUs give overlapping chains (`hip_x ⊂ thigh ⊂ shin`) —
+  the redundant shared-base-IMU measurement the `LΣLᵀ` star (I6) is for.
+
+* **Fixed a frame bug in the fused step's body-frame model.** The first cut used
+  the base *IMU site* as the InEKF body frame `B`. That is only correct when the
+  IMU sits at the body origin with no rotation (true for the synthetic fixture,
+  false for Alex: the pelvis IMU is offset AND yawed +90°). The InEKF's `B` is the
+  *pelvis root body* (what `invariantRootAngularVelocityBody` reports), so the code
+  now takes THREE distinct frames — base IMU site (joint-KF anchor + gyro source),
+  body frame `B` = `base_body_site` (contact-FK origin+frame), and
+  `R_mount = ᴮR_S` (auto-computed at `qpos0`). On real Alex `R_mount` is a clean
+  +90° yaw.
+
+* **`R_mount` verified against Java to 1e-18 — the frame is exactly right.** Java
+  publishes the pelvis gyro bias in both frames (`jointKF_gyroBias_pelvis_imu_*`
+  in the IMU frame, `invariantAppliedGyroBiasInPelvisFrame` in the body frame), so
+  `R_mount @ bias_S == bias_B` is a pure-rotation check with no signal processing
+  in the way. It holds to 1.3e-18 RMS over the [200,210] s window, and also
+  confirms I1 end-to-end on hardware: the bias the InEKF applies IS the joint-KF's.
+
+* **Finding for Tier-2: the real InEKF consumes a Mahony-prefiltered pelvis gyro,
+  not the raw `gyroscope_pelvis_imu`.** `R_mount @ raw_gyro` misses
+  `invariantRawAngularVelocityBody` by ~2.5e-2 rad/s RMS (33% of signal during
+  walking) while the bias-frame check above is exact — so the gap is the *input
+  signal*, not the frame. A per-IMU `*_imuMahony*` complementary filter sits
+  upstream. A full free-running Tier-2 replay of the fused step must feed the same
+  processed angular-velocity channel, not the raw gyroscope. Does not affect the
+  synthetic G9 gate, the assembly, or `R_mount`.
+
+### G10 remains
+
+Not built: the MJX sim env, the ONNX→Flax policy port (≤1e-6 oracle), the
+closed-loop scan + vmap, and NIS/NEES consistency bands (`eval/consistency.py`).
+`FusedOutputs` already emits the joint-KF `TickDiagnostics` and InEKF
+`InEKFOutputs` (with per-tick NIS) the consistency evaluation reads. Note the sim
+model is a *different* MJCF from the estimator's: `urdf2mjcf` deliberately drops
+collision/visual geoms (the estimator needs only FK/Jacobians/M), so the sim needs
+its own build with geoms + actuators (from `resources.zip` meshes or a vendored
+full-body MJCF).
+
+## G10 (part) — the estimator in the loop with the RL policy (`sim/`, 2026-07-26)
+
+`run_estimator.py` + `src/invariant_estimation/sim/` put the fused step inside the MuJoCo policy
+sim: simulated IMUs/encoders in, the policy's `base_ang_vel` + `projected_gravity` out of the
+filter. Full numbers in `.claude-reports/2026-07-26-estimator-in-mujoco-sim.md`; the two findings
+that belong in the port record are below.
+
+### Finding 1 (FIXED, behind a flag): the contact FK pinned the off-path ankles at `qpos0`
+
+`_make_contact_kinematics` evaluates base→sole FK from the 9 filtered joints, and
+`MjxModel.qpos` widens that by leaving every other joint at `qpos0`. Alex's ankles are off-path,
+so the InEKF's contact FK always believed them to be at zero. Measured on a walking run: the
+ankles travel **0.66 rad**, and the contact FK error is 3.4 cm mean with a **5.3 cm swing over a
+gait cycle**. The constant part is harmless — contacts are seeded consistently — but the swing is
+not: a planted foot appears to slide 5 cm every step, and a filter whose contacts are stationary
+by construction can only read that as base motion.
+
+Java anchors at the live sole frame (`referenceFrames.getSoleFrame`), so **this is a port gap, not
+a modelling choice**. Invisible to the Tier-1 parity harness because that compares roll/pitch,
+which gravity leveling holds; the error lands on velocity/position.
+
+Fix: `build_fused_estimator(contact_fk_unfiltered=True)` feeds the measured off-path joints to the
+contact FK and block-diagonally widens `Σ_q` with their encoder variance, so `N = J Σ_q Jᵀ` still
+covers every joint the measurement depends on. `init_fused_carry` seeds from the same augmented
+vector, or the whole standing FK offset arrives as a step at tick 1. **Default off** so recorded
+gates keep their numbers; the sim CLI defaults it on. 30 s walk, tail-RMS: tilt error
+1.40° → **0.81°**, attitude 1.61° → 0.83°, position drift 2.84 → 2.20 m.
+
+The **mass matrix deliberately keeps seeing `qpos0`** — that pinning reproduces Mecano compositing
+the ignored subtree's inertia once at construction (worth 14% on `diag(Qa)`, `MjxModel.qpos`) and
+is a separate concern from kinematics. The fix does not touch it.
+
+### Finding 2 (OPEN): the missing touchdown reseed costs ~2 m of height per 30 s of walking
+
+Residual drift after Finding 1 is **almost entirely vertical**, linear at ~0.09 m/s; horizontal
+odometry is fine (18.77 m estimated vs 19.42 m travelled, 3.3% stride scale). **Base and both
+anchors sink together** (−1.87 m base, −1.82/−1.87 m anchors over 20 s) with a 0.4 mm contact
+innovation — a common mode the relative contact constraint cannot see.
+
+Eliminated by direct test, not by argument:
+* **not the IMU lever arm** — r = (−0.087, 0.012, −0.081) m biases specific force by −0.023 m/s²
+  in z, but substituting a body-origin accelerometer moves 20 s drift only −1.873 → −1.917 m;
+* **not loose anchors** — tightening `contact_floor` 1e-4 → 1e-6 makes it −15 m with 18° of tilt
+  error and **the robot falls**. That slack absorbs contact/FK inconsistency; it is load-bearing.
+
+It is gait-driven: **standing 30 s drifts not at all** (0.012 m constant), and while walking
+**63% of the vertical error accumulates in the 25% of ticks around a touchdown**, at 5x the
+background rate. That is the mechanism `reseedContact` + `TouchdownReseedLatch` exist to prevent —
+tested Java runtime behaviour per `CLAUDE.md` §2, **never implemented in this port** (no
+`inEKF/reseed.py`; `reseed.enabled: false`, deferred 2026-07-21 as "no measurable difference on
+the real robot", a judgement made where absolute height matters least). `InvariantEKFReseedTest`
+already specifies the congruence and the zero-release property. Second, independent candidate: the
+still-deferred contact zero-velocity constraint (`J_dot = 0`, `inEKF/filter.py`).
+
+Neither reaches the policy — base position and velocity are not in the 98-term observation.
+
+## G10 (part) — viewer tooling: ORT pinning, the ghost, threading, GPU (2026-07-27)
+
+Four changes aimed at "the estimator loop is too slow to watch, and the comparison is
+numbers-only". Two of the four landed roughly as designed; **two produced the opposite of the
+predicted result**, which is the part worth reading.
+
+### 1. The ONNX session was the speed problem (`run_policy._ort_session`)
+
+`onnxruntime` defaults to one intra-op thread per physical core *and spins* after each `Run`.
+Measured: a default session spawns **9 threads** on this 20-thread box and keeps them hot, so they
+fight XLA's own pool in the gap between control ticks. The policy is a tiny MLP; one thread
+computes it faster than nine can be synchronised.
+
+Pinning it (`intra_op_num_threads=1`, `inter_op_num_threads=1`,
+`session.intra_op.allow_spinning="0"`) takes the median control tick from ~27 ms to ~17 ms and
+carries the loop across the real-time line: **0.67–0.83x → 1.12–1.24x**. Interleaved A/B, one
+session per process (swapping sessions mid-process leaves the first pool alive and measures *more*
+threads, not fewer — an earlier attempt at this measurement got the sign wrong that way).
+
+The planning note had expected this to pay only in the **tail** ("the median is noisy"). On the
+full loop the median moved robustly too, and it alone retired the "viewer runs at 0.6x" problem
+that the other three features were designed around. Everything downstream had to be re-baselined
+against it — which is why it landed first.
+
+### 2. The ghost (`sim/ghost.py`)
+
+A translucent second robot drawn at the estimated state: a second `MjData` on the same `MjModel`,
+`mj_kinematics` only, never `mj_step`ped, appended to the scene with `mjv_addGeoms(mjCAT_DYNAMIC)`.
+
+* `est.p`/`est.R` drop into the free joint with **no frame conversion** — verified: the ghost's
+  pelvis lands on `est.p` to 0.0 and on `est.R` to 8e-16, because `qpos[0:3]` ≡
+  `d.xpos[PELVIS_LINK]` and the free joint's quaternion is world-from-body like `est.R`.
+* The dynamic pass draws **sites too** (32 meshes + 20 sites = 52 geoms), so the ghost carries a
+  dedicated `MjvOption` with `sitegroup[:] = 0`. Collision geoms are group 3 and already hidden;
+  the floor is static and excluded for free (the static pass adds exactly 1 geom).
+* The 9 filtered joints come from `est.q`; the other 20 are copied from the real `qpos`, which is
+  exactly what the estimator knows (on hardware those are raw encoders).
+* Cost **0.083 ms/frame** (update 0.027 + draw 0.057). The planning note said 0.004 ms — 20x
+  optimistic, still irrelevant against a 20 ms budget.
+* Bound to keypad `*` (GLFW `KP_MULTIPLY` 332). MuJoCo reserves every letter A–Z for render
+  toggles and `run_policy.py` raises on a sub-128 binding, so the keypad is not a style choice.
+
+`run_free_viewer` grew an optional pre-built `loop` argument so `run_estimator.py --wasd` can drive
+it; without that the ghost hook there would have been dead code, since `run_policy`'s own loop has
+no estimator.
+
+### 3. Threading works, and is no longer needed (`sim/estimator_thread.py`)
+
+`ThreadedEstimator` wraps `EstimatorRuntime`; `estimator_loop.py` is untouched, because it is what
+`test_sources_truth_bypasses_the_estimate` runs through at `atol=0`. Never drops a sample (plain
+`deque`, no `maxlen` — a `maxlen` deque discards the *oldest*, the worst possible choice for a
+sequential recursion); consumes **fixed `substeps` chunks** so XLA never retraces; scores against
+the truth **paired** with each chunk rather than the current `MjData`.
+
+Two corrections to the design:
+
+* **Default `max_backlog_ticks` is 2, not 5.** Staleness tracks the allowed backlog almost exactly
+  (age ≈ backlog + 1 ticks), and tilt error against the synchronous run degrades sharply past ~3:
+  `1 → +0.099°, 2 → +0.112°, 3 → +0.456°, 5 → +1.598°`. The planned default of 5 failed the
+  plan's own 0.3° acceptance gate by 5x.
+* **It buys almost nothing now.** 0.97x headless, 1.03x with a render per tick. The 1.90x
+  thread-overlap figure that motivated it was a micro-benchmark of JAX against `mj_step`; in the
+  real loop, once ORT stopped stealing cores, the sim thread has too little work left to overlap.
+  It stays opt-in, viewer-only, off by default.
+
+**A liveness bug that only mutation testing found.** Back-pressure originally waited while
+`self._error is None`. A worker that dies *without* recording an error (swallowed exception,
+library `sys.exit`) then leaves the producer blocked forever — and the test that should have caught
+it **hung instead of failing**, which is the failure mode that hides in CI. The wait is now gated
+on `self._alive()`, and `_reraise` also raises when the thread stopped silently. With the fix, the
+same mutant fails in 2 s instead of hanging.
+
+### 4. The GPU wins — the prediction was backwards
+
+`pyproject.toml` gained its first `[project.optional-dependencies]`: `gpu = ["jax[cuda13]"]`.
+Every reason to expect a **loss** is still true — batch size 1, no `vmap` anywhere in the estimator
+path, hundreds of tiny kernels, float64 at 1/64 rate on a consumer card, a blocking host
+round-trip every tick. Measured anyway, RTX 4070 SUPER, 250 ticks at vx=0.6, three interleaved
+repeats:
+
+| device | build | p50 | xRT | tilt tail-RMS | drift |
+|---|---|---|---|---|---|
+| cpu | 54 s | 13.59–13.84 ms | 1.45–1.47x | 0.856° | 0.353 m |
+| gpu | 71 s | **8.93–9.05 ms** | **2.21–2.24x** | 0.856° | 0.353 m |
+
+**1.5x faster with the error columns identical to three decimals** — a real win, not a
+speed/accuracy trade. Build+compile is ~17 s slower, paid once. The reasoning above was sound and
+the conclusion was still wrong; `experiments/bench_estimator_device.py` exists so the question is
+re-measured rather than re-argued.
+
+Backend selection is the `JAX_PLATFORMS` env var, deliberately **not** a `--device` flag: the
+backend must be chosen before `jax` is imported, and `run_estimator.py` imports the whole
+`invariant_estimation` chain (which runs `jax.config.update` at `__init__.py:15`) at module scope,
+before `argparse`. A flag would need an `sys.argv` scan above the imports — the same import-order
+landmine the file already carries once for `MUJOCO_GL`.
+
+The repo-root `conftest.py` pins the suite to `JAX_PLATFORMS=cpu` via `setdefault`, so installing
+the extra cannot silently move MJX kinematics onto the GPU and shift tolerances measured on CPU.
+Checked afterwards: `tests/sim` + `tests/pipeline` (61 tests) pass on CUDA as well, so the pin is
+precaution rather than a workaround, and `JAX_PLATFORMS=cuda uv run pytest` remains available.
+`uv lock` resolves all extras, so `uv.lock` carries a large `nvidia-*` block that a default
+`uv sync` never downloads.
+
+### Deliberate deviations from the plan
+
+* `max_backlog_ticks` default 5 → **2** (the planned default failed the planned accuracy gate).
+* `run_free_viewer` takes an optional pre-built loop, and `run_estimator.py` gained `--wasd`;
+  without it the planned ghost hook in that viewer would have been unreachable.
+* The threaded-vs-synchronous acceptance test runs **250 ticks, not 120**: `summarise` scores the
+  tail half, and at 120 ticks that window is still inside the gait transient, where the two
+  trajectories differ by more than the estimator does (a 120-tick version read 1.157 vs 0.738° and
+  failed on startup noise alone).
+* `--ghost` with `--headless`/`--video` is a hard error rather than a silent no-op, as is
+  `--realtime` with `--headless` — the latter because a threaded run is not reproducible and must
+  not be able to write an `.npz` or a video that looks authoritative.
+* The plan's note about re-recording `experiments/sim_runs/*.npz` after the ORT change was moot:
+  that directory has never existed in the repo (it was an ad-hoc scratch path). The stale
+  reference in `RUNNING.md` was removed instead.

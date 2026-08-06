@@ -17,11 +17,28 @@ dependencies = [
   "black",
   "mujoco>=3.10.0",
   "mujoco-mjx>=3.10.0",
+  # run_policy.py runs the exported RL policies (assets/rl_models/*.onnx) on CPU. Not used by the
+  # estimator itself, but a hard requirement of the sim entry point, so it stays a main dependency.
+  "onnxruntime>=1.20",
 ]
+
+[project.optional-dependencies]
+# OPT-IN GPU backend: `uv sync --extra gpu`. A default `uv sync` and every macOS install are
+# unaffected -- this is additive (`jaxlib` stays; a `jax-cuda13-plugin` is added alongside).
+# cuda13 matches the driver this was developed against (580.173.02 / CUDA 13.0).
+#
+# NOTE `uv lock` resolves ALL extras, so `uv.lock` carries a large `nvidia-*` block even though a
+# default sync downloads none of it.
+#
+# This is NOT expected to speed up the estimator, and the estimator does not default to it -- see
+# `experiments/bench_estimator_device.py` and the verdict in RUNNING.md. It is here because it
+# unblocks TERRAIN.md Stage 0 (vmapped MJX rollouts), where a GPU genuinely wins.
+gpu = ["jax[cuda13]"]
 
 [project.scripts]
 docs = "invariant_estimation._docs:serve"
 docs-build = "invariant_estimation._docs:build"
+gen-stubs = "invariant_estimation._stubs:main"
 
 [dependency-groups]
 # zstandard decodes robotData.bsz for the Java-parity harness (replay/logsource.py).
@@ -41,6 +58,10 @@ default-groups = ["dev", "docs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `tests/sim/` drives the real sim entry points, which live at the repo root as scripts
+# (`run_policy.py`, `run_estimator.py`) rather than inside the package.
+pythonpath = ["."]
+markers = ["slow: builds the full Alex estimator (~1 min of MJX tracing per module)"]
 
 [build-system]
 requires = ["setuptools>=61"]
@@ -53,4 +74,4 @@ package-dir = { "" = "src"}
 where = ["src"]
 
 [tool.ruff.lint]
-ignore = ["E401", "E402", "F401"]
+ignore = ["E401", "E402", "F401", "E702"]
