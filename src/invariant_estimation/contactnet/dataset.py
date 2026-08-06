@@ -309,7 +309,8 @@ def make_segment(prep: PreparedRollout, t0: int, cfg: ContactNetConfig,
     state0 = InEKFState(R=R0, v=prep.v_true[t0], p=p0, d=d0, P=np.asarray(P0))
 
     return Segment(inputs=inputs, windows=windows, state0=state0,
-                   v_true=prep.v_true[sl], R_true=prep.R_true[sl])
+                   v_true=prep.v_true[sl], R_true=prep.R_true[sl],
+                   p_true=prep.p_true[sl])
 
 
 def sample_starts(rng: np.random.Generator, preps: Sequence[PreparedRollout],

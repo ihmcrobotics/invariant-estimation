@@ -45,6 +45,19 @@ class ContactNetConfig:
     objective: str = "l2_velocity"
     beta: float = 0.5
 
+    # pose-loss weights for the composite objectives
+    # (`l2_vel_pos` / `l2_vel_ori` / `l2_vel_pos_ori`): loss = L_vel + w_pos*L_pos
+    # + w_ori*L_ori. `None` => sized ONCE on the first warm batch so each added term
+    # starts at `pose_weight_ratio` x the velocity term, then FROZEN for the run
+    # (measure-once, not per-step adaptive). An explicit float overrides the
+    # auto-measure. Velocity stays the lead term; ratio 0.5 gives the pose terms
+    # comparable-but-secondary pull. The added terms are segment-relative
+    # (displacement / incremental rotation) because base position and yaw are
+    # unobservable and their absolute error drifts unbounded (see losses.py).
+    w_pos: float | None = None
+    w_ori: float | None = None
+    pose_weight_ratio: float = 0.5
+
     # optimizer
     peak_lr: float = 1.0e-4
     warmup_steps: int = 100
@@ -140,10 +153,16 @@ class ContactNetConfig:
             )
         if self.L <= 0 or self.B <= 0:
             raise ValueError(f"L and B must be positive, got L={self.L} and B={self.B}")
-        if self.objective not in ("beta_nll", "l2_velocity"):
+        if self.objective not in (
+            "beta_nll", "l2_velocity",
+            "l2_vel_pos", "l2_vel_ori", "l2_vel_pos_ori",
+        ):
             raise ValueError(f"Unknown objective: {self.objective!r}")
         if not 0.0 <= self.beta <= 1.0:
             raise ValueError(f"Beta must be in [0,1], got {self.beta}")
+        if not self.pose_weight_ratio > 0.0:
+            raise ValueError(
+                f"pose_weight_ratio must be positive, got {self.pose_weight_ratio}")
         if self.warmup_steps >= self.total_steps:
             raise ValueError(
                 f"warmup_steps ({self.warmup_steps}) must be < total_steps"
