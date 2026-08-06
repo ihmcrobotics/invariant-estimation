@@ -383,7 +383,8 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
                         stance_chol=1.0e-4, swing_chol=1.0e1,
                         contact_fk_unfiltered=True, est_every=1, verbose=True,
                         threaded=False, max_backlog_ticks=2,
-                        contactnet=None, contactnet_norm=None, contacts_per_foot=1):
+                        contactnet=None, contactnet_norm=None, contacts_per_foot=1,
+                        reseed=None, rolling=None):
     t0 = time.time()
     policy = rp.load_policy(policy_name)
     m = rp.build_sim_model(policy, with_visuals=with_visuals, with_imu_sensors=True)
@@ -393,7 +394,7 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
     dt = est_dt or rp.DT * est_every
     fused = me.build_alex_fused_estimator_from_urdf(
         urdf, contacts_per_foot, dt=dt, contact_meas_var=contact_meas_var,
-        contact_fk_unfiltered=contact_fk_unfiltered)
+        contact_fk_unfiltered=contact_fk_unfiltered, reseed=reseed, rolling=rolling)
     reader = SimSensorReader(m, fused, foot_geoms=rp.FOOT_GEOMS, dt=dt, noise=noise,
                              stance_chol=stance_chol, swing_chol=swing_chol)
     if verbose:
@@ -562,6 +563,24 @@ if __name__ == "__main__":
     ap.add_argument("--max-backlog-ticks", type=int, default=2,
                     help="how far the estimator may fall behind before the sim thread waits for "
                          "it (default 5 = 100 ms). Samples are never dropped, only delayed")
+    ap.add_argument("--reseed", action="store_true",
+                    help="enable the touchdown re-seed (inEKF/reseed.py). Off by default, "
+                         "matching config/filter_cfg.yaml, so every recorded gate number "
+                         "stays reproducible without the flag. Measured 1.01x on vertical "
+                         "drift -- kept, but it is NOT the drift fix (PORT_NOTES Finding 2).")
+    ap.add_argument("--rolling", action="store_true",
+                    help="enable the rolling-anchor contact density (inEKF/contact.py): "
+                         "Sigma_C += tau*sigma_r^2*(|w|^2 I - w w^T) with w the foot's "
+                         "MEASURED angular velocity. Off by default. Measured 0.18x/0.11x "
+                         "on vertical drift in OPEN-LOOP replay over two rollouts "
+                         "(PORT_NOTES Finding 3); closed loop is untested.")
+    ap.add_argument("--rolling-tau", type=float, default=None, metavar="SECONDS",
+                    help="rolling-anchor correlation time; default from filter_cfg.yaml (0.25)")
+    ap.add_argument("--rolling-sigma-r", type=float, default=None, metavar="METRES",
+                    help="rolling-anchor lever-arm prior std; default from filter_cfg.yaml "
+                         "(0.0985 = half the URDF foot, the N=2 sole-centre value). With "
+                         "--contacts-per-foot 4 this is the WRONG quantity and must be "
+                         "re-derived per corner -- see PORT_NOTES Finding 3.")
     ap.add_argument("--contactnet", default=None, metavar="PARAMS.npz",
                     help="run a trained ContactNet in the loop: its learned contact_chol "
                          "replaces the analytic stance/swing heuristic. Pass a params.npz "
@@ -598,7 +617,11 @@ if __name__ == "__main__":
         contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every,
         threaded=args.realtime, max_backlog_ticks=args.max_backlog_ticks,
         contactnet=args.contactnet, contactnet_norm=args.contactnet_norm,
-        contacts_per_foot=args.contacts_per_foot)
+        contacts_per_foot=args.contacts_per_foot,
+        reseed=me.inekf_mod.default_reseed_params(enabled=True) if args.reseed else None,
+        rolling=me.inekf_mod.default_rolling_anchor_params(
+            enabled=True, tau=args.rolling_tau, sigma_r=args.rolling_sigma_r)
+        if args.rolling else None)
     # The ghost draws into an `mjvScene`. The viewer has one; so does an offscreen
     # `mujoco.Renderer`, so --ghost now composes with --video (that is how the
     # validation recording is made). It still has nothing to draw into on a bare

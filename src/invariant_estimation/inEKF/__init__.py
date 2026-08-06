@@ -8,13 +8,17 @@ holds no trainable parameters — BPTT during training flows *through* it.
 
 Build order: group -> state -> propagate -> correct -> contact -> gravity_update
 -> ekf -> filter.  All implemented; `filter.step`/`filter.run` are the scan body
-and trajectory driver.  Deferred by decision: reseed, contact trust (see
-PORT_NOTES.md).
+and trajectory driver.  Touchdown re-seed is in `reseed.py`, wired into
+`filter.step` and off by default (``reseed.enabled``).  Deferred by decision:
+contact trust (see PORT_NOTES.md).
 """
 from .contact import (
+    RollingAnchorParams,
     apply_floor,
+    default_rolling_anchor_params,
     digest,
     reconstruct_cov,
+    rolling_anchor_density,
     rotate_to_world,
 )
 from .correct import (
@@ -71,6 +75,15 @@ from .gravity_update import (
     isotropic_gravity_params,
     tilt_angle,
     update_gravity_reference,
+)
+from .reseed import (
+    LatchState,
+    ReseedParams,
+    advance_latch,
+    default_reseed_params,
+    init_latch,
+    pre_reseed_residual,
+    reseed_contacts,
 )
 from .group import (
     Adjoint,
@@ -171,6 +184,16 @@ __all__ = [
     # gravity leveling (G4)
     "GravityParams",
     "GravityRef",
+    "LatchState",
+    "ReseedParams",
+    "RollingAnchorParams",
+    "default_rolling_anchor_params",
+    "rolling_anchor_density",
+    "advance_latch",
+    "default_reseed_params",
+    "init_latch",
+    "pre_reseed_residual",
+    "reseed_contacts",
     "GravityMeasurement",
     "default_gravity_params",
     "isotropic_gravity_params",

@@ -312,6 +312,25 @@ reseed:
   latch_rearm: 0.1                # sustained-low threshold that re-arms
   latch_dwell_ticks: 100          # consecutive below-rearm ticks needed
 
+# Rolling-anchor contact density (inEKF/contact.py, RollingAnchorParams).
+#   Sigma_C += tau * sigma_r^2 * (|w|^2 I - w w^T)
+# with w the foot's angular velocity from the base gyro + the leg encoders. It is
+# rank 2 (null along w), exactly zero when the foot is not rotating, and needs no
+# contact detection at all. It exists because a rigid foot pivoting about its toe
+# edge moves a sole-centre anchor 16-29 mm per stance (measured,
+# experiments/anchor_static_check.py) while the shipped model asserts that point
+# is world-static to 0.32 mm/tick -- so the filter charges the difference to the
+# base and sinks at ~0.04 m/s.
+#
+# OFF by default: every recorded gate number was measured without it.
+rolling_anchor:
+  enabled: false
+  tau: 0.25                       # [s] correlation time of the toe-off pivot;
+                                  # measured window is 0.15-0.3 s
+  sigma_r: 0.0985                 # [m] prior std on |anchor - contact patch|.
+                                  # Half the URDF foot length (0.197 m) for the
+                                  # N=2 sole-centre anchor.
+
 # TODO(contact_trust): FootSwitchContactProbabilityProvider. Not ported — will
 # be validated by comparing the Python and Java implementations on logged data
 # rather than by a unit-test port (Lucas, 2026-07-21).

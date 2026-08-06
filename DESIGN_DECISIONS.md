@@ -112,18 +112,29 @@ fails if it is removed.
 
 ---
 
-## 3. Touchdown re-seed is not implemented
+## 3. Touchdown re-seed is implemented, and OFF by default
 
-**Decided:** 2026-07-21 (Lucas). **Code:** `inEKF/ekf.py` (`TODO(reseed)`).
-**Guarded by:** `tests/inEKF/test_invariant_ekf.py::test_reseed_is_not_implemented`.
+**Decided:** 2026-07-21 (Lucas) to defer; **implemented and measured 2026-08-06.**
+**Code:** `inEKF/reseed.py`, wired in `inEKF/filter.py` between propagate and the
+contact update. **Guarded by:** `tests/inEKF/test_reseed.py` (14 tests: the three
+Java `InvariantEKFReseedTest` properties, the latch, and the masking contract)
+plus `test_invariant_ekf.py::test_reseed_is_wired_but_off_by_default`.
 
-`reseedContact` re-anchors a contact slot by a covariance congruence
-(`P_dd = P_pp + R N Rᵀ`, `P_θd = P_θp`) under a fire-once latch. Not ported —
-measured no meaningful difference on the real robot.
+`reseed_contacts` re-anchors a slot by the covariance congruence
+(`P_dd = P_pp + R N Rᵀ`, `P_θd = P_θp`) under a fire-once `TouchdownReseedLatch`.
 
-**Cost:** stale-anchor drift on long stances is not corrected, and covariance can
-grow more than necessary across a stance. Parameters are parked under `reseed:`
-in `config/filter_cfg.yaml` with `enabled: false`; the call site is marked.
+**Default stays `enabled: false`** for two reasons. First, every recorded gate
+number was measured without it, and `reseed.enabled: false` is verified a true
+no-op (bit-identical replay against the pre-reseed checkout), so the default
+protects reproducibility. Second, it does not do what it was deferred *for*:
+`PORT_NOTES.md` Finding 2 (CLOSED) measures the vertical drift unchanged at
+1.01x with the latch firing correctly 47 times in 20 s. The drift is a common
+mode sustained by a standing velocity bias, and the re-seed — which re-anchors
+onto the current base estimate — is itself common-mode preserving.
+
+**Kept anyway** because it is the correct treatment for touchdown-transient
+injection, which is currently masked by an `S` roughly 20x too large
+(`NIS/dof ~ 0.05`). Revisit the flag once that calibration is fixed.
 
 ---
 

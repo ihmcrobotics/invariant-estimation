@@ -261,12 +261,16 @@ def test_update_publishes_diagnostics():
     assert np.isnan(float(ekf_mod.initial_diagnostics().nis))
 
 
-def test_reseed_is_not_implemented():
-    """`reseedContact` is deliberately absent — deferred, not forgotten.
+def test_reseed_is_wired_but_off_by_default():
+    """Re-seed exists (`inEKF/reseed.py`) and is **disabled** in the shipped config.
 
-    Guards the decision (Lucas, 2026-07-21: no measurable difference on the real
-    robot) against being silently half-implemented later. If reseed lands, this
-    test should be deleted along with the TODO in `ekf.py`.
+    Replaces the old `test_reseed_is_not_implemented`, which guarded the
+    2026-07-21 deferral. The deferral is over, but the shipped default must not
+    move silently: every recorded gate number was measured with the re-seed off,
+    so flipping `reseed.enabled` has to be a deliberate config edit.
     """
-    assert not hasattr(ekf_mod, "reseed_contact")
-    assert "TODO(reseed)" in ekf_mod.__doc__
+    ekf = ekf_mod.create(2)
+    assert ekf.reseed.enabled is False
+    assert ekf.reseed.trigger == 0.5
+    assert ekf.reseed.rearm == 0.1
+    assert ekf.reseed.dwell_ticks == 100

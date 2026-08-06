@@ -407,6 +407,8 @@ def build_fused_estimator(
     accel_var: float | None = None,
     contact_var: float | None = None,
     contact_fk_unfiltered: bool = False,
+    reseed: "inekf_mod.ReseedParams | None" = None,
+    rolling: "inekf_mod.RollingAnchorParams | None" = None,
 ) -> FusedEstimator:
     """Assemble the joint KF + InEKF into one fused estimator (plain Python, I7).
 
@@ -455,7 +457,7 @@ def build_fused_estimator(
     K = len(foot_sites)
     ekf = inekf_mod.create(
         number_of_contacts=K, gyro_var=gyro_var, accel_var=accel_var,
-        contact_var=contact_var, dt=dt,
+        contact_var=contact_var, dt=dt, reseed=reseed, rolling=rolling,
     )
 
     base_site = site_names.index(imu_sites[base_imu])
@@ -488,6 +490,7 @@ def build_fused_estimator(
     kinematics = _make_contact_kinematics(
         model, base_body_ord, foot_site_ords,
         aux_qpos=aux_qpos, n_filtered=build.n_joints,
+        with_omega=ekf.rolling.enabled,
     )
     inekf_step = inf.make_step(ekf, kinematics)
 
@@ -540,6 +543,7 @@ def _aux_joint_tables(model: MjxModel, build: JointKFBuild) -> tuple[np.ndarray,
 def _make_contact_kinematics(
     model: MjxModel, base_body_site: int, foot_site_ords: np.ndarray,
     aux_qpos: np.ndarray | None = None, n_filtered: int | None = None,
+    with_omega: bool = False,
 ) -> inf.ContactKinematics:
     r"""The `robot/` seam: `q ↦ ContactFrames(y, J)` in the InEKF body frame `B`.
 
@@ -587,12 +591,50 @@ def _make_contact_kinematics(
         R_bw = rot[base_body_site]                       # ᵂR_B (body frame == site frame)
         return jnp.einsum("ij,kj->ki", R_bw.T, pos[feet] - p_base)   # (K,3)
 
-    def kinematics(q: Array, q_dot: Array) -> inf.ContactFrames:
+    def _foot_pose(q: Array) -> tuple[Array, Array]:
+        """``(y_i, C_i)`` — base→sole vector and ``C_i = R_Bᵀ R_{sole_i}``, both in ``B``.
+
+        One `site_poses` call feeding both outputs, so differentiating it costs
+        one FK graph rather than two.
+        """
+        if use_aux:
+            q = qpos0.at[idx_filtered].set(q[:n_f]).at[idx_aux].set(q[n_f:])
+        pos, rot = model.site_poses(q)
+        R_bw = rot[base_body_site]
+        y = jnp.einsum("ij,kj->ki", R_bw.T, pos[feet] - pos[base_body_site])   # (K,3)
+        C = jnp.einsum("ji,kjl->kil", R_bw, rot[feet])                         # (K,3,3)
+        return y, C
+
+    def _kinematics_plain(q: Array, q_dot: Array) -> inf.ContactFrames:
         y = _foot_y(q)
         J = jax.jacfwd(_foot_y)(q)                       # (K,3,n)
         return inf.ContactFrames(y=y, J=J, J_dot=jnp.zeros_like(J))
 
-    return kinematics
+    def _kinematics_with_omega(q: Array, q_dot: Array) -> inf.ContactFrames:
+        r"""As above plus ``ω_rel = vee(Ċ Cᵀ)``, the foot's angular velocity
+        relative to the base, expressed in ``B``.
+
+        ``∂C/∂q`` rides along in the **same** `jacfwd` that already produces
+        ``∂y/∂q``, then contracts with ``q̇``. Forward-mode cost scales with the
+        *input* dimension, so widening the output is nearly free — whereas a
+        separate `jvp` on a separate FK function stages out a second MJX
+        kinematics graph and roughly doubles compile time (measured: the step
+        stopped compiling inside a 45 s budget at all).
+        """
+        (y, C), (J, dC) = _foot_pose(q), jax.jacfwd(_foot_pose)(q)
+        C_dot = jnp.einsum("kijn,n->kij", dC, q_dot)     # Ċ = (∂C/∂q) q̇
+        Omega = jnp.einsum("kij,klj->kil", C_dot, C)     # Ċ Cᵀ, (K,3,3)
+        # Antisymmetrise before `vee`: Ċ Cᵀ is exactly skew in theory but only to
+        # rounding once C has been through FK, and the skew part is the signal.
+        S = 0.5 * (Omega - jnp.swapaxes(Omega, -1, -2))
+        omega_rel = jnp.stack([S[:, 2, 1], S[:, 0, 2], S[:, 1, 0]], axis=-1)   # (K,3)
+        return inf.ContactFrames(y=y, J=J, J_dot=jnp.zeros_like(J),
+                                 omega_rel=omega_rel)
+
+    # BUILD-TIME selection: a filter without the rolling anchor traces the
+    # identical graph it did before this feature existed. The extra FK
+    # differentiation is not merely dead-code-eliminated, it is never staged out.
+    return _kinematics_with_omega if with_omega else _kinematics_plain
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +757,11 @@ def _boundary(
     return inf.InEKFInputs(
         omega=omega_body, accel=accel_body, raw_omega=raw_omega_body,
         joint=joint, contact_chol=sensors.contact_chol,
+        # Read only by the touchdown re-seed latch, and only on a build with
+        # `reseed.enabled`. `sensors.contact` is the Schmitt-trusted per-slot
+        # mask the joint KF already consumes; the InEKF uses it for TIMING, never
+        # to gate a measurement (see `InEKFInputs.contact_prob`).
+        contact_prob=jnp.asarray(sensors.contact, dtype=jnp.float64),
     )
 
 
@@ -763,10 +810,9 @@ def init_fused_carry(
         fused.ekf, rotation=R0, velocity=v0, position=p0, contacts=d0,
         covariance=covariance,
     )
-    inekf_carry = inf.init_carry(state0)
+    inekf_carry = inf.init_carry(state0, fused.ekf)
     if seed_gravity:
-        inekf_carry = inf.InEKFCarry(
-            state=state0,
+        inekf_carry = inekf_carry._replace(
             gravity_ref=GravityRef(direction=R0.T @ UP, initialized=jnp.array(1.0)),
         )
 

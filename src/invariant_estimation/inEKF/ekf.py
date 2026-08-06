@@ -26,14 +26,10 @@ new state.  Java's introspection getters (`wasLastUpdateApplied`,
 `getLastConditionProxy`) become the returned `UpdateDiagnostics` pytree rather
 than fields mutated on the side (CLAUDE.md §4).
 
-    # TODO(reseed): touchdown re-seed.  `InvariantEKF.reseedContact(i, y, N)`
-    # re-anchors an existing contact slot by a covariance congruence
-    # (P_dd = P_pp + R N Rᵀ, P_θd = P_θp) under a fire-once `TouchdownReseedLatch`
-    # (trigger 0.5, rearm 0.1, dwell 100 ticks).  Deliberately NOT implemented:
-    # Lucas measured no meaningful difference on the real robot (2026-07-21), so
-    # `InvariantEKFReseedTest` and `TouchdownReseedLatchTest` are unported.
-    # Parameters are parked under `reseed:` in config/filter_cfg.yaml, and the
-    # call site is here — between `predict` and `update` in `step`.
+Touchdown re-seed lives in `reseed.py` and is wired into `filter.step` between
+the propagation and the contact update (the call site this docstring used to
+mark as a TODO).  It is off by default — ``reseed.enabled`` in
+``config/filter_cfg.yaml`` — and `InvariantEKF.reseed` carries its parameters.
 """
 from typing import NamedTuple, Sequence
 
@@ -41,6 +37,7 @@ from jax import Array
 import jax.numpy as jnp
 
 from ..config import section
+from .contact import RollingAnchorParams, default_rolling_anchor_params
 from .correct import UpdateDiagnostics, contact_update, no_update_diagnostics
 from .gravity_update import (
     GravityParams,
@@ -50,6 +47,7 @@ from .gravity_update import (
     default_gravity_params,
 )
 from .propagate import propagate
+from .reseed import ReseedParams, default_reseed_params
 from .state import InEKFParams, InEKFState, default_params
 
 
@@ -66,11 +64,17 @@ class InvariantEKF(NamedTuple):
         Per-contact **body-frame** process covariances used by the propagation.
     gravity_params : GravityParams
         Gravity-leveling configuration.
+    reseed : ReseedParams
+        Touchdown re-seed configuration (`reseed.py`).  ``enabled`` is a
+        **build-time** flag: a disabled build emits no congruence at all, so this
+        is static wiring rather than a data-dependent branch (I7).
     """
     N: int
     params: InEKFParams
     sigma_c: Array
     gravity_params: GravityParams
+    reseed: ReseedParams
+    rolling: RollingAnchorParams
 
     @property
     def number_of_contacts(self) -> int:
@@ -95,6 +99,8 @@ def create(
     contact_var: float | None = None,
     dt: float | None = None,
     gravity_params: GravityParams | None = None,
+    reseed: ReseedParams | None = None,
+    rolling: RollingAnchorParams | None = None,
 ) -> InvariantEKF:
     """Java `InvariantEKF.create(numberOfContacts, gyroVar, accelVar, contactVar)`.
 
@@ -120,6 +126,8 @@ def create(
         sigma_c=sigma_c,
         gravity_params=default_gravity_params() if gravity_params is None
         else gravity_params,
+        reseed=default_reseed_params() if reseed is None else reseed,
+        rolling=default_rolling_anchor_params() if rolling is None else rolling,
     )
 
 

@@ -1523,6 +1523,174 @@ The **mass matrix deliberately keeps seeing `qpos0`** — that pinning reproduce
 the ignored subtree's inertia once at construction (worth 14% on `diag(Qa)`, `MjxModel.qpos`) and
 is a separate concern from kinematics. The fix does not touch it.
 
+### Finding 2 (CLOSED, 2026-08-06): the reseed is implemented, and it is NOT the cause
+
+**The re-seed hypothesis below is wrong.** `inEKF/reseed.py` now implements the
+congruence and the `TouchdownReseedLatch` (14 property tests, incl. the three
+Java ones); `experiments/reseed_drift.py` replays `data/flat_seed005.npz` through
+the InEKF twice from a bit-identical seed. The latch fires **47 times against 46
+touchdown edges** — it works — and the drift does not move:
+
+```
+vertical drift rate   -0.0415  ->  -0.0420 m/s   (1.01x, marginally WORSE)
+final vertical error  -0.7482  ->  -0.7578 m over 20 s
+```
+
+Harness is validated two ways: the OFF arm reproduces the recorded fused run's
+drift rate (`aux.est_p`, -0.0415 m/s), and it is **bit-identical** (max abs diff
+0.0 over 20000 ticks x 3 axes) to the same replay on the pre-reseed checkout, so
+`reseed.enabled: false` is a true no-op.
+
+**Why it cannot work, and this is the part worth keeping.** The re-seed sets
+`d_i <- p_hat + R_hat y_i`: it re-anchors the contact onto *the current base
+estimate*. It is therefore **itself common-mode preserving**. Measured, the drift
+is exactly a common mode — the anchors sink **0.99x** the base error — so there
+is nothing there for a re-seed to remove. What a re-seed does remove is the
+touchdown transient's *injection* into the base, and that is not what is driving
+this:
+
+```
+mean vertical VELOCITY error   -0.0329 m/s, standing
+  x 20 s                       = -0.658 m  of the -0.748 m total  (88%)
+by quarter   Q1 -0.0231   Q2 -0.0592   Q3 -0.0282   Q4 -0.0210 m/s
+mean contact NIS 0.315 on dof 6  ->  NIS/dof ~ 0.05
+```
+
+The bias is present in Q1 and roughly flat: a **standing vertical velocity bias
+integrated continuously**, not an impulse train at touchdown. The 54.7%-of-error-
+in-18.5%-of-ticks touchdown concentration reproduces (3.0x, vs the 5x claimed
+below) but is a *correlate* — the velocity error is largest at impact and is
+never corrected anywhere, which is what `NIS/dof ~ 0.05` says: the contact update
+carries an `S` roughly 20x too large and is barely correcting at all.
+
+#### The actual cause: a toe-off ratchet on the sole-centre anchor
+
+`experiments/anchor_static_check.py` asks the question with **no filter in the
+loop** — put the FK contact point in the world using *ground-truth* base pose,
+`d_i^true(t) = p_true + R_true · h_{p,i}(q)`, and watch it across each trusted
+stance. The contact model says this is a constant. It is not:
+
+| rollout | net rise per stance | loading (first 1/3) | unloading (last 1/3) |
+|---|---|---|---|
+| `flat_seed005` | **+16.18 mm** | −1.63 mm | **+17.66 mm** |
+| `flat_seed020` | **+29.14 mm** | +0.05 mm | **+28.77 mm** |
+
+Essentially all of it is in the last third of stance: the foot pitches up about
+its toe edge at heel-off/toe-off while the Schmitt trigger still trusts it
+(correctly — load is *highest* then, that is propulsion). With `N = 2` the foot
+owns **one** anchor at the sole centre, which cannot represent "pivoting about
+the toe edge", so the sole centre genuinely rises ~2 cm per step.
+
+The filter charges almost all of that to the base. Stance `Σ_C` is
+`stance_chol² = 1e-8` (+ the 1e-4 floor) — a very stiff anchor — while `P_pp` has
+been growing on IMU integration, so the gain split `P_pp / (P_pp + P_dd + N)`
+sends the innovation into `p̂`, downward. Multiply by the 46 stance events in 20 s:
+
+```
+                predicted sink   measured    ratio
+flat_seed005      -0.744 m       -0.748 m     1.01
+flat_seed020      -1.340 m       -1.125 m     0.84
+```
+
+Two rollouts differing 1.8x in anchor rise, and the per-stance rise predicts the
+drift. **The vertical drift is the accumulated toe-off rise of the FK contact
+point, absorbed into the base.**
+
+Note also the constant: the FK sole point sits **+6.5 mm** above the floor
+through stance, which is the N=2 URDF-foot (0.197 m) vs SCS2-box (0.26 m)
+asymmetry recorded under Gate A. Constant, so it does not ratchet — but it puts
+the anchor off the ground and gets the toe-off lever arm wrong too.
+
+#### What follows
+
+* `v_z` is **observable** (the unobservable group is yaw x translation; neither
+  moves `v_z`), `p_z` is not. So this is not "an unobservable direction
+  drifting" — it is a *model* error producing a real velocity error in an
+  observable quantity, integrated into `p_z` where nothing can pull it back.
+* Re-seed cannot reach it: the damage is done at the **end** of stance and is
+  absorbed continuously; re-anchoring at the next touchdown just re-anchors
+  relative to an already-sunk base.
+* The contact **zero-velocity constraint** (`N^v`, the still-open TODO in
+  `correct.py`, named as Finding 2's "second independent candidate") would make
+  this **worse**: it asserts `ḋ_i = 0` harder, and that assertion is exactly
+  what is false during toe-off. Do not add it ungated.
+* `NIS/dof ~ 0.05` is real and is what lets the bias stand uncorrected, but it
+  is downstream of the model error, not the root.
+
+Re-seed is kept — correct, tested, cheap, and the right thing to have once the
+anchor model is right — but it is **off by default** and it is not the drift fix.
+
+### Finding 3 (2026-08-06): the rolling-anchor density fixes it — 5.5x to 9.5x
+
+`inEKF/contact.py::rolling_anchor_density` replaces the assertion ``ḋ_i = 0`` with
+what rigid-body kinematics actually says. For material points ``d_i`` and ``c`` of
+the same foot, ``ḋ_i = ċ + ω × (d_i − c)``, and no-slip contact gives ``ċ = 0``, so
+
+```
+ḋ_i = ω × r_i ,     r_i = d_i − c
+```
+
+``ω`` is **measured** (base gyro + the leg encoders' angular Jacobian, via a
+`jacfwd` that rides along with the one already computing ``∂y/∂q``). ``r_i`` is
+not — locating the patch is the hard problem. Modelling it as zero-mean with
+``Cov(r_i) = σ_r² I`` and pushing it through the known map ``r ↦ [ω]_× r``:
+
+```
+Sigma_C  +=  tau * sigma_r^2 * ( |w|^2 I_3  -  w w^T )
+```
+
+rank 2, null along ``ω``, identically zero when the foot is not rotating. `tau` is
+the one fudge: ``ω × r`` is coherent over the toe-off window (grows ``∝T``) while a
+Wiener process grows ``∝√T``, so approximating one by the other costs a factor of
+the disturbance's correlation time. Everything else is an identity.
+
+**Measured**, 20 s replays, `experiments/reseed_drift.py --arm all`,
+`tau = 0.25 s`, `sigma_r = 0.0985 m` (half the URDF foot), both **untuned** — the
+values fall out of the geometry:
+
+| | `flat_seed005` | | `flat_seed020` | |
+|---|---|---|---|---|
+| arm | drift m/s | final z | drift m/s | final z |
+| shipped | −0.0415 | −0.748 | −0.0551 | −1.125 |
+| touchdown reseed | −0.0420 | −0.758 | −0.0556 | −1.135 |
+| **rolling anchor** | **−0.0075 (0.18x)** | **−0.186** | **−0.0058 (0.11x)** | **−0.094** |
+
+Two independent confirmations that this is the right mechanism and not a lucky
+scale factor:
+
+* **The error changes *character*, not just size.** Both rollouts flip from
+  `LINEAR (biased)` to `SQRT (diffusive)` on the fit-residual test. That is the
+  predicted signature: removing a per-step ratchet should leave a random walk in
+  an unobservable direction, and it does. Nothing about fitting a magnitude
+  forces that outcome.
+* **The touchdown concentration collapses**, 3.0x → 0.2x on `seed020`. The
+  toe-off signature is gone from the error, which is what it means for the term
+  to have absorbed exactly the thing it was derived for.
+
+Horizontal odometry improves too (0.290 → 0.040 m on `seed005`), which it should:
+the same mis-attribution was feeding fore-aft error, it was just not the dominant
+axis.
+
+**Costs and caveats.**
+
+* `NIS/dof` falls further (0.315 → 0.058). Expected — we added process noise —
+  and it confirms the two diagnostics are independent: this term fixes the
+  **ratio** `P_pp : P_dd` (attribution), and does nothing for the **scale** of
+  `S` (calibration). The calibration work is still open and is now the dominant
+  remaining defect.
+* Compile cost: fold ``∂C/∂q`` into the existing `jacfwd` over ``∂y/∂q``. A
+  separate `jvp` on a separate FK function stages out a second MJX kinematics
+  graph and the step stopped compiling inside a 45 s budget at all.
+* `rolling.enabled: false` by default, and `with_omega` is consumed at **build**
+  time by `_make_contact_kinematics`, so a disabled build never stages the extra
+  differentiation. Verified **bit-identical** to the pre-reseed checkout over
+  20000 ticks x 3 axes with both features present.
+* Only tested at N=2 on flat ground. `sigma_r` is a scalar prior; the N=8 story
+  (differences of corner innovations cancel ``ξ_p``, making ``r_i`` observable
+  rather than merely bounded) is untested.
+
+<details><summary>Original (superseded) Finding 2 hypothesis</summary>
+
 ### Finding 2 (OPEN): the missing touchdown reseed costs ~2 m of height per 30 s of walking
 
 Residual drift after Finding 1 is **almost entirely vertical**, linear at ~0.09 m/s; horizontal
@@ -1546,6 +1714,8 @@ already specifies the congruence and the zero-release property. Second, independ
 still-deferred contact zero-velocity constraint (`J_dot = 0`, `inEKF/filter.py`).
 
 Neither reaches the policy — base position and velocity are not in the 98-term observation.
+
+</details>
 
 ## G10 (part) — viewer tooling: ORT pinning, the ghost, threading, GPU (2026-07-27)
 
