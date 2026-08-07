@@ -216,6 +216,7 @@ class JointKFParams(NamedTuple):
     # stance anchors
     anchor_var: float               # Sigma_eps -- ContactNet injection point
     sigma_qd_unfiltered: float      # [rad/s]
+    anchor_rate_gain: float         # dimensionless; 0 == shipped constant Sigma_eps
     # direct velocity channel
     direct_velocity_enabled: bool
     lag_slew_smoothing_hz: float    # [Hz]
@@ -250,6 +251,7 @@ def default_params(**overrides: Any) -> JointKFParams:
         init_bias_var=cfg["init"]["bias_var"],
         anchor_var=cfg["anchor_var"],
         sigma_qd_unfiltered=cfg["sigma_qd_unfiltered"],
+        anchor_rate_gain=cfg["anchor_rate_gain"],
         direct_velocity_enabled=cfg["direct_velocity_enabled"],
         lag_slew_smoothing_hz=cfg["lag_slew_smoothing_hz"],
         r_large=cfg["r_large"],

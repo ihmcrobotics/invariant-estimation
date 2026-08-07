@@ -204,6 +204,24 @@ joint_kf:
   # noise straight into the base gyro-bias the InEKF depends on.
   sigma_qd_unfiltered: 0.1        # [rad/s]  [test-locked]
 
+  # Foot-rotation slip schedule for Sigma_eps (OPTIONAL, default OFF).
+  #     Sigma_eps = (anchor_var + (anchor_rate_gain * |omega_foot_meas|)^2) I3
+  # The anchor asserts a trusted stance foot's angular rate is ZERO. That is exact
+  # standing (measured +0.0005 rad/s mean) and false walking: the foot rolls
+  # heel->toe at +0.55 rad/s mean, 1.51 rms, against an effective sigma of
+  # 0.102 rad/s -- a 5.4-sigma DC violation. The filter disposes of it through the
+  # only states the anchor row touches (its q columns are identically zero), so it
+  # lands on qdot (-0.25 rad/s DC on both knees) and on the gyro bias (||b||=0.377
+  # with NO injected bias). This term reweights the anchor by how fast the foot is
+  # actually rotating -- measured, from the base gyro and the leg encoders.
+  #
+  # It must never DISABLE the anchor: that row is the only absolute observation of
+  # gyro bias in the filter (the IMU-pair block has an exact 3-D common-mode gauge
+  # nullspace), so an over-large gain reintroduces unbounded pelvis pitch drift.
+  #
+  # 0.0 == the shipped constant Sigma_eps, bit-for-bit.
+  anchor_rate_gain: 0.0           # dimensionless
+
   # -- Direct joint-velocity channel (OPTIONAL, default OFF for sim v1) ------
   # Lag inflation R_ii = sigma_i^2 + (dhat_i/omega_eff)^2. The firmware low-pass
   # makes qd^meas a LAGGED measurement; for a first-order filter u - y = ydot/w_c

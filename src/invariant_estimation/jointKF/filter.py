@@ -72,12 +72,24 @@ class SensorInputs(NamedTuple):
     contact : (K,)
         This tick's contact/trust signal per anchor slot. Consumed on the NEXT
         tick — see the module docstring on phase ordering.
+    encoders_vel : (n,), optional
+        Measured velocities of the FILTERED joints, in filter state order. Read
+        only by the stance-anchor slip schedule (`anchors.anchor_slip_from_rate`)
+        and only on a build with ``params.anchor_rate_gain > 0``. Optional — the
+        `()` default is an EMPTY PYTREE, so an unpopulated field costs `lax.scan`
+        no time axis, and a fixture that does not supply it still satisfies the
+        contract.
+
+        Note this is the raw encoder velocity, NOT the filter's `q̇` state. The
+        schedule exists because the anchor corrupts that state, so reading it
+        back here would close a loop on the filter's own error.
     """
 
     encoders: Array
     gyros: Array
     qd_unfiltered: Array
     contact: Array
+    encoders_vel: Array = ()
 
 
 class ModelInputs(NamedTuple):
@@ -179,6 +191,12 @@ def step(
         gyro_base=sensors.gyros[build.base_imu],
         qd_unfiltered=sensors.qd_unfiltered,
         trusted_feet=carry.trusted_feet,
+        # `()` (the unpopulated default) reaches `anchor_block` as None, so a
+        # caller that never wired it keeps the shipped constant Sigma_eps; with
+        # the schedule enabled, `anchor_block` raises rather than silently
+        # reverting. Not `or None` -- a populated array is ambiguous under truth.
+        encoders_vel=(None if isinstance(sensors.encoders_vel, tuple)
+                      else sensors.encoders_vel),
     )
     stacked = measure.build_stacked(
         build, params, gyros=sensors.gyros,

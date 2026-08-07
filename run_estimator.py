@@ -383,7 +383,8 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
                         stance_chol=1.0e-4, swing_chol=1.0e1,
                         contact_fk_unfiltered=True, est_every=1, verbose=True,
                         threaded=False, max_backlog_ticks=2,
-                        contactnet=None, contactnet_norm=None, contacts_per_foot=1):
+                        contactnet=None, contactnet_norm=None, contacts_per_foot=1,
+                        anchor_rate_gain=None):
     t0 = time.time()
     policy = rp.load_policy(policy_name)
     m = rp.build_sim_model(policy, with_visuals=with_visuals, with_imu_sensors=True)
@@ -393,7 +394,7 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
     dt = est_dt or rp.DT * est_every
     fused = me.build_alex_fused_estimator_from_urdf(
         urdf, contacts_per_foot, dt=dt, contact_meas_var=contact_meas_var,
-        contact_fk_unfiltered=contact_fk_unfiltered)
+        contact_fk_unfiltered=contact_fk_unfiltered, anchor_rate_gain=anchor_rate_gain)
     reader = SimSensorReader(m, fused, foot_geoms=rp.FOOT_GEOMS, dt=dt, noise=noise,
                              stance_chol=stance_chol, swing_chol=swing_chol)
     if verbose:
@@ -532,6 +533,13 @@ if __name__ == "__main__":
     ap.add_argument("--contact-meas-var", type=float, default=0.0,
                     help="isotropic floor on the InEKF contact measurement noise "
                          "(flight uses 1e-4; the port default is 0)")
+    ap.add_argument("--anchor-rate-gain", type=float, default=None, metavar="C",
+                    help="stance-anchor slip schedule: Sigma_eps = (anchor_var + (C*|omega_foot|)^2)*I3. "
+                         "The anchor asserts a trusted foot's angular rate is ZERO, which is a 5.4-sigma "
+                         "lie during gait (true rate 0.55 rad/s mean vs sigma 0.102) and lands on qdot "
+                         "and the gyro bias. C=0 (default, from filter_cfg.yaml) is the shipped constant. "
+                         "NOTE the anchor is the only absolute gyro-bias observation in the filter -- an "
+                         "over-large C reintroduces unbounded pelvis pitch drift.")
     ap.add_argument("--contact-fk", choices=("measured", "pinned"), default="measured",
                     help="whether the InEKF's contact FK uses the MEASURED off-path joints "
                          "(the ankles) or pins them at qpos0 as the library default does")
@@ -598,7 +606,8 @@ if __name__ == "__main__":
         contact_fk_unfiltered=(args.contact_fk == "measured"), est_every=args.est_every,
         threaded=args.realtime, max_backlog_ticks=args.max_backlog_ticks,
         contactnet=args.contactnet, contactnet_norm=args.contactnet_norm,
-        contacts_per_foot=args.contacts_per_foot)
+        contacts_per_foot=args.contacts_per_foot,
+        anchor_rate_gain=args.anchor_rate_gain)
     # The ghost draws into an `mjvScene`. The viewer has one; so does an offscreen
     # `mujoco.Renderer`, so --ghost now composes with --video (that is how the
     # validation recording is made). It still has nothing to draw into on a bare

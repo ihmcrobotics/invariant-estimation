@@ -407,6 +407,7 @@ def build_fused_estimator(
     accel_var: float | None = None,
     contact_var: float | None = None,
     contact_fk_unfiltered: bool = False,
+    anchor_rate_gain: float | None = None,   # None => config; 0.0 == shipped constant Sigma_eps
 ) -> FusedEstimator:
     """Assemble the joint KF + InEKF into one fused estimator (plain Python, I7).
 
@@ -450,7 +451,10 @@ def build_fused_estimator(
         tree, imu_sites, pairs, foot_sites,
         base_imu=base_imu, use_mass_matrix=True, use_armature_for_rotor=True,
     )
-    params = default_params(dt=dt, imu_bias_process_var=imu_bias_process_var)
+    params = default_params(
+        dt=dt, imu_bias_process_var=imu_bias_process_var,
+        **({} if anchor_rate_gain is None else {"anchor_rate_gain": anchor_rate_gain}),
+    )
 
     K = len(foot_sites)
     ekf = inekf_mod.create(
@@ -643,6 +647,10 @@ def make_fused_step(fused: FusedEstimator) -> Callable:
             gyros=sensors.gyros,
             qd_unfiltered=sensors.qd_unfiltered,
             contact=sensors.contact,
+            # Forwarded verbatim, `()` sentinel included: the stance-anchor slip
+            # schedule needs the MEASURED filtered-joint velocity, and this is
+            # the only conversion point where it can be handed across.
+            encoders_vel=sensors.encoders_vel,
         )
         jkf_carry, jkf_diag = jkf.step(jkf_carry, jkf_sensors, model_in, build, params)
         q_hat, qd_hat, bias = split_x(jkf_carry.state.x, n)

@@ -319,3 +319,120 @@ helps most (0.057 → 0.040).
 Runs: `results/2026-08-06_*_{A_l2vel,B_l2velpos,C_l2velori,D_l2velposori}/`
 (each with `summary.json`, `training.png`, `validation.png`); combined summary in
 `results/l2_options_summary.png`.
+
+---
+
+# Stance-anchor slip schedule — wiring `Sigma_eps` into the joint KF (2026-08-06)
+
+> ## VERDICT: **the joint-KF defect is real and fixed; the sink is untouched.**
+>
+> The stance anchor asserts a trusted stance foot's angular rate is ZERO. That is
+> exact standing (+0.0005 rad/s mean) and false walking (+0.55 mean, 1.51 rms)
+> against an effective sigma of 0.102 rad/s — a **5.4-sigma DC violation**. The
+> anchor row's `q` columns are identically zero, so the filter can only absorb it
+> into `qdot` or the gyro bias, and it does both: a **-0.21 to -0.26 rad/s DC error
+> on the knees** and a phantom **||b|| = 0.36** in a sim whose true injected bias is
+> 0.042. Reweighting `Sigma_eps` by the MEASURED foot rotation rate removes
+> **18-38x** of the velocity error and **12-34x** of the bias error, costs nothing
+> horizontally, and **does not move the vertical sink at all** — which is what the
+> null-space analysis predicted in advance, not a disappointment discovered after.
+
+## The change
+
+`Sigma_eps = (anchor_var + (c * |omega_foot_meas|)^2) * I3`, per anchor slot, with
+
+    omega_foot_meas = gyro_base + J_U qd_unfiltered + J_F encoders_vel
+
+**fully measured** — never the filter's own `qdot`, which is the corrupted quantity;
+reading it back would be a feedback loop that looks *better* on a tracking metric
+while being structurally wrong (`test_inflation_never_reads_the_filters_own_qdot`).
+
+`anchor_rate_gain` (config, default **0.0** = bit-identical to shipped). `Sigma_eps`
+was already ContactNet's designed second injection point (CLAUDE.md §7) and
+`anchors.anchor_noise` already accepted it — **no caller had ever passed it**. The
+plumbing gap was one line: `encoders_vel` exists on `FusedSensors` and had never been
+copied into `jkf.SensorInputs`.
+
+## Experiment 1 — open-loop fused replay, 20 000 ticks, N=8
+
+Worst per-joint DC `qdot` error [rad/s] and `||b - b_true||`:
+
+| rollout | gain 0 | gain 0.35 |
+|---|---|---|
+| `flat_n8fix_seed000` | 0.2302 / 0.2631 | **0.0060 / 0.0077** (38x / 34x) |
+| `flat_n8fix_seed012` | 0.2649 / 0.2861 | **0.0144 / 0.0129** (18x / 22x) |
+
+Per-joint DC error at gain 0 (seed000): `L.KNEE -0.2110`, `R.KNEE -0.2302`, everything
+else under 0.05. The defect is knee-dominated and stable across rollouts.
+
+**Gauge check (the one that mattered):** `||b||` goes to **0.0423 against an injected
+truth of 0.0420**, instead of 0.273. The anchor still recovers the real bias — it has
+stopped manufacturing a phantom. This is "reweight, never delete": the anchor is the
+only absolute gyro-bias observation in the filter, and a schedule that effectively
+disabled it would reopen the 3-D common-mode gauge.
+
+The response **plateaus** over gain 0.2-1.0 and is slightly *worse* at 1.0 — a genuine
+reweighting, not a disguised switch-off. Operating point 0.35 chosen mid-plateau.
+
+## Experiment 2 — closed loop, arm D's ContactNet, no retraining
+
+| | c1 g=0 | c1 g=0.35 | c2 g=0 | c2 g=0.35 |
+|---|---|---|---|---|
+| vertical drift [m/s] | -0.01774 | -0.01743 | -0.01273 | -0.01319 |
+| final z [m] | -0.5128 | -0.5063 | -0.3854 | -0.3975 |
+| update-deposited [m] | -0.1818 | -0.1718 | -0.1989 | -0.1924 |
+| horiz / path length | 0.84% | **0.77%** | 0.15% | **0.09%** |
+| `qd_err` (max/tick) | 0.3770 | **0.1698** | 0.3936 | **0.1631** |
+| `\|\|b\|\|` | 0.3599 | **0.0281** | 0.3600 | **0.0305** |
+| signature | LINEAR | LINEAR | LINEAR | LINEAR |
+
+c1 = `vx 0.4`; c2 = `vx 0.4, yaw 0.3`. Horizontal error is normalised by **ground-track
+path length**, not net displacement — in the turning condition the robot walks a circle
+(12.3 m of path for 2.5 m of displacement) and displacement inflates the ratio ~5x.
+
+## Reading it
+
+1. **The sink is unchanged, by prediction.** 1.8% better on c1, 3.6% worse on c2 — noise
+   in both directions. The contact Jacobian at N=8 has rank 24 of 33 with a **9-D null
+   space** containing common-mode base+anchor translation; an error already deposited
+   there produces zero innovation and is therefore never removed, for **any** `P` or
+   `Sigma_C`. Cleaning an upstream input cannot reach it. The update-deposited component
+   stays in the -0.17..-0.21 m band it has occupied across every arm and condition
+   measured so far.
+2. **The joint-KF defect is genuinely fixed.** `||b||` collapses 12.8x in closed loop and
+   `qdot`'s DC error 18-38x in replay. This matters beyond the sink: `qdot` feeds the
+   InEKF's `Sigma_qdot` and ContactNet's input features, and `b` feeds the InEKF's
+   propagation directly.
+3. **It costs nothing.** Horizontal accuracy slightly improved in both conditions, tilt
+   unchanged. Contrast the rolling-anchor density, which bought a condition-dependent
+   vertical gain and paid 6-9x horizontally.
+
+## Caveats
+
+* **Two rollouts, two conditions, deterministic runs** (`--imu-noise` off). No distribution.
+* `qd_err` in the closed-loop npz is a **max over joints per tick**, so it carries the
+  noise floor; that is why it shows 2.2x where the per-joint DC error shows 18-38x. The
+  two are consistent, not contradictory.
+* **The gain is not calibrated**, only bracketed: 0.2-1.0 are indistinguishable on two
+  rollouts. A per-foot or anisotropic `Sigma_eps` (inflating only about the roll axis)
+  is the obvious refinement and is deliberately NOT built — that exact rank-2 shape is
+  what cost 6-9x horizontally on the InEKF contact density.
+* Arm D's checkpoint was trained through the **unfixed** filter. These numbers therefore
+  measure the fix's effect on a net that had already adapted to the defect; a retrained
+  net could do better or worse.
+
+## Recommended next
+
+1. **Adopt the schedule** at `anchor_rate_gain = 0.35` — it fixes a measured 5.4-sigma
+   model violation, costs nothing, and is off by default until flipped.
+2. **Retrain ContactNet through the fixed filter.** The frozen `inputs.*` in every pool
+   carry the old joint KF's `qdot` and bias, so the pools must have their `inputs.*`
+   re-derived first (the raw `sensors.*` are still valid — no re-collection).
+3. **Do not expect the sink to move** from anything upstream. It needs `ker H` attacked
+   directly: a moving contact mean (`d_dot = omega x r`, which requires the patch
+   location and a group-affinity derivation first) or the base-vs-anchor injection ratio.
+4. **Port to Java** only after (1) and (2): `JointLevelKFPreFilter` anchor loop L1826-1875
+   takes a constant where this needs a per-foot, per-tick covariance.
+
+Runs: `experiments/anchor_slip_sweep.py`; `results/slip_c{1,2}_g{0.0,0.35}.npz`.
+Derivation: `~/Documents/filter-debugging/sink-derivation.pdf`.

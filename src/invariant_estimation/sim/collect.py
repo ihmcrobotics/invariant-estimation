@@ -94,7 +94,8 @@ class Collector:
 
 def build_collector(policy_name: str = "baseline", *, dt: float = None,
                     chunk_ticks: int = 10_000, contact_meas_var: float = 0.0,
-                    contacts_per_foot: int = 1, verbose: bool = True) -> Collector:
+                    contacts_per_foot: int = 1, anchor_rate_gain: float | None = None,
+                    verbose: bool = True) -> Collector:
     """Load the policy and build the fused estimator.
 
     contact_fk_unfiltered=True is NOT optional: without it FusedSensors.q_unfiltered
@@ -107,7 +108,8 @@ def build_collector(policy_name: str = "baseline", *, dt: float = None,
     policy = rp.load_policy(policy_name)
     fused = me.build_alex_fused_estimator_from_urdf(
         rp.cycloid_forearm_urdf(rp.URDF), contacts_per_foot=contacts_per_foot, dt=dt,
-        contact_meas_var=contact_meas_var, contact_fk_unfiltered=True)
+        contact_meas_var=contact_meas_var, contact_fk_unfiltered=True,
+        anchor_rate_gain=anchor_rate_gain)
     c = Collector(policy=policy, fused=fused, dt=dt, chunk_ticks=int(chunk_ticks),
                   policy_name=policy_name, build_s=time.time() - t0)
     if verbose:
@@ -319,6 +321,13 @@ def collect_rollout(seed: int = 0, seconds: float = 60.0, *,
         "stance_chol": float(stance_chol),
         "swing_chol": float(swing_chol),
         "contact_meas_var": float(c.fused.contact_meas_var),
+        # Read from the EFFECTIVE params, never load_config(): the YAML can be
+        # edited between collection and training, and this pool's frozen
+        # `inputs.*` were produced by the joint KF as configured HERE. A pool
+        # collected under one anchor schedule and trained against another is the
+        # same silent, shape-valid mismatch the contact-geometry guard exists for.
+        "anchor_rate_gain": float(c.fused.params.anchor_rate_gain),
+        "anchor_var": float(c.fused.params.anchor_var),
         "chunk_ticks": int(c.chunk_ticks),
         "travelled_m": travelled,
         "tilt_max_deg": float(tilt.max()),

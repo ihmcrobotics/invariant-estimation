@@ -120,6 +120,7 @@ __all__ = [
     "unfiltered_dof",
     "anchor_jacobians",
     "anchor_noise",
+    "anchor_slip_from_rate",
     "anchor_block",
 ]
 
@@ -319,6 +320,71 @@ def anchor_noise(
     return jnp.where(active[:, None, None], R_on, R_off)
 
 
+def anchor_slip_from_rate(
+    build: JointKFBuild,
+    params: JointKFParams,
+    jac: AnchorJacobians,
+    *,
+    gyro_base: ArrayLike,
+    qd_unfiltered: ArrayLike,
+    encoders_vel: ArrayLike,
+) -> Array:
+    r"""``Sigma_eps = (anchor_var + (c |omega_foot|)^2) I3`` per anchor, ``(K,3,3)``.
+
+    Why
+    ---
+    The anchor row asserts ``omega_foot ~ 0`` (see `anchor_block`).  That is exact
+    for a foot resting flat and static — measured on Alex at **+0.0005 rad/s mean,
+    0.005 rms** while standing — and false during gait, where the foot rolls
+    heel->toe at **+0.55 rad/s mean, 1.51 rms** through trusted stance, against an
+    effective ``sigma_x`` of 0.102 rad/s.  A 5.4-sigma DC violation is a wrong
+    model, not bad luck, and the filter has nowhere honest to put it: this row's
+    ``q`` columns are identically zero, so it is absorbed by ``qdot`` (a measured
+    -0.25 rad/s DC error on both knees) and by the gyro bias (``||b|| = 0.377``
+    in a sim with *no* injected bias).
+
+    This term reweights the assertion by how fast the foot is *actually* rotating.
+
+    The rate is **fully measured** — base gyro plus both halves of the leg chain::
+
+        omega_foot_meas = omega_base + J_U qdot_U + J_F qdot_F^enc
+
+    all three already in the base-IMU frame by construction of `anchor_jacobians`.
+    ``qdot_F`` is taken from the **encoders**, never from the filter's own
+    ``qdot`` state: that state is the quantity this defect corrupts, so feeding it
+    back here would close a loop on the filter's own error.  Same discipline as
+    the anchor's raw (bias-uncorrected) ``gyro_base``.
+
+    Properties, all asserted in `tests/jointKF/test_anchor_slip.py`:
+
+    * ``anchor_rate_gain = 0`` reproduces the shipped constant **bit-for-bit**
+      (``x + 0.0 == x``), which is what lets every existing anchor oracle stand;
+    * identically the shipped value at ``omega_foot = 0`` — flat stance untouched,
+      self-gating on a measured quantity, no threshold and no schedule;
+    * monotone non-decreasing in ``|omega_foot|``, and PSD-ordered above the
+      constant path: this may only ever make the anchor *less* informative.
+
+    It stays **isotropic** deliberately.  The anisotropic (rank-2, null along
+    ``omega``) form is more faithful to the geometry, but that exact shape was
+    measured on the InEKF contact density and cost 6-9x in horizontal drift; do
+    not reach for it here without re-measuring that.
+
+    Returns
+    -------
+    Array, shape (K, 3, 3)
+    """
+    eye3 = jnp.eye(3, dtype=jnp.float64)
+    J_F = jnp.asarray(jac.filtered, dtype=jnp.float64)
+    J_U = jnp.asarray(jac.unfiltered, dtype=jnp.float64)
+    omega = (
+        jnp.asarray(gyro_base, dtype=jnp.float64)[None, :]
+        + jnp.einsum("kic,c->ki", J_U, jnp.asarray(qd_unfiltered, dtype=jnp.float64))
+        + jnp.einsum("kic,c->ki", J_F, jnp.asarray(encoders_vel, dtype=jnp.float64))
+    )                                                            # (K,3)
+    extra = (params.anchor_rate_gain * jnp.linalg.norm(omega, axis=-1)) ** 2   # (K,)
+    return (params.anchor_var + extra)[:, None, None] * eye3
+
+
 def anchor_block(
     build: JointKFBuild,
     params: JointKFParams,
@@ -327,6 +393,7 @@ def anchor_block(
     gyro_base: ArrayLike,
     qd_unfiltered: ArrayLike,
     trusted_feet: ArrayLike,
+    encoders_vel: ArrayLike | None = None,
     sigma_eps: ArrayLike | None = None,
 ) -> AnchorBlock:
     r"""Build the ``(H, z, R)`` anchor block — Java's anchor loop, fixed-shape.
@@ -346,8 +413,16 @@ def anchor_block(
         Non-zero means trusted; the value itself is not used as a weight, because
         the Java trusted set is boolean and partial trust is expressed upstream
         (the Schmitt trigger) rather than by softening the anchor.
+    encoders_vel : Array, shape (n,), optional
+        Measured velocities of the FILTERED joints, in filter state order.  Read
+        only by the `anchor_slip_from_rate` schedule, and only on a build with
+        ``params.anchor_rate_gain > 0``.  Optional so a caller that does not wire
+        it keeps the shipped behaviour; a build with the schedule on and this
+        unset fails loudly rather than silently reverting to the constant.
     sigma_eps : Array, shape (K, 3, 3), optional
-        See `anchor_noise`.
+        See `anchor_noise`.  Takes precedence over the `anchor_rate_gain`
+        schedule: an explicit value is the LEARNED provider (CLAUDE.md §7), and a
+        learned Sigma_eps must never be silently overwritten by the analytic one.
 
     Returns
     -------
@@ -371,6 +446,25 @@ def anchor_block(
 
     H = jnp.concatenate([jnp.zeros((K, 3, n), dtype=jnp.float64), -J_F, bias_block], axis=2)
     z = gyro_base[None, :] + jnp.einsum("kic,c->ki", J_U, qd_u)
+
+    # Sigma_eps precedence. The `params.anchor_rate_gain` test is a BUILD-TIME
+    # Python branch, not a traced one (I7): every caller passes `JointKFParams`
+    # concretely -- `make_fused_step` closes over `fused.params` -- so a disabled
+    # build traces the identical pre-schedule graph. Same shape as the
+    # `contact_fk_unfiltered` flag in `pipeline/main_estimator.py`.
+    #   1. explicit sigma_eps  -> the LEARNED provider, always wins;
+    #   2. else the analytic rate schedule, if anchor_rate_gain > 0;
+    #   3. else anchor_noise's own constant anchor_var * I3.
+    if sigma_eps is None and params.anchor_rate_gain > 0.0:
+        if encoders_vel is None:
+            raise ValueError(
+                "anchor_rate_gain > 0 needs `encoders_vel` (the measured filtered-joint "
+                "velocities); pass it, or set anchor_rate_gain=0 for the shipped constant."
+            )
+        sigma_eps = anchor_slip_from_rate(
+            build, params, jac,
+            gyro_base=gyro_base, qd_unfiltered=qd_u, encoders_vel=encoders_vel,
+        )
 
     # Inactive: residual AND rows zeroed, R -> r_large * I3 (never zeroed).
     H = H * active[:, None, None]
