@@ -584,6 +584,77 @@ CUDA too — the pin is precaution, not a workaround for a known failure.) Note 
 all extras, so `uv.lock` carries a large `nvidia-*` block even though a default `uv sync`
 downloads none of it.
 
+### Where the height drift comes from: `experiments/z_budget.py`
+
+The InEKF sinks while walking. `z_budget.py` runs the same closed loop with an
+instrumented InEKF step and prints an **exactly closing** ledger — every metre of
+`p̂_z − p_z^true` assigned to one of the three places the filter writes height
+(seed, propagation, the two `exp(−ξ)` updates), with the dominant velocity term
+expanded through its own closing sub-budget. Closure is asserted at 1e-11; the
+numbers are attributions, not differences of runs.
+
+```bash
+uv run python experiments/z_budget.py --ticks 1500 --vx 0.4 --verify
+uv run python experiments/z_budget.py --ticks 1500 --vx 0.4 --contacts-per-foot 4  # deployed N=8
+uv run python experiments/z_budget.py --ticks 1500 --vx 0.4 --x0 50   # world-origin lever test
+uv run python experiments/z_budget.py --ticks 1500 --vx 0.0           # standing control (~0 drift)
+```
+
+`--verify` re-runs the **shipped** `inEKF/filter.make_step` over the recorded boundary
+inputs and asserts bit-equality with the instrumented copy. The tracing step is a
+literal copy of the shipped one, so **run `--verify` after touching either file** —
+it is the only thing keeping them honest. `--out FILE.npz` writes the raw per-tick
+record plus every budget term.
+
+Findings and the full influence map: `docs/notes/inekf_z_influence_map.md`.
+Headline: at N=2 the contact FK update is 98.6% of the sink and 86% of that arrives
+through the *velocity* channel, which `H` has no columns for; the IMU lever arm is
+0.05% and gravity leveling has the wrong sign to be a cause.
+
+### Sweeping conditions and pooling across seeds
+
+`z_budget.py` also takes the knobs a drift study needs, so one tool covers the whole
+matrix. The ones that mattered:
+
+```bash
+--contactnet P.npz --contactnet-norm N.npz   # score a trained ContactNet checkpoint
+--dwell 0.08                                 # contact-trust entry debounce [s]
+--contact-meas-var 1.0e-4                    # the R floor (main_estimator.py landmine #2)
+--contact-source oracle                      # MuJoCo contact truth instead of the trigger
+--terrain hard_stepping --terrain-seed 0     # heightfield worlds
+--vx 0.6 --yaw 0.3                           # command; --imu-noise --noise-seed K
+```
+
+Records go to `--out FILE.npz`; pool them with `z_summarise.py`, which groups by
+everything except the `_s<seed>` suffix and reports mean ± spread:
+
+```bash
+uv run python experiments/z_summarise.py results/dwell results/terrain --detection
+uv run python experiments/z_summarise.py results/rfloor --ledger   # per-term budget
+```
+
+Two companion tools: `z_authority.py` reports `‖∇_θ D‖` and `cos(∇_θ D, ∇_θ L)` for a
+drift functional `D` (and can optimise a checkpoint *directly against drift*, which is
+how the Σ_C authority ceiling was measured); `b_phase.py` computes the phase-R² of
+`log tr Σ_C` on a Fourier basis of gait phase — the stride-clock check.
+
+**Four gotchas, each of which produced a wrong number before it was caught:**
+
+* **The heightfield is ±8 m.** At `vx=0.4` a 30 s run walks off it and the robot
+  falls, while the `.npz` still looks well-formed. Terrain runs use `--ticks 700`
+  (14 s); `z_summarise.py` has a fall detector that judges the **true** state only.
+* **Run one closed-loop sweep at a time** (two are fine, three saturate 20 cores).
+  The sweep drivers in `experiments/*.sh` serialise themselves by polling for each
+  other — but never `pkill -f` a pattern that also matches your own shell.
+* **`--settle`** (default 20 s) makes `z_summarise.py` skip `.npz` files written very
+  recently: numpy will happily read a half-flushed file and give different numbers on
+  two consecutive reads.
+* **A lever that improves drift monotonically may be tuning a cancellation.** Drift
+  crosses zero in `contact_meas_var`, so its flat-ground optimum drifts *upward* on
+  terrain. Check the **sign across conditions**, not just the magnitude on one.
+
+The overnight study built on all of this: `.claude-reports/2026-08-07-contact-fk-z-drift.md`.
+
 ### Watching the estimate: the ghost, and `--realtime`
 
 ```bash
