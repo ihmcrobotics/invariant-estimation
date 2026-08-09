@@ -32,12 +32,23 @@ while pgrep -f "l_ablation_ladder.sh" > /dev/null 2>&1; do
 done
 log "ladder finished; starting the L=1024 column with remat ON"
 
-# Do NOT gate on the earlier columns succeeding: L=1024 is the column that tests the
-# stride-crossover prediction, and it is worth having even if one of the shorter
-# cells needs a re-run. The ladder skips completed cells, so nothing is redone.
-LVALS=1024 REMAT=on STEPS="${STEPS:-6000}" OUT_ROOT="${OUT_ROOT}" \
-  ARMS="${ARMS:-A_l2vel C_l2velori}" \
-  bash scripts/l_ablation_ladder.sh
+# HELD, 2026-08-09. The L=1024 column is NOT launched automatically any more.
+#
+# Two reasons. (1) The trimmed column (A, C) cannot test the hypothesis it exists
+# for: the stride-crossover argument is about a POSITION loss term distinguishing
+# accumulated DC drift from bounded gait oscillation, and neither l2_velocity nor
+# l2_vel_ori has a position term at any horizon. The arms carrying the mechanism are
+# B (l2_vel_pos) and D. (2) Measured returns are decaying: RMSE -14.5% then -5.4%
+# per doubling, NEES_z saturated at ~2.0 between L=256 and 512, NIS/dof flat at
+# ~0.18 across every L. Committing 19 h on that basis is not warranted before we
+# have drift numbers.
+#
+# So: measure drift on the finished cells, then STOP and let a human choose. If the
+# column is run, the informative design is A (control: loss blind to accumulation)
+# vs B (treatment: loss that can see it) -- not A vs C.
+log "grid finished; measuring drift on the completed cells"
+uv run --extra gpu python scripts/drift_backfill.py --root "${OUT_ROOT}" 2>&1 | tee -a "$LOG"
 rc=$?
-log "L=1024 column finished (exit ${rc})"
+log "drift backfill finished (exit ${rc}); L=1024 is HELD pending that result."
+log "  to run it:  ARMS='A_l2vel B_l2velpos' LVALS=1024 REMAT=on bash scripts/l_ablation_ladder.sh"
 exit $rc
