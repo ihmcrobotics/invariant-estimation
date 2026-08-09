@@ -210,6 +210,86 @@ Last validated run (flat ground, seeds 0–3 train / 4–5 held out): velocity R
 **0.086 → 0.028 m/s**, NEES **19.4 → 1.05** vs the analytic `contact_chol`
 baseline. Full numbers and caveats (flat-terrain only, etc.) in `RESULTS.md`.
 
+> **The deadline split is a confound.** Each arm gets an equal slice of the
+> *remaining* time, and caches warm as the night goes on, so the arms do not get
+> equal **steps** (the 2026-08-06 run: A 7639 → D 9839, +29%). Do not compare arms
+> from this script without checking `steps_run` in each `summary.json`. Use
+> `scripts/l_ablation_ladder.sh` below when you need a matched-step comparison.
+
+### BPTT length `L`, rematerialization, and the contact R floor
+
+Three knobs on `run_contactnet.py` that the loss ladder does not touch:
+
+| flag | default | what it does |
+|---|---|---|
+| `--L` | 128 | BPTT segment length in **ticks** — how far the gradient traverses the InEKF scan. Independent of `H` (history per network evaluation). |
+| `--remat` / `--no-remat` | `True` | Wrap the scan body in `jax.checkpoint(prevent_cse=False)`. |
+| `--contact-meas-var` | `1e-4` | InEKF contact-measurement noise floor (`main_estimator` "landmine #2"). |
+
+**`L` is a memory axis, not just a horizon.** Reverse-mode AD stores the scan's
+per-tick residuals, so activation memory is `O(L × residuals-per-tick)`; at N=8 the
+body's interior (`Φ`, `Ad_X̂`, `Q_d`, `H`, `S`, `K`, the Joseph products — all
+33-square) dwarfs the ~9 kB carry crossing each tick. `remat` saves only the carry
+and recomputes the interior on the backward pass: `O(L × carry)` memory for one
+extra forward evaluation of the body. It is **identity, not an approximation** —
+`tests/contactnet/test_remat.py` pins the gradients to 1e-9 relative and pins the
+noise floor at bit-equality, so a truncated backward pass cannot hide in it.
+
+> **`remat` was a dead flag until 2026-08-08.** `make_segment_loss` accepted it,
+> documented it, and never applied it, so all four 2026-08-06 arms trained with no
+> rematerialization while their `summary.json` said `remat: true`. `summary.json`
+> now records `remat` and `contact_meas_var` explicitly, and `test_remat.py`
+> asserts the primitive is actually in the jaxpr. Measure before choosing:
+>
+> ```bash
+> uv run --extra gpu python scripts/remat_probe.py     # temp/peak MB + s/step per L
+> ```
+
+Measured on the RTX 4070 (12 GB), N=8, B=32, `n8fix`, 2026-08-08 — `temp` is compiled
+scratch for the train step, `peak` is the runtime device high-water mark:
+
+| L | peak MB (off) | peak MB (on) | s/step (off) | s/step (on) |
+|---|---|---|---|---|
+| 128 | 1310 | 672 | 0.457 | 0.523 |
+| 256 | 2371 | 1081 | 0.958 | 1.123 |
+| 512 | 5201 | 2619 | 2.047 | 2.351 |
+
+remat buys a consistent **~2× memory for ~1.16× time**. The operational conclusion:
+**L=512 fits on this card without remat** (5.2 GB against ~11.4 GB free), so remat is
+headroom rather than a requirement up to L=512 — it is what makes L=1024 (≈10 GB raw)
+practical. Note `peak_bytes_in_use` never resets within a process, which is why the
+probe runs each cell in its own subprocess; measuring both cells in one process
+reports the first one twice.
+
+**The R floor.** `--contact-meas-var` defaults to `0.0` inside `build_collector`
+(the port's original behaviour); `run_contactnet.py` now passes `1e-4`, the tuned
+value from the 2026-08-07 z-drift study — the one config lever ContactNet
+measurably responds to (+31.1%). **Do not raise it to `1e-2`:** that is a
+flat-ground cancellation which drifts *upward* on both terrains. The contact-trust
+`dwell` knob from the same study is deliberately **not** set here: ContactNet is
+measured immune to it (0.9%, it overwrites `contact_chol`), and the
+`contact_trust` block in `config/filter_cfg.yaml` is not wired on this branch —
+nothing in `src/` reads it and `sim/sensors.ContactTrust` hardcodes `dwell=0.04`.
+
+**Matched-step L ablation.** `scripts/l_ablation_ladder.sh` runs 4 objectives ×
+`L ∈ {128, 256, 512}` with **identical `--steps` in every cell**, into one nested
+`results/l_ablation/` so twelve run directories do not land loose in `results/`:
+
+```bash
+REMAT=on nohup scripts/l_ablation_ladder.sh > results/l_ablation/ladder.out 2>&1 &
+# env knobs: REMAT(required) LVALS STEPS WARMUP POOL_TAG CONTACTS CONTACT_MEAS_VAR
+#            TIME_BUDGET OUT_ROOT
+```
+
+It refuses to start without `REMAT`, skips cells that already have a
+`summary.json` (so a re-run resumes), and **fails loudly on any cell whose
+`steps_run` ≠ `STEPS`** rather than quietly tabulating a short arm. Two caveats
+that belong on any table it produces: pose weights are auto-sized per cell so
+`w_pos`/`w_ori` differ across `L` (each term is held at `0.5 × L_vel` at init,
+which is what keeps "the same objective" meaningful), and at matched steps `L=512`
+sees 4× the trajectory of `L=128`, so *data seen* is not matched — inherent to a
+matched-step L ablation.
+
 **Gate before pushing:** `bash scripts/verify.sh` — the Layer-1 deterministic
 checks (F=30, `d_in=600`, `stride=1`, channel order q,q̇,τ; process-socket-only;
 nothing under `tests/` modified; the `test_online` geometry). It only greps and

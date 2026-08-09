@@ -83,6 +83,16 @@ def make_segment_loss(ekf, kinematics, eps, beta=0.5, objective="l2_velocity",
     setting under `scan`).
     """
     step = make_step(ekf, kinematics)
+    if remat:
+        # Store only the ~9 kB (X_hat, P, gravity_ref) carry per tick and recompute
+        # the body's interior (Phi, Ad_X, Q_d, H, S, K, the Joseph products -- all
+        # (3N+9)-square) on the backward pass. Activation memory over the scan drops
+        # from O(L * interior) to O(L * carry); the price is one extra forward
+        # evaluation of the body. Mathematically identity -- `tests/contactnet/
+        # test_remat.py` asserts the gradients agree to 1e-12, and asserts the
+        # primitive is actually IN the jaxpr: this argument was accepted, documented
+        # and silently dropped for four training arms (see PORT_NOTES).
+        step = jax.checkpoint(step, prevent_cse=False)
     if objective not in VALID_OBJECTIVES:
         raise ValueError(f"unknown objective {objective}")
     use_pos, use_ori = _POSE_OBJECTIVES.get(objective, (False, False))

@@ -183,6 +183,37 @@ def validate(prep, cache, norm, cfg, params, fused, P0, eps):
     return baseline, learned
 
 
+def check_pool_contact_meas_var(paths, train_value):
+    """Warn loudly when the pool was COLLECTED at a different R floor than we train at.
+
+    `contact_meas_var` is recorded per rollout (`collect.collect_rollout`'s meta). It
+    is a filter parameter, not a data parameter, so a mismatch is legitimate: the
+    fused estimator is rebuilt at train time and `validate()` runs the analytic
+    baseline and the learned Sigma_C through that SAME rebuilt filter, so the two stay
+    matched and the comparison stands. The existing `n8fix` pool was collected at 0.0
+    and is trained at 1e-4 for exactly this reason.
+
+    What it is NOT safe to leave silent: the recorded `inputs.contact_chol` heuristic
+    -- the analytic baseline -- was produced under the pool's value, so quoting a
+    number from this run against a number from a differently-floored run is only valid
+    for the LEARNED arm. Print it rather than discover it in a results table.
+    """
+    seen = {}
+    for p in paths:
+        try:
+            with np.load(p) as z:
+                seen[float(json.loads(str(z["meta"]))["contact_meas_var"])] = p.name
+        except (KeyError, ValueError, OSError):
+            continue          # pre-dates the meta field; nothing to check against
+    stale = {v: n for v, n in seen.items() if v != float(train_value)}
+    if stale:
+        print(f"  NOTE: pool collected at contact_meas_var={sorted(stale)} "
+              f"(e.g. {list(stale.values())[0]}), training/validating at "
+              f"{train_value:g}. Expected -- the filter is rebuilt here and the "
+              f"analytic baseline is re-run through it, so baseline and learned stay "
+              f"matched. Do not compare the BASELINE column across differing floors.")
+
+
 _POSE_USE = {"l2_vel_pos": (True, False),
              "l2_vel_ori": (False, True),
              "l2_vel_pos_ori": (True, True)}
@@ -254,6 +285,22 @@ def main():
     ap.add_argument("--pose-weight-ratio", type=float, default=None,
                     help="target: each active pose term starts at ratio x L_vel "
                          "(default 0.5); used only when --w-pos/--w-ori are unset")
+    ap.add_argument("--L", type=int, default=None,
+                    help="BPTT segment length in ticks (ContactNetConfig.L, default "
+                         "128). The L-ablation knob; note L is also a MEMORY axis -- "
+                         "activation memory over the filter scan is O(L), so raising "
+                         "it without --remat is what OOMs a 12 GB card.")
+    ap.add_argument("--remat", action=argparse.BooleanOptionalAction, default=None,
+                    help="rematerialize the BPTT scan body (jax.checkpoint). Trades "
+                         "~one extra forward pass for O(L)-fold activation memory; "
+                         "mathematically identity (tests/contactnet/test_remat.py).")
+    ap.add_argument("--contact-meas-var", type=float, default=1.0e-4,
+                    help="InEKF contact-measurement noise floor [m^2] "
+                         "(main_estimator 'landmine #2', port default 0.0). 1e-4 is "
+                         "the tuned value from the 2026-08-07 z-drift study -- the "
+                         "one config lever ContactNet responds to (+31.1%%). Do NOT "
+                         "raise to 1e-2: that is a flat-ground cancellation that "
+                         "drifts UPWARD on both terrains.")
     ap.add_argument("--pool", type=str, default=None,
                     help="rollout pool tag, e.g. 'n8'. Selects data/*_<tag>_seed*.npz "
                          "and holds out one rollout PER TERRAIN for validation. "
@@ -269,6 +316,10 @@ def main():
         overrides["w_ori"] = args.w_ori
     if args.pose_weight_ratio is not None:
         overrides["pose_weight_ratio"] = args.pose_weight_ratio
+    if args.L is not None:
+        overrides["L"] = args.L
+    if args.remat is not None:
+        overrides["remat"] = args.remat
     cfg = ContactNetConfig(**overrides)
 
     t_start = time.time()
@@ -276,7 +327,8 @@ def main():
     out = make_run_dir(RESULTS_ROOT, tag=args.tag, explicit=args.out_dir)
     print(f"== run directory: {out} ==")
     c = collect.build_collector(policy_name="baseline", chunk_ticks=10_000,
-                                contacts_per_foot=args.contacts_per_foot)
+                                contacts_per_foot=args.contacts_per_foot,
+                                contact_meas_var=args.contact_meas_var)
 
     if args.collect:
         print("== collecting ==")
@@ -305,6 +357,7 @@ def main():
     val_paths = [p for p in val_paths if p.exists()]
     print(f"train rollouts: {[p.name for p in train_paths]}")
     print(f"val rollouts:   {[p.name for p in val_paths]}")
+    check_pool_contact_meas_var(train_paths + val_paths, args.contact_meas_var)
 
     print("== building channel caches ==")
     dataset.build_channel_cache(train_paths + val_paths, c)
@@ -389,6 +442,13 @@ def main():
         "cfg": {"F": cfg.F, "d_in": cfg.d_in, "H": cfg.H,
                 "window_span_s": cfg.window_span_seconds,
                 "L": cfg.L, "B": cfg.B, "objective": cfg.objective,
+                # remat and contact_meas_var are recorded because BOTH were
+                # silently wrong before: remat was accepted and dropped on the
+                # floor (dead flag, four arms), and contact_meas_var defaults to
+                # 0.0 in build_collector with no record in the run summary. A run
+                # that cannot state its own filter configuration is not evidence.
+                "remat": cfg.remat,
+                "contact_meas_var": float(args.contact_meas_var),
                 "w_pos": w_pos, "w_ori": w_ori,
                 "pose_weight_ratio": cfg.pose_weight_ratio,
                 "episode_s": cfg.episode_s, "warm_in_s": cfg.warm_in_s,
