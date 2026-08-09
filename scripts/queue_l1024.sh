@@ -36,6 +36,7 @@ log "ladder finished; starting the L=1024 column with remat ON"
 # stride-crossover prediction, and it is worth having even if one of the shorter
 # cells needs a re-run. The ladder skips completed cells, so nothing is redone.
 LVALS=1024 REMAT=on STEPS="${STEPS:-6000}" OUT_ROOT="${OUT_ROOT}" \
+  ARMS="${ARMS:-A_l2vel C_l2velori}" \
   bash scripts/l_ablation_ladder.sh
 rc=$?
 log "L=1024 column finished (exit ${rc})"

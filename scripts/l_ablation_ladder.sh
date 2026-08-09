@@ -18,12 +18,13 @@
 #
 # Usage:  REMAT=on scripts/l_ablation_ladder.sh
 # Env:    REMAT (on|off, REQUIRED)  LVALS  STEPS  WARMUP  POOL_TAG  CONTACTS
-#         CONTACT_MEAS_VAR  TIME_BUDGET  OUT_ROOT
+#         CONTACT_MEAS_VAR  TIME_BUDGET  OUT_ROOT  ARMS
 set -uo pipefail
 cd "$(dirname "$0")/.."                      # repo root
 
 REMAT="${REMAT:-}"
 LVALS="${LVALS:-128 256 512}"
+ARMS="${ARMS:-A_l2vel B_l2velpos C_l2velori D_l2velposori}"   # subset of TAGS to run
 STEPS="${STEPS:-6000}"
 WARMUP="${WARMUP:-100}"
 POOL_TAG="${POOL_TAG:-n8fix}"
@@ -43,7 +44,7 @@ esac
 mkdir -p "$OUT_ROOT"
 log(){ echo "[$(date +%F' '%H:%M:%S)] $*" | tee -a "$LOG"; }
 
-log "=== L-ablation start; L={${LVALS}} steps=${STEPS} remat=${REMAT} pool=${POOL_TAG} contacts_per_foot=${CONTACTS} contact_meas_var=${CONTACT_MEAS_VAR} ==="
+log "=== L-ablation start; L={${LVALS}} steps=${STEPS} remat=${REMAT} arms={${ARMS}} pool=${POOL_TAG} contacts_per_foot=${CONTACTS} contact_meas_var=${CONTACT_MEAS_VAR} ==="
 
 have=$(ls data/*_${POOL_TAG}_seed*.npz 2>/dev/null | wc -l)
 log "pool '${POOL_TAG}': ${have} rollouts"
@@ -73,6 +74,7 @@ failed=()
 for L in ${LVALS}; do
   for i in "${!OBJS[@]}"; do
     obj=${OBJS[$i]}; tag=${TAGS[$i]}
+    case " ${ARMS} " in *" ${tag} "*) ;; *) continue ;; esac
     cell="${OUT_ROOT}/L${L}_${tag}"
     if [ -f "${cell}/summary.json" ]; then
       log "--- cell L=${L} ${tag}: already complete, skipping ---"
