@@ -183,35 +183,33 @@ def validate(prep, cache, norm, cfg, params, fused, P0, eps):
     return baseline, learned
 
 
-def check_pool_contact_meas_var(paths, train_value):
-    """Warn loudly when the pool was COLLECTED at a different R floor than we train at.
+def pool_contact_meas_var(paths):
+    """The `contact_meas_var` the pool was COLLECTED under, from its recorded meta.
 
-    `contact_meas_var` is recorded per rollout (`collect.collect_rollout`'s meta). It
-    is a filter parameter, not a data parameter, so a mismatch is legitimate: the
-    fused estimator is rebuilt at train time and `validate()` runs the analytic
-    baseline and the learned Sigma_C through that SAME rebuilt filter, so the two stay
-    matched and the comparison stands. The existing `n8fix` pool was collected at 0.0
-    and is trained at 1e-4 for exactly this reason.
+    Needed because the floor is applied at the joint-KF -> InEKF boundary
+    (`main_estimator._boundary`), which runs during COLLECTION only. Training and
+    validation replay recorded `InEKFInputs`, so the floor they see is the pool's,
+    not whatever is passed to `build_collector` here. `dataset.apply_contact_meas_floor`
+    re-applies the delta; this function supplies the baseline it is a delta from, so
+    that re-applying is not a double-add.
 
-    What it is NOT safe to leave silent: the recorded `inputs.contact_chol` heuristic
-    -- the analytic baseline -- was produced under the pool's value, so quoting a
-    number from this run against a number from a differently-floored run is only valid
-    for the LEARNED arm. Print it rather than discover it in a results table.
+    Raises on a mixed pool: a pool collected under two different floors has no single
+    baseline, and silently picking one would put a different effective R on different
+    rollouts in the same batch.
     """
     seen = {}
     for p in paths:
         try:
             with np.load(p) as z:
-                seen[float(json.loads(str(z["meta"]))["contact_meas_var"])] = p.name
+                v = float(json.loads(str(z["meta"]))["contact_meas_var"])
         except (KeyError, ValueError, OSError):
-            continue          # pre-dates the meta field; nothing to check against
-    stale = {v: n for v, n in seen.items() if v != float(train_value)}
-    if stale:
-        print(f"  NOTE: pool collected at contact_meas_var={sorted(stale)} "
-              f"(e.g. {list(stale.values())[0]}), training/validating at "
-              f"{train_value:g}. Expected -- the filter is rebuilt here and the "
-              f"analytic baseline is re-run through it, so baseline and learned stay "
-              f"matched. Do not compare the BASELINE column across differing floors.")
+            continue          # pre-dates the meta field
+        seen.setdefault(v, []).append(p.name)
+    if len(seen) > 1:
+        raise SystemExit(
+            f"pool was collected under MIXED contact_meas_var {sorted(seen)}; "
+            f"there is no single baseline to re-floor from. Split the pool.")
+    return next(iter(seen), 0.0)
 
 
 _POSE_USE = {"l2_vel_pos": (True, False),
@@ -357,7 +355,7 @@ def main():
     val_paths = [p for p in val_paths if p.exists()]
     print(f"train rollouts: {[p.name for p in train_paths]}")
     print(f"val rollouts:   {[p.name for p in val_paths]}")
-    check_pool_contact_meas_var(train_paths + val_paths, args.contact_meas_var)
+    pool_cmv = pool_contact_meas_var(train_paths + val_paths)
 
     print("== building channel caches ==")
     dataset.build_channel_cache(train_paths + val_paths, c)
@@ -374,6 +372,20 @@ def main():
     print("== preparing rollouts ==")
     train_preps = dataset.prepare(train_paths, norm, cfg, verbose=True)
     val_preps = dataset.prepare(val_paths, norm, cfg, verbose=True)
+
+    # Re-apply the contact measurement-noise floor to the REPLAYED inputs. The floor
+    # lives in `inputs.joint.sigma_q`, written at collection time by
+    # `main_estimator._boundary`; nothing on the training/validation path calls that
+    # boundary, so `build_collector(contact_meas_var=...)` alone is a no-op here.
+    # See `dataset.apply_contact_meas_floor` for why the delta form is exact.
+    if args.contact_meas_var != pool_cmv:
+        print(f"== re-flooring contact measurement noise: pool collected at "
+              f"{pool_cmv:g}, training at {args.contact_meas_var:g} "
+              f"(delta {args.contact_meas_var - pool_cmv:+.3g} on diag(sigma_q)) ==")
+    train_preps = dataset.apply_contact_meas_floor(
+        train_preps, args.contact_meas_var, pool_cmv)
+    val_preps = dataset.apply_contact_meas_floor(
+        val_preps, args.contact_meas_var, pool_cmv)
 
     print("== measuring P0 ==")
     P0 = dataset.measure_p0(c.fused, train_preps[0], cfg, ticks=3000)

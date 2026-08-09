@@ -27,6 +27,7 @@ Load-bearing points (see the reference dataset.py docstring for the full argumen
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -258,6 +259,53 @@ def prepare(paths: Sequence[Path | str], norm: normalize.NormConstants,
         if verbose:
             print(f"  prepared {prep.name}: T={T}, starts=[{t_lo}, {t_hi}] "
                   f"({prep.n_starts} legal)")
+    return out
+
+
+def apply_contact_meas_floor(preps: Sequence[PreparedRollout],
+                             contact_meas_var: float, recorded: float = 0.0
+                             ) -> list[PreparedRollout]:
+    r"""Re-apply the InEKF contact measurement-noise floor to RECORDED inputs.
+
+    `contact_meas_var` (main_estimator "landmine #2") is applied at the joint-KF ->
+    InEKF boundary: `_boundary` sets ``sigma_q_eff = sigma_q + contact_meas_var * I``
+    and writes it into `InEKFInputs.joint.sigma_q` (`main_estimator.py:697,713`). That
+    boundary runs inside `make_fused_step` -- the COLLECTION path.
+
+    ContactNet trains and validates by replaying recorded `InEKFInputs` through
+    `inEKF.filter.make_step`, which consumes `inputs.joint.sigma_q` directly
+    (`filter.py:264`, via `contact_position_noise`). It never calls `_boundary`. So
+    passing `contact_meas_var` to `build_collector` at TRAINING time sets
+    `fused.contact_meas_var` and changes nothing at all: the value that matters was
+    baked into the recorded `sigma_q` when the pool was collected. Symptom, if you
+    ever see it again: the analytic baseline is bit-identical across a change to the
+    floor, because the floor is not in the graph.
+
+    This function closes that gap on the replay path, and it is EXACT rather than an
+    approximation, for two reasons:
+
+      * `sigma_q_eff` is a pure transformation of the joint KF's OUTPUT -- it is used
+        only to build the InEKF input and never fed back into the joint filter -- so
+        re-applying it downstream reproduces it identically; and
+      * the collection policy is driven by ground truth (`collect` calls
+        `rp.build_obs(self.m, self.d, ...)`), so the recorded trajectory does not
+        depend on the filter configuration at all. Re-collecting at a different floor
+        would yield the same sensors and the same truth.
+
+    `recorded` is the floor the pool was collected under (from its meta), so the
+    delta applied is `contact_meas_var - recorded` and calling this twice is not a
+    double-add.
+    """
+    delta = float(contact_meas_var) - float(recorded)
+    if delta == 0.0:
+        return list(preps)
+    out = []
+    for prep in preps:
+        sq = prep.inputs.joint.sigma_q
+        n = sq.shape[-1]
+        floored = sq + delta * np.eye(n, dtype=np.float64)
+        joint = prep.inputs.joint._replace(sigma_q=floored)
+        out.append(dataclasses.replace(prep, inputs=prep.inputs._replace(joint=joint)))
     return out
 
 
