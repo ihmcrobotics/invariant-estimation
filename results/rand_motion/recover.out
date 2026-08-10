@@ -1,0 +1,250 @@
+[2026-08-09 23:17:30] [recover] step 1/2: early drift for A on the walking held-out set
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+cells: ['L256_A_l2vel']
+collector: 9 filtered joints, 8 IMUs, 8 contacts, 4 off-path joints, dt=0.001 (1000 Hz)  [built in 0.9s]
+held-out: ['flat_n8fix_seed028.npz', 'hard_stepping_n8fix_seed027.npz', 'stepping_stones_n8fix_seed022.npz', 'waves_n8fix_seed025.npz']
+  reused flat_n8fix_seed000_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed004_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed008_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed012_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed016_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed020_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed024_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed003_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed007_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed011_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed015_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed019_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed023_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed006_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed014_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed018_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed001_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed005_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed009_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed017_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed021_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed028_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed027_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed022_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed025_feat.npz (cache newer than rollout, channels match)
+1 distinct normalization(s) across 1 cells
+  P0 from flat/seed0 ticks [16019, 19019): diag(R)=[6.64983805e-05 6.89037297e-05 1.00027989e+00], diag(v)=[0.00079118 0.00077245 0.00018433], diag(p)=[0.12287249 0.12097755 0.12140872], diag(d)=[0.12287031 0.12097683 0.12141024 0.12286839 0.12097627 0.1214101
+ 0.1228721  0.12098173 0.12140916 0.12287092 0.12098141 0.12140908
+ 0.12291139 0.12104048 0.12144945 0.12291014 0.12104344 0.12144625
+ 0.12293942 0.12105974 0.12142006 0.12287423 0.12097469 0.12141085], eig in [8.791e-08, 1.152e+00]
+  L256_A_l2vel           drift_z -0.00633 m/s (analytic -0.01044)  rmse 0.0727
+
+### Drift vs the metric the arms were selected on (28 s of held-out walking per rollout)
+
+| cell | L | vel RMSE | |drift_z| [m/s] | analytic | ratio | final e_z | horiz % |
+|---|---|---|---|---|---|---|---|
+| L256_A_l2vel | 256 | 0.0727 | 0.00633 | 0.01044 | 0.61x | -0.190 | 1.39 |
+
+rank by |drift_z| : ['L256_A_l2vel']
+rank by vel_rmse  : ['L256_A_l2vel']
+[2026-08-09 23:21:57] [recover] step 1 done (exit 0)
+[2026-08-09 23:21:57] [recover] step 2/2: train B and D on the randomized pool, then drift over all cells
+[2026-08-09 23:21:57] === overnight decision run: L=256 steps=6000 arms={B_l2velpos D_l2velposori} pool=n8rand ===
+[2026-08-09 23:21:57] stage 1: drift_backfill already present, skipping
+[2026-08-09 23:21:57] stage 2: pool 'n8rand' already has 16 rollouts, skipping collection
+[2026-08-09 23:21:57] pool 'n8rand': 16 rollouts
+[2026-08-09 23:21:57] stage 3: training B_l2velpos (l2_vel_pos) at L=256 on the randomized pool
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+== run directory: /home/llibshutz/alex/invariant-estimation/results/rand_motion/L256_B_l2velpos ==
+collector: 9 filtered joints, 8 IMUs, 8 contacts, 4 off-path joints, dt=0.001 (1000 Hz)  [built in 0.9s]
+pool 'n8rand': 16 rollouts over {'flat': 4, 'hard_stepping': 4, 'stepping_stones': 4, 'waves': 4}
+train rollouts: ['flat_n8rand_seed000.npz', 'flat_n8rand_seed004.npz', 'flat_n8rand_seed008.npz', 'hard_stepping_n8rand_seed003.npz', 'hard_stepping_n8rand_seed007.npz', 'hard_stepping_n8rand_seed011.npz', 'stepping_stones_n8rand_seed002.npz', 'stepping_stones_n8rand_seed006.npz', 'stepping_stones_n8rand_seed010.npz', 'waves_n8rand_seed001.npz', 'waves_n8rand_seed005.npz', 'waves_n8rand_seed009.npz']
+val rollouts:   ['flat_n8rand_seed012.npz', 'hard_stepping_n8rand_seed015.npz', 'stepping_stones_n8rand_seed014.npz', 'waves_n8rand_seed013.npz']
+== building channel caches ==
+  reused flat_n8rand_seed000_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8rand_seed004_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8rand_seed008_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8rand_seed003_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8rand_seed007_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8rand_seed011_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8rand_seed002_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8rand_seed006_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8rand_seed010_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8rand_seed001_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8rand_seed005_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8rand_seed009_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8rand_seed012_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8rand_seed015_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8rand_seed014_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8rand_seed013_feat.npz (cache newer than rollout, channels match)
+== fitting normalization (train, walking set) ==
+  floored channels: []
+  cfg: F=30 d_in=600 H=20 (window 19 ms, consecutive ticks) L=256 B=32 objective=l2_vel_pos episode_s=43.0
+== preparing rollouts ==
+  prepared flat/seed0: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared flat/seed4: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared flat/seed8: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared hard_stepping/seed3: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared hard_stepping/seed7: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared hard_stepping/seed11: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared stepping_stones/seed2: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared stepping_stones/seed6: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared stepping_stones/seed10: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared waves/seed1: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared waves/seed5: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared waves/seed9: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared flat/seed12: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared hard_stepping/seed15: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared stepping_stones/seed14: T=44000, starts=[16019, 43744] (27726 legal)
+  prepared waves/seed13: T=44000, starts=[16019, 43744] (27726 legal)
+== re-flooring contact measurement noise: pool collected at 0, training at 0.0001 (delta +0.0001 on diag(sigma_q)) ==
+== measuring P0 ==
+  P0 from flat/seed0 ticks [16019, 19019): diag(R)=[6.79595063e-05 6.95500321e-05 1.00028024e+00], diag(v)=[0.00087308 0.00086168 0.00019664], diag(p)=[0.12085103 0.11852565 0.11967487], diag(d)=[0.12085059 0.11852473 0.11967518 0.12084845 0.11852462 0.11967535
+ 0.12084997 0.11852574 0.11967485 0.12084814 0.1185257  0.11967506
+ 0.12091279 0.11858935 0.11968974 0.12091426 0.11858941 0.11968824
+ 0.12092024 0.11860034 0.11968205 0.12092167 0.11860046 0.11968046], eig in [1.016e-07, 1.089e+00]
+== building network + batcher ==
+  pose-weight measurement (warm batch, init net): L_vel=2.348e-01 L_pos=2.630e-02 L_ori=1.055e-02
+  pose weights (frozen): w_pos=4.4628e+00 w_ori=0.0000e+00 (ratio=0.5, objective=l2_vel_pos)
+== training ==
+step    0 loss 3.52175e-01 |g| 1.02e+00 NIS/dof 5.655e+00 applied 1.00 reseeds 1
+step   10 loss 5.89432e-01 |g| 8.94e+01 NIS/dof 6.091e+00 applied 1.00 reseeds 4
+step   20 loss 4.49579e-01 |g| 2.32e+01 NIS/dof 5.303e+00 applied 1.00 reseeds 5
+step   30 loss 4.12126e-01 |g| 2.18e+01 NIS/dof 4.009e+00 applied 1.00 reseeds 16
+step   40 loss 4.63395e-01 |g| 5.40e+00 NIS/dof 3.808e+00 applied 1.00 reseeds 21
+step   50 loss 5.60042e-01 |g| 4.07e+00 NIS/dof 3.934e+00 applied 1.00 reseeds 26
+step   60 loss 4.92129e-01 |g| 5.92e-01 NIS/dof 4.571e+00 applied 1.00 reseeds 29
+step   70 loss 3.68874e-01 |g| 8.07e-01 NIS/dof 2.927e+00 applied 1.00 reseeds 34
+step   80 loss 4.42145e-01 |g| 2.37e+00 NIS/dof 3.263e+00 applied 1.00 reseeds 38
+step   90 loss 3.27982e-01 |g| 8.40e-01 NIS/dof 2.869e+00 applied 1.00 reseeds 44
+step  100 loss 3.28692e-01 |g| 9.63e-01 NIS/dof 3.446e+00 applied 1.00 reseeds 57
+step  110 loss 4.95276e-01 |g| 1.20e+00 NIS/dof 3.584e+00 applied 1.00 reseeds 67
+step  120 loss 2.93605e-01 |g| 1.04e+00 NIS/dof 2.191e+00 applied 1.00 reseeds 79
+step  130 loss 4.41123e-01 |g| 1.79e+00 NIS/dof 4.080e+00 applied 1.00 reseeds 85
+step  140 loss 3.72523e-01 |g| 9.08e-01 NIS/dof 3.305e+00 applied 1.00 reseeds 91
+step  150 loss 5.14670e-01 |g| 3.21e+00 NIS/dof 4.387e+00 applied 1.00 reseeds 96
+step  160 loss 5.84242e-01 |g| 1.74e+00 NIS/dof 4.434e+00 applied 1.00 reseeds 97
+step  170 loss 4.99437e-01 |g| 1.79e+00 NIS/dof 4.246e+00 applied 1.00 reseeds 102
+step  180 loss 3.03810e-01 |g| 1.86e+00 NIS/dof 2.817e+00 applied 1.00 reseeds 110
+step  190 loss 4.48397e-01 |g| 4.68e+00 NIS/dof 4.622e+00 applied 1.00 reseeds 115
+step  200 loss 2.39771e-01 |g| 1.98e+00 NIS/dof 2.245e+00 applied 1.00 reseeds 125
+step  210 loss 3.79635e-01 |g| 2.00e+00 NIS/dof 3.280e+00 applied 1.00 reseeds 136
+step  220 loss 4.00766e-01 |g| 8.73e+00 NIS/dof 3.886e+00 applied 1.00 reseeds 143
+step  230 loss 3.41404e-01 |g| 3.00e+00 NIS/dof 3.336e+00 applied 1.00 reseeds 148
+step  240 loss 4.54527e-01 |g| 3.96e+00 NIS/dof 4.122e+00 applied 1.00 reseeds 152
+step  250 loss 3.75020e-01 |g| 8.06e+00 NIS/dof 4.325e+00 applied 1.00 reseeds 159
+step  260 loss 4.00448e-01 |g| 5.41e+00 NIS/dof 3.162e+00 applied 1.00 reseeds 162
+step  270 loss 3.79026e-01 |g| 4.09e+00 NIS/dof 3.813e+00 applied 1.00 reseeds 170
+step  280 loss 2.77896e-01 |g| 2.72e+00 NIS/dof 2.638e+00 applied 1.00 reseeds 177
+step  290 loss 3.81078e-01 |g| 4.18e+00 NIS/dof 4.463e+00 applied 1.00 reseeds 187
+step  300 loss 3.40612e-01 |g| 4.53e+00 NIS/dof 3.594e+00 applied 1.00 reseeds 192
+step  310 loss 2.94540e-01 |g| 4.07e+00 NIS/dof 3.266e+00 applied 1.00 reseeds 196
+step  320 loss 2.86050e-01 |g| 3.55e+00 NIS/dof 3.236e+00 applied 1.00 reseeds 202
+step  330 loss 3.50683e-01 |g| 2.08e+00 NIS/dof 3.309e+00 applied 1.00 reseeds 210
+step  340 loss 3.14871e-01 |g| 3.15e+00 NIS/dof 3.308e+00 applied 1.00 reseeds 218
+step  350 loss 4.39545e-01 |g| 7.43e+00 NIS/dof 4.477e+00 applied 1.00 reseeds 222
+step  360 loss 4.37703e-01 |g| 1.04e+01 NIS/dof 4.345e+00 applied 1.00 reseeds 233
+step  370 loss 2.43473e-01 |g| 2.74e+00 NIS/dof 3.326e+00 applied 1.00 reseeds 239
+step  380 loss 4.43319e-01 |g| 1.01e+01 NIS/dof 4.778e+00 applied 1.00 reseeds 247
+step  390 loss 1.68463e-01 |g| 2.58e+00 NIS/dof 2.476e+00 applied 1.00 reseeds 254
+step  400 loss 2.95770e-01 |g| 3.10e+00 NIS/dof 2.903e+00 applied 1.00 reseeds 260
+step  410 loss 3.86841e-01 |g| 3.00e+00 NIS/dof 4.320e+00 applied 1.00 reseeds 266
+step  420 loss 3.24391e-01 |g| 5.42e+00 NIS/dof 3.624e+00 applied 1.00 reseeds 275
+step  430 loss 3.05052e-01 |g| 3.08e+00 NIS/dof 3.502e+00 applied 1.00 reseeds 278
+step  440 loss 1.77378e-01 |g| 1.31e+01 NIS/dof 3.072e+00 applied 1.00 reseeds 289
+step  450 loss 3.16860e-01 |g| 8.55e+00 NIS/dof 3.205e+00 applied 1.00 reseeds 293
+step  460 loss 3.64576e-01 |g| 1.40e+01 NIS/dof 3.984e+00 applied 1.00 reseeds 297
+step  470 loss 2.44890e-01 |g| 8.89e+00 NIS/dof 3.256e+00 applied 1.00 reseeds 306
+step  480 loss 2.01970e-01 |g| 1.11e+01 NIS/dof 2.533e+00 applied 1.00 reseeds 309
+step  490 loss 2.20480e-01 |g| 1.21e+01 NIS/dof 2.903e+00 applied 1.00 reseeds 314
+step  500 loss 1.31738e-01 |g| 1.06e+01 NIS/dof 2.305e+00 applied 1.00 reseeds 323
+step  510 loss 1.01088e-01 |g| 3.19e+00 NIS/dof 1.775e+00 applied 1.00 reseeds 329
+step  520 loss 1.33099e-01 |g| 4.91e+00 NIS/dof 2.123e+00 applied 1.00 reseeds 334
+step  530 loss 1.13373e-01 |g| 4.25e+00 NIS/dof 1.878e+00 applied 1.00 reseeds 338
+step  540 loss 1.25668e-01 |g| 4.00e+00 NIS/dof 1.719e+00 applied 1.00 reseeds 343
+step  550 loss 1.16604e-01 |g| 3.34e+00 NIS/dof 1.584e+00 applied 1.00 reseeds 350
+step  560 loss 9.47769e-02 |g| 3.43e+00 NIS/dof 1.374e+00 applied 1.00 reseeds 357
+step  570 loss 7.09032e-02 |g| 2.14e+00 NIS/dof 1.204e+00 applied 1.00 reseeds 367
+step  580 loss 7.42960e-02 |g| 4.28e+00 NIS/dof 1.097e+00 applied 1.00 reseeds 375
+step  590 loss 6.56172e-02 |g| 3.79e+00 NIS/dof 1.004e+00 applied 1.00 reseeds 381
+step  600 loss 4.58250e-02 |g| 1.18e+00 NIS/dof 7.710e-01 applied 1.00 reseeds 386
+step  610 loss 7.14764e-02 |g| 4.08e+00 NIS/dof 9.096e-01 applied 1.00 reseeds 390
+step  620 loss 3.99981e-02 |g| 1.04e+00 NIS/dof 6.681e-01 applied 1.00 reseeds 398
+step  630 loss 4.32200e-02 |g| 1.05e+00 NIS/dof 5.663e-01 applied 1.00 reseeds 405
+step  640 loss 3.48061e-02 |g| 6.91e-01 NIS/dof 5.148e-01 applied 1.00 reseeds 411
+step  650 loss 3.54029e-02 |g| 8.26e-01 NIS/dof 5.349e-01 applied 1.00 reseeds 419
+step  660 loss 3.09693e-02 |g| 7.84e-01 NIS/dof 3.642e-01 applied 1.00 reseeds 429
+step  670 loss 1.14367e-02 |g| 3.95e-01 NIS/dof 2.336e-01 applied 1.00 reseeds 433
+step  680 loss 1.86636e-02 |g| 9.29e-01 NIS/dof 3.456e-01 applied 1.00 reseeds 438
+step  690 loss 2.23575e-02 |g| 1.24e+00 NIS/dof 2.850e-01 applied 1.00 reseeds 444
+step  700 loss 3.11202e-02 |g| 1.51e+00 NIS/dof 4.048e-01 applied 1.00 reseeds 447
+step  710 loss 1.57137e-02 |g| 2.89e-01 NIS/dof 2.220e-01 applied 1.00 reseeds 452
+step  720 loss 1.17679e-02 |g| 7.32e-01 NIS/dof 2.125e-01 applied 1.00 reseeds 456
+step  730 loss 2.59847e-02 |g| 4.27e-01 NIS/dof 2.845e-01 applied 1.00 reseeds 467
+step  740 loss 1.55125e-02 |g| 3.99e-01 NIS/dof 2.483e-01 applied 1.00 reseeds 477
+step  750 loss 1.07666e-02 |g| 9.52e-01 NIS/dof 2.476e-01 applied 1.00 reseeds 487
+step  760 loss 9.25695e-03 |g| 2.05e-01 NIS/dof 1.722e-01 applied 1.00 reseeds 490
+step  770 loss 1.31413e-02 |g| 2.90e-01 NIS/dof 1.690e-01 applied 1.00 reseeds 498
+step  780 loss 1.17517e-02 |g| 3.00e-01 NIS/dof 1.615e-01 applied 1.00 reseeds 502
+step  790 loss 1.02030e-02 |g| 6.28e-01 NIS/dof 1.852e-01 applied 1.00 reseeds 507
+step  800 loss 1.14352e-02 |g| 4.16e-01 NIS/dof 1.649e-01 applied 1.00 reseeds 512
+step  810 loss 1.07876e-02 |g| 6.07e-01 NIS/dof 1.976e-01 applied 1.00 reseeds 519
+step  820 loss 1.12728e-02 |g| 8.30e-01 NIS/dof 1.410e-01 applied 1.00 reseeds 524
+step  830 loss 1.12788e-02 |g| 3.89e-01 NIS/dof 1.833e-01 applied 1.00 reseeds 530
+step  840 loss 1.55990e-02 |g| 4.71e-01 NIS/dof 2.167e-01 applied 1.00 reseeds 537
+step  850 loss 1.12345e-02 |g| 3.63e-01 NIS/dof 1.639e-01 applied 1.00 reseeds 543
+step  860 loss 1.09015e-02 |g| 7.26e-01 NIS/dof 1.163e-01 applied 1.00 reseeds 547
+step  870 loss 1.23093e-02 |g| 5.52e-01 NIS/dof 1.852e-01 applied 1.00 reseeds 553
+step  880 loss 9.63692e-03 |g| 1.73e-01 NIS/dof 1.448e-01 applied 1.00 reseeds 557
+step  890 loss 7.63649e-03 |g| 1.95e-01 NIS/dof 1.456e-01 applied 1.00 reseeds 564
+step  900 loss 1.31391e-02 |g| 9.58e-01 NIS/dof 1.656e-01 applied 1.00 reseeds 572
+step  910 loss 7.80429e-03 |g| 2.50e-01 NIS/dof 9.103e-02 applied 1.00 reseeds 578
+step  920 loss 9.23403e-03 |g| 2.15e-01 NIS/dof 1.164e-01 applied 1.00 reseeds 584
+step  930 loss 1.08048e-02 |g| 6.91e-01 NIS/dof 1.396e-01 applied 1.00 reseeds 589
+step  940 loss 1.23843e-02 |g| 5.22e-01 NIS/dof 1.470e-01 applied 1.00 reseeds 596
+step  950 loss 8.83866e-03 |g| 3.91e-01 NIS/dof 9.534e-02 applied 1.00 reseeds 601
+step  960 loss 9.82458e-03 |g| 3.75e-01 NIS/dof 1.478e-01 applied 1.00 reseeds 607
+step  970 loss 9.25383e-03 |g| 2.74e-01 NIS/dof 1.113e-01 applied 1.00 reseeds 610
+step  980 loss 1.03453e-02 |g| 6.55e-01 NIS/dof 1.071e-01 applied 1.00 reseeds 619
+step  990 loss 1.16455e-02 |g| 3.14e-01 NIS/dof 1.561e-01 applied 1.00 reseeds 625
+step 1000 loss 1.14160e-02 |g| 7.19e-01 NIS/dof 1.134e-01 applied 1.00 reseeds 632
+step 1010 loss 8.62438e-03 |g| 2.43e-01 NIS/dof 9.868e-02 applied 1.00 reseeds 636
+step 1020 loss 8.78927e-03 |g| 2.42e-01 NIS/dof 1.235e-01 applied 1.00 reseeds 641
+step 1030 loss 1.16700e-02 |g| 4.73e-01 NIS/dof 1.329e-01 applied 1.00 reseeds 645
+step 1040 loss 1.09803e-02 |g| 6.91e-01 NIS/dof 1.465e-01 applied 1.00 reseeds 650
+step 1050 loss 1.31282e-02 |g| 4.64e-01 NIS/dof 8.525e-02 applied 1.00 reseeds 660
+step 1060 loss 1.05053e-02 |g| 5.36e-01 NIS/dof 8.632e-02 applied 1.00 reseeds 664
+step 1070 loss 9.71029e-03 |g| 5.46e-01 NIS/dof 8.622e-02 applied 1.00 reseeds 671
+step 1080 loss 9.15166e-03 |g| 3.99e-01 NIS/dof 1.044e-01 applied 1.00 reseeds 680
+step 1090 loss 8.54010e-03 |g| 7.72e-01 NIS/dof 8.630e-02 applied 1.00 reseeds 683
+step 1100 loss 9.73413e-03 |g| 4.23e-01 NIS/dof 9.367e-02 applied 1.00 reseeds 693
+step 1110 loss 1.16602e-02 |g| 5.48e-01 NIS/dof 1.441e-01 applied 1.00 reseeds 700
+step 1120 loss 8.96635e-03 |g| 1.85e-01 NIS/dof 1.056e-01 applied 1.00 reseeds 708
+step 1130 loss 8.79302e-03 |g| 1.83e-01 NIS/dof 9.458e-02 applied 1.00 reseeds 713
+step 1140 loss 1.94503e-02 |g| 7.56e-01 NIS/dof 1.271e-01 applied 1.00 reseeds 721
+step 1150 loss 9.86999e-03 |g| 9.08e-01 NIS/dof 7.974e-02 applied 1.00 reseeds 729
+step 1160 loss 9.29119e-03 |g| 4.47e-01 NIS/dof 5.558e-02 applied 1.00 reseeds 734
+step 1170 loss 9.39061e-03 |g| 3.04e-01 NIS/dof 8.787e-02 applied 1.00 reseeds 740
+step 1180 loss 7.34294e-03 |g| 2.06e-01 NIS/dof 9.524e-02 applied 1.00 reseeds 745
+step 1190 loss 8.84654e-03 |g| 2.26e-01 NIS/dof 9.011e-02 applied 1.00 reseeds 751
+step 1200 loss 9.80644e-03 |g| 7.78e-01 NIS/dof 8.360e-02 applied 1.00 reseeds 754
+step 1210 loss 9.46084e-03 |g| 2.68e-01 NIS/dof 7.551e-02 applied 1.00 reseeds 760
+step 1220 loss 1.07242e-02 |g| 6.59e-01 NIS/dof 8.906e-02 applied 1.00 reseeds 765
+step 1230 loss 8.64596e-03 |g| 2.89e-01 NIS/dof 6.517e-02 applied 1.00 reseeds 770
+step 1240 loss 7.94306e-03 |g| 2.25e-01 NIS/dof 8.400e-02 applied 1.00 reseeds 777
+step 1250 loss 1.14047e-02 |g| 4.64e-01 NIS/dof 8.742e-02 applied 1.00 reseeds 785
+step 1260 loss 5.31793e-03 |g| 8.25e-02 NIS/dof 6.907e-02 applied 1.00 reseeds 793
+step 1270 loss 7.68525e-03 |g| 2.52e-01 NIS/dof 7.923e-02 applied 1.00 reseeds 796
+step 1280 loss 8.17529e-03 |g| 2.69e-01 NIS/dof 6.792e-02 applied 1.00 reseeds 803
+step 1290 loss 9.39929e-03 |g| 1.71e-01 NIS/dof 7.697e-02 applied 1.00 reseeds 806
+step 1300 loss 8.19704e-03 |g| 3.02e-01 NIS/dof 8.392e-02 applied 1.00 reseeds 813
+step 1310 loss 8.40695e-03 |g| 2.83e-01 NIS/dof 1.051e-01 applied 1.00 reseeds 821
+step 1320 loss 8.46422e-03 |g| 2.08e-01 NIS/dof 6.223e-02 applied 1.00 reseeds 826
+step 1330 loss 7.13790e-03 |g| 2.14e-01 NIS/dof 8.781e-02 applied 1.00 reseeds 832
+step 1340 loss 6.77963e-03 |g| 4.64e-01 NIS/dof 7.167e-02 applied 1.00 reseeds 841
+step 1350 loss 7.75594e-03 |g| 1.98e-01 NIS/dof 8.122e-02 applied 1.00 reseeds 845
+step 1360 loss 8.68341e-03 |g| 4.09e-01 NIS/dof 5.633e-02 applied 1.00 reseeds 854
+step 1370 loss 6.32864e-03 |g| 1.48e-01 NIS/dof 7.247e-02 applied 1.00 reseeds 861
+step 1380 loss 5.86712e-03 |g| 1.73e-01 NIS/dof 7.224e-02 applied 1.00 reseeds 869
+step 1390 loss 7.88018e-03 |g| 1.85e-01 NIS/dof 8.739e-02 applied 1.00 reseeds 876
+step 1400 loss 6.64221e-03 |g| 3.44e-01 NIS/dof 6.850e-02 applied 1.00 reseeds 882
+step 1410 loss 8.38989e-03 |g| 3.54e-01 NIS/dof 8.566e-02 applied 1.00 reseeds 888
+step 1420 loss 6.10563e-03 |g| 8.34e-02 NIS/dof 6.475e-02 applied 1.00 reseeds 893

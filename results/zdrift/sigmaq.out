@@ -1,0 +1,156 @@
+[2026-08-10 03:30:14] [sigmaq] control: recorded Sigma_q, floor 0
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+cells: ['L256_A_l2vel', 'L256_C_l2velori']
+collector: 9 filtered joints, 8 IMUs, 8 contacts, 4 off-path joints, dt=0.001 (1000 Hz)  [built in 0.9s]
+held-out: ['flat_n8fix_seed028.npz', 'hard_stepping_n8fix_seed027.npz', 'stepping_stones_n8fix_seed022.npz', 'waves_n8fix_seed025.npz']
+  reused flat_n8fix_seed000_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed004_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed008_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed012_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed016_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed020_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed024_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed003_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed007_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed011_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed015_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed019_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed023_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed006_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed014_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed018_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed001_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed005_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed009_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed017_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed021_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed028_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed027_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed022_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed025_feat.npz (cache newer than rollout, channels match)
+1 distinct normalization(s) across 2 cells
+  P0 from flat/seed0 ticks [16019, 19019): diag(R)=[6.40571118e-05 6.71245090e-05 1.00027367e+00], diag(v)=[0.00070236 0.00066632 0.00016959], diag(p)=[0.12268351 0.12084981 0.12124315], diag(d)=[0.12268351 0.12084981 0.12124316 0.1226835  0.12084981 0.12124315
+ 0.12268351 0.12084983 0.12124315 0.1226835  0.12084983 0.12124315
+ 0.12268352 0.12084982 0.12124317 0.12268352 0.12084982 0.12124317
+ 0.12268353 0.12084982 0.12124316 0.12268354 0.12084982 0.12124316], eig in [2.629e-10, 1.149e+00]
+  L256_A_l2vel           drift_z +0.00003 m/s (analytic -0.01329)  rmse 0.0487
+  L256_C_l2velori        drift_z +0.01816 m/s (analytic -0.01329)  rmse 0.0476
+
+### Drift vs the metric the arms were selected on (28 s of held-out walking per rollout)
+
+| cell | L | vel RMSE | |drift_z| [m/s] | analytic | ratio | final e_z | horiz % |
+|---|---|---|---|---|---|---|---|
+| L256_A_l2vel | 256 | 0.0487 | 0.00003 | 0.01329 | 0.00x | -0.111 | 7.38 |
+| L256_C_l2velori | 256 | 0.0476 | 0.01816 | 0.01329 | 1.37x | +0.440 | 5.87 |
+
+rank by |drift_z| : ['L256_A_l2vel', 'L256_C_l2velori']
+rank by vel_rmse  : ['L256_C_l2velori', 'L256_A_l2vel']
+[2026-08-10 03:41:24] [sigmaq] uniform x5.39 (what an isotropic correction can achieve), floor 0
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+cells: ['L256_A_l2vel', 'L256_C_l2velori']
+collector: 9 filtered joints, 8 IMUs, 8 contacts, 4 off-path joints, dt=0.001 (1000 Hz)  [built in 0.9s]
+held-out: ['flat_n8fix_seed028.npz', 'hard_stepping_n8fix_seed027.npz', 'stepping_stones_n8fix_seed022.npz', 'waves_n8fix_seed025.npz']
+  reused flat_n8fix_seed000_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed004_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed008_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed012_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed016_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed020_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed024_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed003_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed007_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed011_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed015_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed019_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed023_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed006_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed014_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed018_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed001_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed005_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed009_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed017_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed021_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed028_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed027_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed022_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed025_feat.npz (cache newer than rollout, channels match)
+1 distinct normalization(s) across 2 cells
+  P0 from flat/seed0 ticks [16019, 19019): diag(R)=[6.40865307e-05 6.71444809e-05 1.00027377e+00], diag(v)=[0.00070323 0.00066712 0.00016987], diag(p)=[0.12268832 0.12084941 0.12124601], diag(d)=[0.12268833 0.12084941 0.12124602 0.12268829 0.1208494  0.121246
+ 0.12268831 0.12084948 0.12124601 0.12268826 0.12084948 0.12124599
+ 0.12268837 0.12084945 0.1212461  0.12268837 0.12084945 0.1212461
+ 0.12268843 0.12084945 0.12124604 0.12268844 0.12084941 0.12124604], eig in [1.341e-09, 1.149e+00]
+  L256_A_l2vel           drift_z +0.00142 m/s (analytic -0.01321)  rmse 0.0487
+  L256_C_l2velori        drift_z +0.01963 m/s (analytic -0.01321)  rmse 0.0476
+
+### Drift vs the metric the arms were selected on (28 s of held-out walking per rollout)
+
+| cell | L | vel RMSE | |drift_z| [m/s] | analytic | ratio | final e_z | horiz % |
+|---|---|---|---|---|---|---|---|
+| L256_A_l2vel | 256 | 0.0487 | 0.00142 | 0.01321 | 0.11x | -0.069 | 6.70 |
+| L256_C_l2velori | 256 | 0.0476 | 0.01963 | 0.01321 | 1.49x | +0.482 | 5.09 |
+
+rank by |drift_z| : ['L256_A_l2vel', 'L256_C_l2velori']
+rank by vel_rmse  : ['L256_C_l2velori', 'L256_A_l2vel']
+[2026-08-10 05:58:29] [sigmaq] per-joint measured ratios (what I9 asks for), floor 0
+Failed to import warp: No module named 'warp'
+Failed to import mujoco_warp: No module named 'warp'
+cells: ['L256_A_l2vel', 'L256_C_l2velori']
+collector: 9 filtered joints, 8 IMUs, 8 contacts, 4 off-path joints, dt=0.001 (1000 Hz)  [built in 0.9s]
+held-out: ['flat_n8fix_seed028.npz', 'hard_stepping_n8fix_seed027.npz', 'stepping_stones_n8fix_seed022.npz', 'waves_n8fix_seed025.npz']
+  reused flat_n8fix_seed000_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed004_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed008_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed012_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed016_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed020_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed024_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed003_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed007_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed011_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed015_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed019_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed023_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed006_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed014_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed018_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed001_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed005_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed009_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed017_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed021_feat.npz (cache newer than rollout, channels match)
+  reused flat_n8fix_seed028_feat.npz (cache newer than rollout, channels match)
+  reused hard_stepping_n8fix_seed027_feat.npz (cache newer than rollout, channels match)
+  reused stepping_stones_n8fix_seed022_feat.npz (cache newer than rollout, channels match)
+  reused waves_n8fix_seed025_feat.npz (cache newer than rollout, channels match)
+1 distinct normalization(s) across 2 cells
+  P0 from flat/seed0 ticks [16019, 19019): diag(R)=[6.40676990e-05 6.71343278e-05 1.00027373e+00], diag(v)=[0.00070295 0.00066657 0.00016975], diag(p)=[0.12268757 0.12084843 0.12124484], diag(d)=[0.12268758 0.12084842 0.12124485 0.12268754 0.12084842 0.12124482
+ 0.12268756 0.12084846 0.12124483 0.12268752 0.12084846 0.12124483
+ 0.1226876  0.12084844 0.12124491 0.1226876  0.12084844 0.12124491
+ 0.12268764 0.12084844 0.12124486 0.12268766 0.12084844 0.12124487], eig in [3.259e-10, 1.149e+00]
+  L256_A_l2vel           drift_z +0.00115 m/s (analytic -0.01326)  rmse 0.0487
+  L256_C_l2velori        drift_z +0.01907 m/s (analytic -0.01326)  rmse 0.0476
+
+### Drift vs the metric the arms were selected on (28 s of held-out walking per rollout)
+
+| cell | L | vel RMSE | |drift_z| [m/s] | analytic | ratio | final e_z | horiz % |
+|---|---|---|---|---|---|---|---|
+| L256_A_l2vel | 256 | 0.0487 | 0.00115 | 0.01326 | 0.09x | -0.079 | 7.02 |
+| L256_C_l2velori | 256 | 0.0476 | 0.01907 | 0.01326 | 1.44x | +0.466 | 5.45 |
+
+rank by |drift_z| : ['L256_A_l2vel', 'L256_C_l2velori']
+rank by vel_rmse  : ['L256_C_l2velori', 'L256_A_l2vel']
+[2026-08-10 06:14:24] [sigmaq] --- Sigma_q correction: drift and consistency ---
+variant    cell               |drift_z|  final e_z   NIS/dof  analytic NIS  sign
+asis       L256_A_l2vel         0.00003     -0.111     0.301         0.010  MIXED
+asis       L256_C_l2velori      0.01816     +0.440     0.244         0.010  yes
+uniform    L256_A_l2vel         0.00142     -0.069     0.269         0.009  MIXED
+uniform    L256_C_l2velori      0.01963     +0.482     0.212         0.009  yes
+perjoint   L256_A_l2vel         0.00115     -0.079     0.281         0.010  MIXED
+perjoint   L256_C_l2velori      0.01907     +0.466     0.224         0.010  yes
+
+NIS/dof target is 1. If per-joint moves it and uniform does not, an isotropic
+floor cannot represent this error and the fix belongs upstream (I9).
+[2026-08-10 06:14:24] [sigmaq] === sigma_q test complete ===
