@@ -81,8 +81,18 @@ def main():
         for r in rows:
             c = sign_consistent(r)
             ok.setdefault(r["floor"], []).append(c is not False)
-        eligible = {f: v for f, v in by_floor.items() if all(ok.get(f, [True]))}
-        pool = eligible or by_floor
+        # An UNVERIFIED floor must not win by default. When both checked candidates
+        # came back MIXED, the previous rule fell through to a floor that had never
+        # been sign-checked and started a 6 h retrain on it. Require positive
+        # evidence: eligible means every cell at that floor was CHECKED and AGREED.
+        checked = {}
+        for r in rows:
+            checked.setdefault(r["floor"], []).append(sign_consistent(r))
+        eligible = {f: v for f, v in by_floor.items()
+                    if checked.get(f) and all(c is True for c in checked[f])}
+        if not eligible:
+            return          # print nothing: the caller must not proceed on a guess
+        pool = eligible
         best = min(pool, key=lambda f: sum(pool[f]) / len(pool[f]))
         print(best)
         return
