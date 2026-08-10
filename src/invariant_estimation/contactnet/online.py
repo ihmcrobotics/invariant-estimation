@@ -166,8 +166,8 @@ def make_provider(subchain, base_imu: int, kinematics, cfg: ContactNetConfig,
 
     def step(state: OnlineState, sensors):
         state, win, ready = feats(state, sensors)
-        L = jax.vmap(forward, in_axes=(None, 0, None))(
-            params, win.reshape(n_c, -1), cfg.eps)          # (N_c, 3, 3)
+        L = jax.vmap(forward, in_axes=(None, 0, None, None))(
+            params, win.reshape(n_c, -1), cfg.eps, cfg.diag_param)   # (N_c, 3, 3)
         return state, jnp.where(ready, L, sensors.contact_chol)
 
     return step

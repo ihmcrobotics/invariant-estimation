@@ -31,7 +31,21 @@ class ContactNetConfig:
     dt: float = 1.0e-3             # sim/filter tick period [s]
 
     widths: tuple[int, ...] = (256, 256)  # trunk
-    eps: float = 1.0e-6            # softplus floor on diag(L)
+    eps: float = 1.0e-6            # positivity floor on diag(L)
+
+    diag_param: str = "softplus"
+    """Positive parameterisation of diag(L). RECORDED per run; a checkpoint must be
+    loaded under the one it was trained with, or its head's raw outputs are rescaled.
+
+    `softplus` is the original. For r << 0 it IS exp, so it behaves well at the tight
+    end -- but it goes LINEAR above zero, where relative sensitivity dlogL/dr decays
+    as 1/r. Sigma_C spans ~1e10 stance->swing (analytic tr 3e-8 -> 3e2), and reaching
+    the swing end needs r=+10 at sensitivity 0.10. Measured: the softplus run achieved
+    3.6 of the 19.2 raw units that span requires (19%), leaving Sigma_C 685x too tight
+    in swing -- which is what pushes the base upward once the feet leave the ground.
+
+    `exp` gives dlogL/dr = 1 everywhere; the same target is r=+2.30 at sensitivity
+    1.00. For a scale parameter spanning ten decades this is the natural choice."""
 
     # BPTT / data
     L: int = 128                   # ticks the gradient traverses
@@ -153,6 +167,8 @@ class ContactNetConfig:
             )
         if self.L <= 0 or self.B <= 0:
             raise ValueError(f"L and B must be positive, got L={self.L} and B={self.B}")
+        if self.diag_param not in ("softplus", "exp"):
+            raise ValueError(f"diag_param must be softplus or exp, got {self.diag_param!r}")
         if self.objective not in (
             "beta_nll", "l2_velocity",
             "l2_vel_pos", "l2_vel_ori", "l2_vel_pos_ori",

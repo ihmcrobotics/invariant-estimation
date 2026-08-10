@@ -39,7 +39,8 @@ class Segment(NamedTuple):
 def contact_factors(
     params: ContactNetParams,
     windows :Array,
-    eps: float
+    eps: float,
+    diag_param: str = "softplus",
 ) -> Array:
     """
     Network over every tick and contact, all at once.
@@ -52,9 +53,9 @@ def contact_factors(
     """
     L, N_c = windows.shape[0], windows.shape[1]
     flat = windows.reshape(L, N_c, -1) # last dim is D_in = H * F, the flattening
-    over_contacts = jax.vmap(forward, in_axes=(None, 0, None))
-    over_time = jax.vmap(over_contacts, in_axes=(None, 0, None))
-    return over_time(params, flat, eps)
+    over_contacts = jax.vmap(forward, in_axes=(None, 0, None, None))
+    over_time = jax.vmap(over_contacts, in_axes=(None, 0, None, None))
+    return over_time(params, flat, eps, diag_param)
 
 # objective -> (use_pos, use_ori) for the composite pose objectives. Resolved at
 # build time (outside the traced region) so the branch never enters the graph.
@@ -67,7 +68,7 @@ VALID_OBJECTIVES = ("beta_nll", "l2_velocity") + tuple(_POSE_OBJECTIVES)
 
 
 def make_segment_loss(ekf, kinematics, eps, beta=0.5, objective="l2_velocity",
-                      remat=True, w_pos=0.0, w_ori=0.0):
+                      remat=True, w_pos=0.0, w_ori=0.0, diag_param="softplus"):
     """Build the per-segment loss: ``(params, segment) -> (loss, (outputs, carry))``.
 
     A factory matching `make_step`: `ekf`, `kinematics` and the scalars are static
@@ -98,7 +99,7 @@ def make_segment_loss(ekf, kinematics, eps, beta=0.5, objective="l2_velocity",
     use_pos, use_ori = _POSE_OBJECTIVES.get(objective, (False, False))
 
     def segment_loss(params: ContactNetParams, segment: Segment, carry0=None):
-        L_c = contact_factors(params, segment.windows, eps)
+        L_c = contact_factors(params, segment.windows, eps, diag_param)
         inputs = segment.inputs._replace(contact_chol=L_c)
         c0 = init_carry(segment.state0) if carry0 is None else carry0
         carry, outputs = jax.lax.scan(step, c0, inputs)

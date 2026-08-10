@@ -70,13 +70,33 @@ def main():
                     help="override every motion's duration (default: the schedule's own)")
     ap.add_argument("--fps", type=float, default=50.0)
     ap.add_argument("--size", default="1280x720", metavar="WxH")
+    ap.add_argument("--contact-meas-var", type=float, default=1.0e-3,
+                    help="InEKF contact measurement-noise floor. MUST match what the "
+                         "checkpoint was TRAINED at -- the 2026-08-10 sweep found this "
+                         "parameter dominates drift (it is ~30,000x the measured "
+                         "Sigma_q, so it effectively sets how much the contact FK "
+                         "measurement is listened to at all). The recommended "
+                         "checkpoint was trained at 1e-3; running it at 0 evaluates a "
+                         "configuration it never saw.")
+    ap.add_argument("--imu-noise", action="store_true",
+                    help="corrupt the IMU as the training pool was collected "
+                         "(n8fix has imu_noise=True and a true gyro bias). Running a "
+                         "net trained on noisy IMU against clean sensors is a "
+                         "distribution shift, and the estimator's bias state has "
+                         "nothing to estimate.")
+    ap.add_argument("--noise-seed", type=int, default=0)
+    ap.add_argument("--metrics", default=None, metavar="PATH.json",
+                    help="also record per-motion vertical drift (estimate vs truth)")
     args = ap.parse_args()
 
     w, h = (int(v) for v in args.size.lower().split("x"))
     loop = re_mod.make_estimated_loop(
         "baseline", with_visuals=True, contactnet=args.contactnet,
         contactnet_norm=args.contactnet_norm, verbose=True,
-        contacts_per_foot=args.contacts_per_foot)
+        contacts_per_foot=args.contacts_per_foot,
+        contact_meas_var=args.contact_meas_var,
+        noise=(re_mod.IMUNoise(seed=args.noise_seed) if args.imu_noise else None))
+    print(f"  contact_meas_var={args.contact_meas_var:g}")
     ghost = Ghost(loop.m, loop.maps, loop.filtered_slots, mode=args.ghost)
 
     rec = rp.VideoRecorder(loop.m, args.out, body=loop.maps["BASE_BID"],
@@ -88,6 +108,7 @@ def main():
           f"contactnet={'yes' if args.contactnet else 'no (baseline)'}")
     tick = 0
     stop = False
+    trace = []                       # (label, t, e_z, horiz_err) per control tick
     for label, cmd, secs in SCHEDULE:
         if stop:
             break
@@ -97,14 +118,51 @@ def main():
         print(f"    {label:10s} cmd={cmd} for {n} ticks")
         for _ in range(n):
             loop.control_tick()
+            est = loop.current_estimate()
+            if est is not None:
+                p_true = np.asarray(loop.d.xpos[loop.maps["BASE_BID"]], dtype=float)
+                e = np.asarray(est.p, dtype=float) - p_true
+                trace.append((label, tick * control_dt, float(e[2]),
+                              float(np.linalg.norm(e[:2]))))
             if tick % stride == 0:
-                capture_with_ghost(rec, loop.d, ghost, loop.current_estimate())
+                capture_with_ghost(rec, loop.d, ghost, est)
             tick += 1
             if not np.all(np.isfinite(loop.d.qpos)):
                 print(f"    !! non-finite state during {label}; stopping")
                 stop = True
                 break
     rec.close()
+
+    if trace:
+        import json
+        from collections import OrderedDict
+        by = OrderedDict()
+        for label, t, ez, eh in trace:
+            by.setdefault(label, []).append((t, ez, eh))
+        print("\n  closed-loop vertical error, per motion "
+              "(e_z = p_hat_z - p_true_z; CUMULATIVE across the clip)")
+        print(f"    {'motion':10s} {'secs':>5s} {'e_z start':>10s} {'e_z end':>9s} "
+              f"{'d(e_z)':>8s} {'rate m/s':>9s} {'horiz':>7s}")
+        rows = []
+        for label, seg in by.items():
+            t = np.array([r[0] for r in seg]); ez = np.array([r[1] for r in seg])
+            eh = np.array([r[2] for r in seg])
+            # rate WITHIN the motion: the clip is one continuous run, so absolute e_z
+            # carries in from earlier motions and only the slope is attributable here.
+            rate = float(np.polyfit(t, ez, 1)[0]) if len(t) > 2 else float("nan")
+            rows.append(dict(motion=label, seconds=float(t[-1] - t[0]),
+                             ez_start=float(ez[0]), ez_end=float(ez[-1]),
+                             ez_delta=float(ez[-1] - ez[0]), rate_mps=rate,
+                             horiz_end=float(eh[-1])))
+            print(f"    {label:10s} {rows[-1]['seconds']:5.1f} {ez[0]:+10.3f} "
+                  f"{ez[-1]:+9.3f} {rows[-1]['ez_delta']:+8.3f} {rate:+9.5f} "
+                  f"{eh[-1]:7.3f}")
+        if args.metrics:
+            pathlib_out = args.metrics
+            with open(pathlib_out, "w") as f:
+                json.dump(dict(contact_meas_var=args.contact_meas_var,
+                               contactnet=args.contactnet, per_motion=rows), f, indent=2)
+            print(f"  metrics -> {pathlib_out}")
 
 
 if __name__ == "__main__":
