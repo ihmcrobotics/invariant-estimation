@@ -1,0 +1,94 @@
+[
+  {
+    "cell": "L256_A_l2vel",
+    "L": 256,
+    "objective": "l2_velocity",
+    "vel_rmse": 0.048678820169816006,
+    "drift_z": -0.0054158860355807276,
+    "base_drift_z": -0.007111263951621689,
+    "final_ez": -0.13266673305699891,
+    "base_final_ez": -0.19471438803272934,
+    "horiz_pct": 0.6901637786140675,
+    "base_horiz_pct": 0.5160645940031159,
+    "nis_over_dof": 0.021767665418342817,
+    "base_nis_over_dof": 0.001472713898562307,
+    "contact_meas_var": 0.001,
+    "seconds": 27.98,
+    "per_rollout": [
+      {
+        "name": "flat/seed28",
+        "drift_z": -0.004391569448055885,
+        "final_ez": -0.11769372626891028,
+        "base_drift_z": -0.005319714572626164,
+        "nis_over_dof": 0.023574834407168694
+      },
+      {
+        "name": "hard_stepping/seed27",
+        "drift_z": -0.009284141539657252,
+        "final_ez": -0.23566056347784015,
+        "base_drift_z": -0.008238999491217052,
+        "nis_over_dof": 0.02470514588793329
+      },
+      {
+        "name": "stepping_stones/seed22",
+        "drift_z": -0.0031502320635238942,
+        "final_ez": -0.03344316802282343,
+        "base_drift_z": -0.009234708224618757,
+        "nis_over_dof": 0.01933583531608336
+      },
+      {
+        "name": "waves/seed25",
+        "drift_z": -0.0048376010910858806,
+        "final_ez": -0.1438694744584218,
+        "base_drift_z": -0.005651633518024787,
+        "nis_over_dof": 0.019454846062185917
+      }
+    ]
+  },
+  {
+    "cell": "L256_C_l2velori",
+    "L": 256,
+    "objective": "l2_vel_ori",
+    "vel_rmse": 0.047595926523239976,
+    "drift_z": -0.0063776934715065615,
+    "base_drift_z": -0.007111263951621689,
+    "final_ez": -0.16485330815438423,
+    "base_final_ez": -0.19471438803272934,
+    "horiz_pct": 0.4898070356338431,
+    "base_horiz_pct": 0.5160645940031159,
+    "nis_over_dof": 0.01386890025514959,
+    "base_nis_over_dof": 0.001472713898562307,
+    "contact_meas_var": 0.001,
+    "seconds": 27.98,
+    "per_rollout": [
+      {
+        "name": "flat/seed28",
+        "drift_z": -0.005214316705075025,
+        "final_ez": -0.12726485366968066,
+        "base_drift_z": -0.005319714572626164,
+        "nis_over_dof": 0.014568009151474869
+      },
+      {
+        "name": "hard_stepping/seed27",
+        "drift_z": -0.010105294424494511,
+        "final_ez": -0.2723339435961164,
+        "base_drift_z": -0.008238999491217052,
+        "nis_over_dof": 0.016224318644352528
+      },
+      {
+        "name": "stepping_stones/seed22",
+        "drift_z": -0.005084495323047737,
+        "final_ez": -0.08887703668213354,
+        "base_drift_z": -0.009234708224618757,
+        "nis_over_dof": 0.012023546873009452
+      },
+      {
+        "name": "waves/seed25",
+        "drift_z": -0.005106667433408974,
+        "final_ez": -0.17093739866960633,
+        "base_drift_z": -0.005651633518024787,
+        "nis_over_dof": 0.01265972635176151
+      }
+    ]
+  }
+]
