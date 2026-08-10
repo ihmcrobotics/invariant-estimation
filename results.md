@@ -309,13 +309,84 @@ helps most (0.057 → 0.040).
 
 ## Recommended next
 
-1. **Adopt `l2_vel_pos` as the default composite** — it is the clean win (beats
-   analytic, no orientation ambiguity, fewer knobs).
-2. **Matched-step A/B/C/D rerun** to remove the step-count confound before quoting
-   D over B.
+> **SUPERSEDED 2026-08-10 — do not act on items 1–2.** Both rest on held-out velocity
+> RMSE, which was subsequently measured to be *uncorrelated* with vertical drift
+> (Spearman +0.05 over nine checkpoints). The matched-step rerun in item 2 was done:
+> with the contact R floor live, `l2_vel_pos` came back the **worst** of the four arms
+> (+41% vs the analytic baseline), inverting the ranking below. See §8.
+
+1. ~~**Adopt `l2_vel_pos` as the default composite**~~ — see the note above.
+2. ~~**Matched-step A/B/C/D rerun**~~ — done; see §8.
 3. The calibration (NIS/dof ≪ 1) is now the limiting factor, not the mean — pursue
    the Block-C noise-model reconciliation next, not more loss terms.
 
 Runs: `results/2026-08-06_*_{A_l2vel,B_l2velpos,C_l2velori,D_l2velposori}/`
 (each with `summary.json`, `training.png`, `validation.png`); combined summary in
 `results/l2_options_summary.png`.
+
+
+---
+
+## 8. L-ablation and the z-drift pivot (2026-08-09/10)
+
+Full write-ups: `~/Documents/filter-debugging/z-drift-pivot.pdf` (results),
+`contact-zero-velocity.pdf` (the structural proposal), `branch-fixes.pdf` (what to
+port back). Mechanism detail and the invariants live in `PORT_NOTES.md` and
+`CLAUDE.md` §7. This section is the outcome only.
+
+### What was run
+
+4 objectives x L in {128, 256, 512} at **matched 6000 steps** on the `n8fix` pool,
+after fixing two dead knobs (`remat`, `contact_meas_var` — see PORT_NOTES). Then a
+six-point contact-R-floor sweep, a randomized-motion pool, and a closed-loop check.
+
+### What it showed
+
+* **The objective stops mattering once the horizon is adequate.** At L=128 the four
+  arms spread 54% on held-out velocity RMSE; at L=256, 2.5% — all beating the
+  analytic baseline. The L2-options ranking above is a low-horizon artifact.
+* **The horizon is spent by L=256.** L=512 is worse on drift; NEES_z saturates at
+  ~2.0; NIS/dof is flat at ~0.18 across every L. An L=1024 column was queued and
+  cancelled.
+* **Randomized motion hurt.** Spectrally it worked (gait line 62% -> 34% of in-band
+  power) and cost 2.4x on drift when scored on walking.
+* **No R floor gives both low drift and consistency.** Every floor that looks good on
+  drift is a cancellation across terrains; the only sign-consistent one (1e-3) is the
+  worst on both axes. NIS/dof is monotone in the floor.
+
+### The result that invalidates the rest
+
+**Offline replay is not a valid metric for a learned Sigma_C.** Replay and closed-loop
+agree for the *analytic* arm and disagree by **21x** on the learned one: the best
+checkpoint measures -0.085 m in replay (and "2.3x better than analytic") and
+**+2.49 m** closed-loop, against the analytic heuristic's -0.117 m in the same
+harness. `scripts/online_offline_oracle.py` confirms the deployed path is faithful to
+1e-15, so this is the metric, not a bug.
+
+Everything in this section derived from replay — the floor sweep, the sign analysis,
+the arm ranking — therefore needs redoing closed-loop (~3 min per configuration,
+*cheaper* than replay). The analytic-baseline rows are unaffected.
+
+### Why the network fails, and the one fix tried
+
+Learned Sigma_C modulates stance->swing by 885x where the analytic heuristic spans
+1e10 — 685x too tight in swing, so the filter treats a lifting foot as world-static
+and pushes the *base* upward. Error is ~0 standing and appears the moment walking
+starts.
+
+`diag_param="exp"` (log-parameterised diag(L)) was added to open that range and
+retrained once. **The mechanism worked and the optimisation did not:** span 12.8 ->
+21.9 raw units, swing Sigma_C from 685x to **8x** too tight — but held-out RMSE 1.374
+vs the analytic 0.0607, loss rising, 30 non-finite steps. `exp` is unbounded (p99
+per-axis Sigma_C ~2.7e5, contact update effectively off) and its uniform relative
+sensitivity makes `peak_lr=1e-4`, tuned for softplus, too aggressive. Default stays
+`softplus`.
+
+### Open
+
+1. Redo the floor sweep closed-loop (~20 min total).
+2. Bounded/retuned `exp` (clamp to ~[1e-4, 1e2], lower LR).
+3. The structural option: the contact **zero-velocity constraint**, which adds rows
+   to `H` rather than reweighting existing ones. `H` currently has no velocity
+   columns, and 98.6% of the sink flows through the contact update's write into
+   `v_hat`/`R_hat`. Derivation in `contact-zero-velocity.pdf`.
