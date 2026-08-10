@@ -43,7 +43,7 @@ if [ -f results/l_ablation/drift_backfill.json ]; then
   log "stage 1: drift_backfill already present, skipping"
 else
   log "stage 1: measuring drift on the finished L-ablation cells"
-  uv run --extra gpu python scripts/drift_backfill.py --root results/l_ablation 2>&1 | tee -a "$LOG"
+  bash scripts/gpu_lock.sh uv run --extra gpu python scripts/drift_backfill.py --root results/l_ablation 2>&1 | tee -a "$LOG"
   log "stage 1 done (exit $?)"
 fi
 
@@ -81,7 +81,7 @@ for tag in ${ARMS}; do
   cell="$OUT/L${L}_${tag}"
   if [ -f "${cell}/summary.json" ]; then log "stage 3: ${tag} done, skipping"; continue; fi
   log "stage 3: training ${tag} (${OBJ[$tag]}) at L=${L} on the randomized pool"
-  uv run --extra gpu python scripts/run_contactnet.py \
+  bash scripts/gpu_lock.sh uv run --extra gpu python scripts/run_contactnet.py \
      --pool "${POOL}" --contacts-per-foot 4 --objective "${OBJ[$tag]}" \
      --L "${L}" --no-remat --contact-meas-var 1.0e-4 \
      --steps "${STEPS}" --warmup-steps 100 --time-budget-s 86400 \
@@ -101,7 +101,7 @@ done
 # norm_constants.npz rather than refitting, which is what makes the cross-pool
 # comparison legitimate instead of silently distribution-shifted.
 log "stage 4: drift for the randomized nets, evaluated on the n8fix walking held-out set"
-uv run --extra gpu python scripts/drift_backfill.py --root "$OUT" --pool n8fix \
+bash scripts/gpu_lock.sh uv run --extra gpu python scripts/drift_backfill.py --root "$OUT" --pool n8fix \
    --out "$OUT/drift_rand_on_walking.json" 2>&1 | tee -a "$LOG"
 
 log "=== overnight complete ==="
