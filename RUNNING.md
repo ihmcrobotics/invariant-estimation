@@ -290,6 +290,92 @@ which is what keeps "the same objective" meaningful), and at matched steps `L=51
 sees 4× the trajectory of `L=128`, so *data seen* is not matched — inherent to a
 matched-step L ablation.
 
+### Measuring drift, not RMSE — `scripts/drift_backfill.py`
+
+**Do not rank ContactNet arms on held-out velocity RMSE.** Measured over nine
+checkpoints, Spearman(|drift_z|, vel RMSE) = **+0.05** — the metric every arm has
+been selected on is uncorrelated with the drift we care about.
+
+```bash
+uv run --extra gpu python scripts/drift_backfill.py --root results/l_ablation
+uv run --extra gpu python scripts/drift_backfill.py --root results/rand_motion \
+    --pool n8fix --only L256_A_l2vel     # cross-pool: train anywhere, score on walking
+```
+
+Replays each checkpoint over an identical held-out region (truth-seeded, so vertical
+error starts at exactly zero) and reports `drift_z` (least-squares slope, m/s),
+`final_ez`, `horiz_pct` (against **true** path length), and contact `NIS/dof`. It
+prints both rankings and their Spearman correlation.
+
+Three things it does deliberately, each of which would silently invalidate the
+comparison otherwise:
+
+* **One region for every cell.** `prepare` sets `t_hi = T − L`, so scoring each cell
+  at its own `L` would give different-`L` cells different spans. `EVAL_L` pins one.
+* **Each cell's own frozen `norm_constants.npz`**, never refit from the evaluation
+  pool. Refitting is invisible for a same-pool cell and silently distribution-shifting
+  for a cross-pool one — i.e. wrong for exactly the comparison worth making.
+* **`--pool` selects evaluation rollouts, `--root` selects checkpoints.** Training on
+  one distribution and scoring on another is a supported, deliberate combination.
+
+`drift_z` and `final_ez` **rank cells differently** — slope answers "where in ten
+minutes", accumulated error answers "where now". Pick the one your deployment cares
+about; they disagree.
+
+This ranks; it does not explain. `experiments/z_budget.py` (branch
+`full-filter/z-debug`) remains the tool that attributes the sink to a specific filter
+write and sweeps terrain to catch cancellations.
+
+### The contact R floor — `scripts/zdrift_tonight.sh`, `zdrift_summary.py`
+
+`--contact-meas-var` is the largest lever measured (27% on RMSE; it flipped
+ContactNet from 2.5× *worse* than the analytic heuristic on drift to 0.26×). Because
+the floor is applied to the **replayed** inputs, an existing checkpoint can be scored
+at any floor without retraining (~5 min/point), which is what makes a sweep cheap:
+
+```bash
+FLOORS="0 3e-5 1e-4 3e-4 1e-3 3e-3" bash scripts/zdrift_tonight.sh
+uv run python scripts/zdrift_summary.py          # incremental: reads whatever exists
+```
+
+Read **both** columns. The floor sets innovation covariance directly, so raising it
+pushes `NIS/dof` *away* from 1 while it may improve drift — if the two goals pull
+apart, that tension is the result, and the combined score hides it.
+
+### Serialize GPU work — `scripts/gpu_lock.sh`
+
+JAX preallocates ~75% of the device per process, so a second JAX job on this 12 GB
+card does not run slower — it OOMs, **and takes the first one down with it**. On
+2026-08-09 a drift evaluation launched alongside a training cell killed the cell 2.5
+minutes in and then died itself, costing the night's queue. Wrap anything that touches
+the GPU:
+
+```bash
+bash scripts/gpu_lock.sh uv run --extra gpu python scripts/run_contactnet.py …
+```
+
+`flock` blocks rather than failing, so a queued job waits its turn. The victim is
+whichever process next instantiates a CUDA graph, not the one that over-committed,
+which is why care alone is not a control.
+
+### Breaking the stride clock — motion randomization
+
+`collect_dr_pool.py` takes `--cmd-resample-s`, `--cmd-vx/vy/yaw`, `--disturb-rate-hz`.
+The default `cmd_resample_s=3.0` is *slower* than the measured ~1.0 s stride, so the
+gait settles into a limit cycle and gait phase becomes nearly deterministic from the
+sensor window — which lets the network regress Σ_C off phase (phase R² = 0.942)
+instead of contact condition.
+
+```bash
+bash scripts/rand_motion_check.sh 0.4 0.8        # survivability FIRST — falls yield no data
+uv run python scripts/plot_pool_psd.py           # did periodicity actually break?
+```
+
+It works spectrally (gait line 62% → 34% of in-band power, sub-gait 9% → 19%) but
+**measured worse for deployment**: scored on walking, the randomized-trained net was
+2.4× worse on drift slope. Breaking the shortcut removed something useful for the
+distribution we deploy into.
+
 **Gate before pushing:** `bash scripts/verify.sh` — the Layer-1 deterministic
 checks (F=30, `d_in=600`, `stride=1`, channel order q,q̇,τ; process-socket-only;
 nothing under `tests/` modified; the `test_online` geometry). It only greps and
