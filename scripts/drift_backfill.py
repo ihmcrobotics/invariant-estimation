@@ -95,8 +95,10 @@ def drift_of(prep, cache, norm, cfg, params, fused, P0, eps, dt):
         # zero-error start -- the same convention the z-drift reports use.
         slope = float(np.polyfit(t, e[:, 2], 1)[0])
         horiz = float(np.linalg.norm(e[-1, :2]))
+        dof = 3 * out.state.d.shape[-2]
         return dict(drift_z=slope, final_ez=float(e[-1, 2]),
                     horiz_pct=100.0 * horiz / max(path, 1e-9),
+                    nis_over_dof=float(jnp.mean(out.contact_diagnostics.nis)) / dof,
                     seconds=float(t[-1]), path_m=path)
 
     baseline = run(inputs.contact_chol)
@@ -111,10 +113,14 @@ def main():
     ap.add_argument("--contacts-per-foot", type=int, default=4)
     ap.add_argument("--contact-meas-var", type=float, default=1.0e-4)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--only", nargs="+", default=None,
+                    help="restrict to cells whose name matches one of these exactly")
     args = ap.parse_args()
 
     root = Path(args.root) if Path(args.root).is_absolute() else REPO / Path(args.root)
     cells = sorted(p.parent for p in root.glob("L*_*/params.npz"))
+    if args.only:
+        cells = [c for c in cells if c.name in set(args.only)]
     if not cells:
         raise SystemExit(f"no cells with params.npz under {root}")
     print(f"cells: {[c.name for c in cells]}")
@@ -189,6 +195,9 @@ def main():
                 drift_z=mean(1, "drift_z"), base_drift_z=mean(0, "drift_z"),
                 final_ez=mean(1, "final_ez"), base_final_ez=mean(0, "final_ez"),
                 horiz_pct=mean(1, "horiz_pct"), base_horiz_pct=mean(0, "horiz_pct"),
+                nis_over_dof=mean(1, "nis_over_dof"),
+                base_nis_over_dof=mean(0, "nis_over_dof"),
+                contact_meas_var=float(args.contact_meas_var),
                 seconds=per[0][1]["seconds"]))
             print(f"  {cell.name:22s} drift_z {rows[-1]['drift_z']:+.5f} m/s "
               f"(analytic {rows[-1]['base_drift_z']:+.5f})  rmse {rmse:.4f}", flush=True)
