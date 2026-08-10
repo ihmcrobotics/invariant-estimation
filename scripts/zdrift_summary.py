@@ -36,6 +36,22 @@ def load():
     return rows
 
 
+def sign_consistent(r):
+    """Does every held-out terrain agree on the SIGN of the accumulated error?
+
+    A floor sitting on the zero crossing of drift produces a small MEAN while
+    individual terrains sit either side of zero. That is a cancellation, not a fix,
+    and the 2026-08-07 study measured this parameter doing exactly that: its
+    flat-ground optimum drifts upward on terrain. Selecting on |mean| alone walks
+    straight into it, so a mixed-sign floor is disqualified rather than ranked.
+    """
+    per = r.get("per_rollout")
+    if not per:
+        return None                      # evaluated before per-rollout was recorded
+    signs = {e["final_ez"] > 0 for e in per}
+    return len(signs) == 1
+
+
 def score(r):
     """Distance from the two targets, in log space so both are scale-free.
 
@@ -60,16 +76,24 @@ def main():
         by_floor = {}
         for r in rows:
             by_floor.setdefault(r["floor"], []).append(score(r))
-        best = min(by_floor, key=lambda f: sum(by_floor[f]) / len(by_floor[f]))
+        # disqualify any floor whose terrains disagree on sign -- see sign_consistent
+        ok = {}
+        for r in rows:
+            c = sign_consistent(r)
+            ok.setdefault(r["floor"], []).append(c is not False)
+        eligible = {f: v for f, v in by_floor.items() if all(ok.get(f, [True]))}
+        pool = eligible or by_floor
+        best = min(pool, key=lambda f: sum(pool[f]) / len(pool[f]))
         print(best)
         return
 
-    print("\n| floor | cell | |drift_z| | final e_z | NIS/dof (→1) | analytic NIS |")
-    print("|---|---|---|---|---|---|")
+    print("\n| floor | cell | |drift_z| | final e_z | NIS/dof (→1) | analytic NIS | sign agrees |")
+    print("|---|---|---|---|---|---|---|")
     for r in sorted(rows, key=lambda r: (r["floor_f"], r["cell"])):
+        agree = {True: "yes", False: "**MIXED**", None: "?"}[sign_consistent(r)]
         print(f"| {r['floor']} | {r['cell']} | {abs(r['drift_z']):.5f} | "
               f"{r['final_ez']:+.3f} | {r['nis_over_dof']:.3f} | "
-              f"{r['base_nis_over_dof']:.3f} |")
+              f"{r['base_nis_over_dof']:.3f} | {agree} |")
     by_floor = {}
     for r in rows:
         by_floor.setdefault(r["floor"], []).append(r)

@@ -198,7 +198,13 @@ def main():
                 nis_over_dof=mean(1, "nis_over_dof"),
                 base_nis_over_dof=mean(0, "nis_over_dof"),
                 contact_meas_var=float(args.contact_meas_var),
-                seconds=per[0][1]["seconds"]))
+                seconds=per[0][1]["seconds"],
+                per_rollout=[{"name": vp.name,
+                              "drift_z": r[1]["drift_z"],
+                              "final_ez": r[1]["final_ez"],
+                              "base_drift_z": r[0]["drift_z"],
+                              "nis_over_dof": r[1]["nis_over_dof"]}
+                             for vp, r in zip(val_preps, per)]))
             print(f"  {cell.name:22s} drift_z {rows[-1]['drift_z']:+.5f} m/s "
               f"(analytic {rows[-1]['base_drift_z']:+.5f})  rmse {rmse:.4f}", flush=True)
 
