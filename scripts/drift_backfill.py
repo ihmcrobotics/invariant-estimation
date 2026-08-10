@@ -113,6 +113,12 @@ def main():
     ap.add_argument("--contacts-per-foot", type=int, default=4)
     ap.add_argument("--contact-meas-var", type=float, default=1.0e-4)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--sigma-q-scale", nargs="+", type=float, default=None,
+                    help="rescale recorded Sigma_q per joint (1 value = uniform, "
+                         "9 = per-joint). Joint NEES is 48.5 vs a target of 9, so the "
+                         "joint KF is overconfident ~5.4x, structured 0.56-6.41 across "
+                         "joints. Tests whether an ISOTROPIC correction suffices -- "
+                         "invariant I9 says it should not.")
     ap.add_argument("--only", nargs="+", default=None,
                     help="restrict to cells whose name matches one of these exactly")
     args = ap.parse_args()
@@ -179,6 +185,11 @@ def main():
             dataset.prepare(train_paths, norm, cfg), args.contact_meas_var, pool_cmv)
         val_preps = dataset.apply_contact_meas_floor(
             dataset.prepare(val_paths, norm, cfg), args.contact_meas_var, pool_cmv)
+        if args.sigma_q_scale:
+            sc = (args.sigma_q_scale[0] if len(args.sigma_q_scale) == 1
+                  else args.sigma_q_scale)
+            train_preps = dataset.scale_sigma_q(train_preps, sc)
+            val_preps = dataset.scale_sigma_q(val_preps, sc)
         P0 = dataset.measure_p0(c.fused, train_preps[0], cfg, ticks=3000)
         vcache = {vp.name: caches[p] for vp, p in zip(val_preps, val_paths)}
 

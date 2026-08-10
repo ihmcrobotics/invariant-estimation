@@ -309,6 +309,42 @@ def apply_contact_meas_floor(preps: Sequence[PreparedRollout],
     return out
 
 
+def scale_sigma_q(preps: Sequence[PreparedRollout], scale) -> list[PreparedRollout]:
+    r"""Rescale the RECORDED joint covariance per joint: ``Sigma_q <- D Sigma_q D``.
+
+    Measured on the n8fix pool, joint-level NEES over the 9 filtered joints is 48.5
+    against a target of 9 -- the joint KF is OVERCONFIDENT by ~5.4x. And the error is
+    structured, not a uniform scale: per-joint ``e^2/sigma^2`` runs 0.56 to 6.41.
+
+    That matters because `contact_meas_var` is an ISOTROPIC floor, and the port's
+    invariant I9 is "per-joint noise scaling, never uniform". A single scalar cannot
+    represent a 12x spread across joints, which is the likeliest reason that knob
+    behaves like a bias trim -- moving drift monotonically through zero -- rather
+    than like a noise parameter.
+
+    ``D = diag(sqrt(scale))`` scales VARIANCES by ``scale`` per joint while leaving
+    the correlation structure intact; the joint KF's Sigma_q is genuinely coupled
+    through the mass matrix and diagonalising it would discard exactly what
+    ``J Sigma_q J^T`` needs.
+
+    `scale` is a scalar or a length-9 sequence. Only the filtered block is touched --
+    the off-path (aux) joints have no measured ratio, so they are left alone rather
+    than scaled on a guess.
+    """
+    scale = np.asarray(scale, dtype=np.float64)
+    out = []
+    for prep in preps:
+        sq = np.array(prep.inputs.joint.sigma_q, dtype=np.float64, copy=True)
+        n = 9 if scale.ndim and scale.size == 9 else sq.shape[-1]
+        d = np.ones(sq.shape[-1], dtype=np.float64)
+        d[:n] = np.sqrt(np.broadcast_to(scale, (n,)))
+        D = np.diag(d)
+        sq = D @ sq @ D
+        joint = prep.inputs.joint._replace(sigma_q=sq)
+        out.append(dataclasses.replace(prep, inputs=prep.inputs._replace(joint=joint)))
+    return out
+
+
 def _assert_float64(prep: PreparedRollout) -> None:
     """I8 at the dataset boundary: a float32 leaf here silently downcasts the filter."""
     leaves = [prep.channels, prep.y_fk, prep.R_true, prep.v_true, prep.p_true]
