@@ -48,9 +48,32 @@ def main():
                     help="filename tag, e.g. n8fix. Use to keep a re-collected pool "
                          "(e.g. after the waves-seed fix) from writing over an "
                          "existing same-N pool.")
+    # --- motion-randomization knobs (see RUNNING.md, "breaking the stride clock") ---
+    # Default cmd_resample_s=3.0 is SLOWER than the ~1.0 s stride, so the gait settles
+    # into a clean limit cycle and gait phase becomes a near-deterministic function of
+    # the sensor window -- which lets ContactNet regress the phase-conditional mean of
+    # Sigma_C instead of learning contact condition (measured: phase R^2 = 0.942).
+    # Resampling below the stride, and allowing the ranges to reach zero (stop-start,
+    # turn-in-place), destroys that shortcut.
+    ap.add_argument("--cmd-resample-s", type=float, default=None,
+                    help="command resample period [s]. Below the ~1.0 s stride to "
+                         "break gait periodicity; 3.0 (default cfg) preserves it.")
+    ap.add_argument("--cmd-vx", type=float, nargs=2, default=None, metavar=("LO", "HI"))
+    ap.add_argument("--cmd-vy", type=float, nargs=2, default=None, metavar=("LO", "HI"))
+    ap.add_argument("--cmd-yaw", type=float, nargs=2, default=None, metavar=("LO", "HI"))
+    ap.add_argument("--disturb-rate-hz", type=float, default=None,
+                    help="push rate; raising it also breaks periodicity")
     args = ap.parse_args()
 
-    cfg = ContactNetConfig(env_dr=True)
+    over = {}
+    if args.cmd_resample_s is not None: over["cmd_resample_s"] = args.cmd_resample_s
+    if args.cmd_vx  is not None: over["cmd_vx_range"]  = tuple(args.cmd_vx)
+    if args.cmd_vy  is not None: over["cmd_vy_range"]  = tuple(args.cmd_vy)
+    if args.cmd_yaw is not None: over["cmd_yaw_range"] = tuple(args.cmd_yaw)
+    if args.disturb_rate_hz is not None: over["disturb_rate_hz"] = args.disturb_rate_hz
+    cfg = ContactNetConfig(env_dr=True, **over)
+    if over:
+        print(f"motion randomization overrides: {over}", flush=True)
     c = collect.build_collector(contacts_per_foot=args.contacts_per_foot, verbose=True)
     print(f"collecting N={c.fused.n_contacts} pool, terrains={args.terrains}, "
           f"{args.seeds} rollouts of {args.seconds}s -> {args.out_dir}", flush=True)

@@ -55,7 +55,8 @@ import jax
 import jax.numpy as jnp
 
 import invariant_estimation  # noqa: F401  (x64)
-from invariant_estimation.contactnet import dataset, network, rollout as cn_rollout
+from invariant_estimation.contactnet import dataset, network, normalize
+from invariant_estimation.contactnet import rollout as cn_rollout
 from invariant_estimation.contactnet.config import ContactNetConfig
 from invariant_estimation.inEKF.filter import init_carry, make_step
 from invariant_estimation.inEKF.state import InEKFState
@@ -131,37 +132,65 @@ def main():
     print(f"held-out: {[p.name for p in val_paths]}")
 
     dataset.build_channel_cache(train_paths + val_paths, c)
-    norm = dataset.fit_normalization(train_paths)
     pool_cmv = rc.pool_contact_meas_var(train_paths + val_paths)
+    caches = {p: dataset.load_channel_cache(dataset.cache_path(p)) for p in val_paths}
 
-    train_preps = dataset.apply_contact_meas_floor(
-        dataset.prepare(train_paths, norm, cfg), args.contact_meas_var, pool_cmv)
-    val_preps = dataset.apply_contact_meas_floor(
-        dataset.prepare(val_paths, norm, cfg), args.contact_meas_var, pool_cmv)
-    P0 = dataset.measure_p0(c.fused, train_preps[0], cfg, ticks=3000)
+    # Each cell is evaluated under ITS OWN frozen normalization, loaded from the
+    # checkpoint directory -- never refit here. `params.npz` and `norm_constants.npz`
+    # are a matched pair (RUNNING.md: "load them together -- a mismatch silently
+    # shifts the input distribution"). Refitting from this pool would be invisible
+    # and harmless for a cell trained on this pool, and silently wrong for one
+    # trained on another, which is exactly the comparison we want to make: train on
+    # randomized motion, evaluate on the walking distribution we deploy into.
+    #
+    # Distinct norms are grouped so `prepare` runs once per norm, not once per cell.
+    def norm_key(cell):
+        z = np.load(cell / "norm_constants.npz")
+        return (z["mean"].tobytes(), z["std"].tobytes())
+
+    def load_norm(cell):
+        z = np.load(cell / "norm_constants.npz")
+        return normalize.NormConstants(
+            mean=jnp.asarray(z["mean"], dtype=jnp.float64),
+            std=jnp.asarray(z["std"], dtype=jnp.float64),
+            names=tuple(str(s) for s in z["names"]),
+            n_ticks=0, source=f"loaded from {cell.name}",
+            floored=tuple(str(s) for s in z["floored"]))
+
+    groups = {}
+    for cell in cells:
+        groups.setdefault(norm_key(cell), []).append(cell)
+    print(f"{len(groups)} distinct normalization(s) across {len(cells)} cells")
 
     like = network.init(jax.random.PRNGKey(0), cfg.d_in, cfg.widths,
                         cfg.sigma_0, cfg.eps)
-    caches = {vp.name: dataset.load_channel_cache(dataset.cache_path(p))
-              for vp, p in zip(val_preps, val_paths)}
+    from invariant_estimation.contactnet import train as cn_train
 
     rows = []
-    for cell in cells:
-        from invariant_estimation.contactnet import train as cn_train
-        params = cn_train.load_params(str(cell / "params.npz"), like)
-        per = [drift_of(vp, caches[vp.name], norm, cfg, params, c.fused, P0,
-                        cfg.eps, cfg.dt) for vp in val_preps]
-        mean = lambda arm, k: float(np.mean([r[arm][k] for r in per]))
-        summ = json.loads((cell / "summary.json").read_text())
-        rmse = float(np.mean([v["learned"]["vel_rmse"] for v in summ["val"]]))
-        rows.append(dict(
-            cell=cell.name, L=summ["cfg"]["L"], objective=summ["cfg"]["objective"],
-            vel_rmse=rmse,
-            drift_z=mean(1, "drift_z"), base_drift_z=mean(0, "drift_z"),
-            final_ez=mean(1, "final_ez"), base_final_ez=mean(0, "final_ez"),
-            horiz_pct=mean(1, "horiz_pct"), base_horiz_pct=mean(0, "horiz_pct"),
-            seconds=per[0][1]["seconds"]))
-        print(f"  {cell.name:22s} drift_z {rows[-1]['drift_z']:+.5f} m/s "
+    for key, group in groups.items():
+        norm = load_norm(group[0])
+        train_preps = dataset.apply_contact_meas_floor(
+            dataset.prepare(train_paths, norm, cfg), args.contact_meas_var, pool_cmv)
+        val_preps = dataset.apply_contact_meas_floor(
+            dataset.prepare(val_paths, norm, cfg), args.contact_meas_var, pool_cmv)
+        P0 = dataset.measure_p0(c.fused, train_preps[0], cfg, ticks=3000)
+        vcache = {vp.name: caches[p] for vp, p in zip(val_preps, val_paths)}
+
+        for cell in group:
+            params = cn_train.load_params(str(cell / "params.npz"), like)
+            per = [drift_of(vp, vcache[vp.name], norm, cfg, params, c.fused, P0,
+                            cfg.eps, cfg.dt) for vp in val_preps]
+            mean = lambda arm, k: float(np.mean([r[arm][k] for r in per]))
+            summ = json.loads((cell / "summary.json").read_text())
+            rmse = float(np.mean([v["learned"]["vel_rmse"] for v in summ["val"]]))
+            rows.append(dict(
+                cell=cell.name, L=summ["cfg"]["L"], objective=summ["cfg"]["objective"],
+                vel_rmse=rmse,
+                drift_z=mean(1, "drift_z"), base_drift_z=mean(0, "drift_z"),
+                final_ez=mean(1, "final_ez"), base_final_ez=mean(0, "final_ez"),
+                horiz_pct=mean(1, "horiz_pct"), base_horiz_pct=mean(0, "horiz_pct"),
+                seconds=per[0][1]["seconds"]))
+            print(f"  {cell.name:22s} drift_z {rows[-1]['drift_z']:+.5f} m/s "
               f"(analytic {rows[-1]['base_drift_z']:+.5f})  rmse {rmse:.4f}", flush=True)
 
     out = Path(args.out) if args.out else root / "drift_backfill.json"
