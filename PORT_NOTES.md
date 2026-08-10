@@ -2022,7 +2022,37 @@ recorded in `summary.json`. It must be read back: the two give the head's raw ou
 different meanings, so loading under the wrong one silently rescales Σ_C. `sigma_0`
 stays 1e-4 — the tight end was never the problem, and it preserves the "iteration 0
 emits the shipped filter's stance value" property `tests/sim/test_n8_network.py`
-asserts. **Unproven:** no arm has completed training under `exp`.
+asserts.
+
+**Result (2026-08-10, `results/zdrift_exp/L256_A_cmv1e-3_exp`, 6000 steps): the
+mechanism works, the optimisation does not.**
+
+    parameterisation   raw span      tr(Sigma_C) stance   swing      ratio
+    softplus           12.82 / 19.2  4.9e-4               0.44       8.9e2
+    exp                21.90 / 11.5  3.5e-4               37.5       1.07e5
+    analytic target    --            3.0e-8               3.0e+2     1.0e10
+
+The span more than doubled and overshot what `exp` requires; swing Sigma_C went from
+685x too tight to **8x** too tight — an 86x improvement on the exact quantity that
+makes the filter lift the base. Range was genuinely the binding constraint.
+
+But the run is unusable: held-out velocity RMSE 1.374 against the analytic baseline's
+0.0607, loss rising 0.376 -> 0.933 (peak 3.87), a gradient-norm spike to 13.9 near
+step 200, and 30 non-finite steps skipped by the train-step guard.
+
+Two coupled causes, both worth fixing before retrying:
+
+* **`exp` is unbounded and used it.** p99 raw output is +12.5, i.e. per-axis
+  Sigma_C ~ 2.7e5 — at those ticks the contact update is effectively switched off.
+  Clamping the map into the physically meaningful range (~[1e-4, 1e2]) would prevent
+  the escape without giving back the span.
+* **`exp` raises the effective learning rate.** Under softplus `dlogL/dr` is < 1 and
+  falling toward the swing end; under `exp` it is exactly 1 everywhere. `peak_lr =
+  1e-4` was tuned against the softplus geometry and is materially more aggressive in
+  Sigma_C-space.
+
+So: right diagnosis, right fix, wrong hyperparameters. `diag_param` stays defaulted
+to `softplus` until a bounded/retuned `exp` run beats it.
 
 ### 6. Measurements worth not re-deriving
 
