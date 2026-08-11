@@ -37,7 +37,7 @@ import jax.numpy as jnp
 from invariant_estimation.contactnet import (dataset as DS, features as F,
                                              network as N, normalize as NM,
                                              train as TR)
-from invariant_estimation.contactnet.config import ContactNetConfig
+from invariant_estimation.contactnet.checkpoint import config_for_checkpoint
 
 # Validated categorical slots 1-3 (light surface): worst-pair CVD dE 9.2,
 # normal-vision 27.6. Slot 3 (aqua) is 2.74:1 against the surface, below the 3:1
@@ -48,14 +48,19 @@ DT, W = 1.0e-3, 400          # +-0.4 s: a swing is ~0.4-0.5 s at this gait
 
 
 def load(ckpt, diag_param, t_max):
-    cfg = ContactNetConfig(diag_param=diag_param)
+    # `diag_param=None` (the default) restores what the run recorded; an explicit value
+    # overrides it, which is the only legitimate use -- deliberately reading a
+    # checkpoint under the wrong parameterisation to see the size of the error.
+    over = {} if diag_param is None else {"diag_param": diag_param}
+    cfg = config_for_checkpoint(str(ckpt), **over)
+    spec = cfg.diag_spec
     z = np.load(Path(ckpt) / "norm_constants.npz", allow_pickle=False)
     consts = NM.NormConstants(
         mean=jnp.asarray(z["mean"]), std=jnp.asarray(z["std"]),
         names=tuple(str(s) for s in z["names"]),
         floored=tuple(str(s) for s in z["floored"]), n_ticks=0, source=str(ckpt))
     like = N.init(jax.random.PRNGKey(0), cfg.d_in, cfg.widths, cfg.sigma_0,
-                  cfg.eps, diag_param)
+                  cfg.eps, spec)
     params = TR.load_params(str(Path(ckpt) / "params.npz"), like)
 
     path = sorted(glob.glob(str(REPO / "data" / "*_n8fix_seed*.npz")))[0]
@@ -63,8 +68,9 @@ def load(ckpt, diag_param, t_max):
     x = NM.apply(jnp.asarray(cache["channels"][:t_max]), consts)
     win = np.asarray(F.window(x, cfg.H))
     T, n_c = win.shape[0], win.shape[1]
-    L = np.asarray(jax.vmap(N.forward, in_axes=(None, 0, None, None))(
-        params, jnp.asarray(win.reshape(T * n_c, -1)), cfg.eps, diag_param))
+    L = np.asarray(jax.vmap(lambda p, xi: N.forward(p, xi, cfg.eps, spec),
+                            in_axes=(None, 0))(
+        params, jnp.asarray(win.reshape(T * n_c, -1))))
     learned = (L ** 2).sum(axis=(-2, -1)).reshape(T, n_c)
 
     with np.load(path, allow_pickle=True) as zz:
@@ -72,7 +78,7 @@ def load(ckpt, diag_param, t_max):
         gt = np.asarray(zz["sensors.contact"])[:T].astype(float)
     analytic = (an ** 2).sum(axis=(-2, -1))
     swing = analytic > 3e-2          # between the 1e-4 and 1e1 factor levels
-    return learned, analytic, gt, swing, cfg.H, n_c, Path(path).name
+    return learned, analytic, gt, swing, cfg.H, n_c, Path(path).name, cfg.diag_param
 
 
 def triggered(sig, swing, H, kind):
@@ -89,12 +95,14 @@ def triggered(sig, swing, H, kind):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="results/zdrift/L256_A_l2vel_cmv1e-3")
-    ap.add_argument("--diag-param", default="softplus", choices=["softplus", "exp"])
+    ap.add_argument("--diag-param", default=None, choices=list(N.DIAG_PARAMS),
+                    help="override the parameterisation recorded in the run's "
+                         "summary.json; default is to use what was recorded")
     ap.add_argument("--ticks", type=int, default=30000)
     ap.add_argument("--out", default="results/zdrift/contact_phase.png")
     args = ap.parse_args()
 
-    learned, analytic, gt, swing, H, n_c, roll = load(
+    learned, analytic, gt, swing, H, n_c, roll, dparam = load(
         args.ckpt, args.diag_param, args.ticks)
     lg = np.log10(np.clip(learned, 1e-30, None))
     la = np.log10(np.clip(analytic, 1e-30, None))
@@ -151,7 +159,7 @@ def main():
     out = REPO / args.out
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=140, facecolor=SURFACE)
-    print(f"wrote {out}   (rollout {roll}, N_c={n_c}, diag_param={args.diag_param})")
+    print(f"wrote {out}   (rollout {roll}, N_c={n_c}, diag_param={dparam})")
 
 
 if __name__ == "__main__":

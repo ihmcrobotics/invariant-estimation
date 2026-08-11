@@ -34,7 +34,7 @@ import jax.numpy as jnp
 
 import invariant_estimation  # noqa: F401
 from invariant_estimation.contactnet import dataset, network, normalize, rollout as cn_rollout
-from invariant_estimation.contactnet.config import ContactNetConfig
+from invariant_estimation.contactnet.checkpoint import config_for_checkpoint
 from invariant_estimation.sim import collect
 
 import importlib
@@ -106,7 +106,8 @@ def main():
     # objective because it only selects which loss terms `validate()` reports. The
     # run already records both -- read them rather than make the caller remember.
     cpf, objective = resolve_run_geometry(run, args.contacts_per_foot, args.objective)
-    cfg = ContactNetConfig(objective=objective)
+    # ... and the diag(L) parameterisation, for the same reason (N5).
+    cfg = config_for_checkpoint(str(run), objective=objective)
     c = collect.build_collector(contacts_per_foot=cpf, verbose=True)
 
     if args.pool:
@@ -134,7 +135,7 @@ def main():
     # freshly-initialised net of the same shape (`train.load_params`'s contract).
     from invariant_estimation.contactnet import train as cn_train
     like = network.init(jax.random.PRNGKey(cfg.init_seed), cfg.d_in, cfg.widths,
-                        cfg.sigma_0, cfg.eps)
+                        cfg.sigma_0, cfg.eps, cfg.diag_spec)
     params = cn_train.load_params(str(run / "params.npz"), like)
 
     dataset.build_channel_cache(val_paths, c, verbose=True)

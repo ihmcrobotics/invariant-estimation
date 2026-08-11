@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+from . import network
+
 
 @dataclass(frozen=True)
 class ContactNetConfig:
@@ -45,7 +47,25 @@ class ContactNetConfig:
     in swing -- which is what pushes the base upward once the feet leave the ground.
 
     `exp` gives dlogL/dr = 1 everywhere; the same target is r=+2.30 at sensitivity
-    1.00. For a scale parameter spanning ten decades this is the natural choice."""
+    1.00. For a scale parameter spanning ten decades this is the natural choice.
+    MEASURED: it opened the span (12.8 -> 21.9 raw units) and then diverged -- p99 raw
+    +12.5 is a per-axis Sigma_C of 2.7e5, at which the contact update switches itself
+    off. Nothing bounds it.
+
+    `bounded_exp` is that log parameterisation confined to [diag_lo, diag_hi] by a
+    sigmoid in log space. Smooth saturation, not a clip: at the bounds the gradient
+    shrinks rather than vanishing."""
+
+    diag_lo: float = network.DIAG_LO_DEFAULT
+    diag_hi: float = network.DIAG_HI_DEFAULT
+    """Range `bounded_exp` spans, as LINEAR per-axis contact STDs (the units of
+    `sigma_0`), logged internally. Ignored by `softplus` and `exp`.
+
+    1e-5 -> 1e2 brackets the analytic heuristic's 1e-4 (stance) -> 1e1 (swing) with a
+    decade of headroom either side, so the network can go tighter than stance and
+    looser than swing without being able to reach the 2.7e5 that killed the unbounded
+    run. RECORDED and read back with `diag_param`: different bounds rescale a
+    checkpoint's head exactly the way the wrong `diag_param` does."""
 
     # BPTT / data
     L: int = 128                   # ticks the gradient traverses
@@ -132,6 +152,13 @@ class ContactNetConfig:
     terrain_mix: tuple = (("flat", 0.25), ("waves", 0.25), ("stepping_stones",0.25), ("hard_stepping",0.25))
 
     @property
+    def diag_spec(self) -> "network.DiagSpec":
+        """The diag(L) parameterisation as one object. Pass THIS to `network.init` /
+        `network.forward`, never the bare `diag_param` string, or the bounds are
+        silently the module defaults."""
+        return network.DiagSpec(self.diag_param, self.diag_lo, self.diag_hi)
+
+    @property
     def d_in(self) -> int:
         return self.F * self.H
 
@@ -167,8 +194,22 @@ class ContactNetConfig:
             )
         if self.L <= 0 or self.B <= 0:
             raise ValueError(f"L and B must be positive, got L={self.L} and B={self.B}")
-        if self.diag_param not in ("softplus", "exp"):
-            raise ValueError(f"diag_param must be softplus or exp, got {self.diag_param!r}")
+        if self.diag_param not in network.DIAG_PARAMS:
+            raise ValueError(
+                f"diag_param must be one of {network.DIAG_PARAMS}, "
+                f"got {self.diag_param!r}")
+        if not 0.0 < self.diag_lo < self.diag_hi:
+            raise ValueError(
+                f"need 0 < diag_lo < diag_hi, got diag_lo={self.diag_lo}, "
+                f"diag_hi={self.diag_hi}")
+        if self.diag_param == "bounded_exp" and not (
+                self.diag_lo < self.sigma_0 - self.eps < self.diag_hi):
+            # The init bias is logit((log(sigma_0 - eps) - log lo)/(log hi - log lo));
+            # outside the range it is not finite and the run starts saturated.
+            raise ValueError(
+                f"bounded_exp needs diag_lo < sigma_0 - eps < diag_hi, got "
+                f"diag_lo={self.diag_lo}, sigma_0-eps={self.sigma_0 - self.eps}, "
+                f"diag_hi={self.diag_hi}")
         if self.objective not in (
             "beta_nll", "l2_velocity",
             "l2_vel_pos", "l2_vel_ori", "l2_vel_pos_ori",

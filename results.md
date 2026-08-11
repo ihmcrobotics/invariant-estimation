@@ -320,9 +320,12 @@ helps most (0.057 → 0.040).
 3. The calibration (NIS/dof ≪ 1) is now the limiting factor, not the mean — pursue
    the Block-C noise-model reconciliation next, not more loss terms.
 
-Runs: `results/2026-08-06_*_{A_l2vel,B_l2velpos,C_l2velori,D_l2velposori}/`
-(each with `summary.json`, `training.png`, `validation.png`); combined summary in
-`results/l2_options_summary.png`.
+Runs: `results/2026-08-06_*_{A_l2vel,B_l2velpos,C_l2velori,D_l2velposori}/` — the
+`summary.json` of each is still there; their weights, histories and plots (and the
+combined `results/l2_options_summary.png`) were pruned from the working tree on
+2026-08-10 and are recoverable from git history at `e84321f~1`. This section's ranking
+is superseded twice over anyway (§8 matched-step, §9 closed-loop), so the checkpoints
+had no remaining use.
 
 
 ---
@@ -384,9 +387,91 @@ sensitivity makes `peak_lr=1e-4`, tuned for softplus, too aggressive. Default st
 
 ### Open
 
-1. Redo the floor sweep closed-loop (~20 min total).
+1. ~~Redo the floor sweep closed-loop (~20 min total).~~ Done 2026-08-10, §9.
 2. Bounded/retuned `exp` (clamp to ~[1e-4, 1e2], lower LR).
 3. The structural option: the contact **zero-velocity constraint**, which adds rows
    to `H` rather than reweighting existing ones. `H` currently has no velocity
    columns, and 98.6% of the sink flows through the contact update's write into
    `v_hat`/`R_hat`. Derivation in `contact-zero-velocity.pdf`.
+
+---
+
+## 9. The closed-loop floor sweep (2026-08-10)
+
+Twelve runs, `scripts/cl_floor_sweep.sh` → `scripts/cl_floor_summary.py`, one 25 s
+six-motion clip each, clean sensors, N=8. Redoes closed-loop what §8's replay sweep
+did invalidly (N1). Evidence: `results/zdrift_bexp/closed_loop/cmv_*_{analytic,learned}.json`.
+
+    floor     analytic d(e_z)   analytic horiz    learned d(e_z)
+    0            -0.198             0.006            +2.713
+    3e-5         -0.178             0.021            +2.903
+    1e-4         -0.162             0.033            +2.971
+    3e-4         -0.141             0.044            +2.852
+    1e-3         -0.117             0.060            +2.488
+    3e-3         -0.085             0.058            +2.063
+
+**The harness is deterministic and the reference used clean sensors.** Clean-sensor
+`cmv=1e-3` reproduces `results/zdrift/closed_loop/best_A_cmv1e-3.json` (+2.4884 m) in
+every digit of all seven motions, and the analytic arm at the same floor reproduces the
+documented -0.117 m. `--imu-noise` moves the same learned configuration to +1.9750 m —
+a 21% level shift, so the settings must never be mixed inside a comparison.
+
+**The analytic response is monotone over four decades, so the sweep does not identify
+an operating point.** There is no interior optimum: "minimise |e_z|" selects whichever
+floor is the top of the swept range. The vertical gain is bought with horizontal error
+(0.006 → 0.058 m, ~10x), which is the mechanism already on record — the floor
+de-weights the contact FK measurement rather than modelling anything, and at 1e-3 it is
+~30 000x the measured Σ_q. §8's warning that 1e-2 flips the sign upward puts the useful
+range's edge just past 3e-3.
+
+**The floor is not the lever for the learned arm either.** It moves learned drift over
+2.06–2.97 m, ~30%, and never within an order of magnitude of the analytic ~0.1 m. §8's
+replay-derived "the one config lever ContactNet responds to (+31.1%)" survives in
+magnitude and not in importance: a 30% modulation of a 20x failure is not a lever.
+
+Every floor is single-signed across the six motions on both arms, so N3's cancellation
+trap is not what is happening here — this is a real monotone trade, not four terrains
+averaging out.
+
+The bounded-`exp` run therefore trains at **1e-3**, chosen to match the softplus
+baseline rather than by the (void) minimisation rule, so that run differs from
+`L256_A_l2vel_cmv1e-3` only in the parameterisation and its paired learning rate.
+
+---
+
+## 10. `bounded_exp` — the amplitude hypothesis, confirmed (2026-08-10)
+
+`results/zdrift_bexp/L256_A_cmv1e-3_bexp`: `diag_param=bounded_exp` (sigmoid in log
+space over [1e-5, 1e2]) with `peak_lr=3e-5`, otherwise identical to
+`L256_A_l2vel_cmv1e-3` — same pool, objective, L, `--no-remat`, floor, 6000 steps.
+
+**Closed loop, `cmv=1e-3`, clean sensors, same 25 s six-motion clip:**
+
+    arm            total d(e_z)    horiz     per-motion signs
+    analytic          -0.117       0.060     - only
+    bounded_exp       -0.312       0.095     - only
+    softplus          +2.488       1.023     + only
+
+**8.0x better than softplus on vertical, ~11x on horizontal, and the sign is
+corrected.** The learned filter no longer pushes the base *up* when the feet leave the
+ground; it sinks, like the analytic filter, at 2.7x the analytic magnitude. All six
+motions are single-signed, so this is not an N3 cancellation.
+
+Training was healthy in every respect the `exp` run was not: loss 0.376 -> 0.00219
+(softplus 0.00153), **zero** non-finite steps (exp had 30), `applied` 1.00 throughout
+(exp collapsed to ~0.001), and it beats the analytic baseline on all four held-out
+terrains (0.0474-0.0633 vs 0.0579-0.0674). Contact NIS/dof 0.062-0.073, looser than
+softplus's 0.113-0.137 and closer to the analytic 0.005-0.008.
+
+**The reading.** Amplitude was the dominant cause of the learned arm's failure, and
+removing it removed the learned-specific failure mode entirely. What remains is the
+*same* error the analytic filter has, not a different one — which is what §8's
+null-space argument predicts as the ceiling for anything Sigma_C-shaped: Sigma_C sets
+the base-vs-anchor split, and the residual common-mode sink is invisible to `H` from
+any split. **This is not a success on its own terms** — -0.312 m over 25 s is ~1.2 cm/s
+and not deployable — but it is the first learned Sigma_C that does not invert the sink,
+and it relocates the problem from "the network is wrong" to "the measurement model
+cannot see this mode".
+
+Evidence: `results/zdrift_bexp/closed_loop/cmv_1e-3_bexp.json`, summary and span plot
+in the run directory.

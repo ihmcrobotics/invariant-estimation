@@ -339,18 +339,21 @@ def build_contactnet_provider(fused, reader, ckpt, norm_path, *, verbose=True):
     """Load a `run_contactnet.py` checkpoint and return `(provider_scan, online_state0)`.
 
     `provider_scan(ostate, stacked_sensors) -> (ostate, contact_chol)` is the jitted
-    per-batch form of `contactnet.online.make_provider`. `ContactNetConfig()` MUST be
-    the config the checkpoint was trained under — this run uses the defaults
-    (F=30, H=20, d_in=600); a mismatch silently shifts the network input.
+    per-batch form of `contactnet.online.make_provider`. The config MUST be the one the
+    checkpoint was trained under — a mismatch silently shifts the network input (F, H,
+    d_in) or rescales its output (`diag_param` and its bounds, invariant N5). The
+    fields that are recorded are restored from `summary.json` by
+    `checkpoint.config_for_checkpoint`; the rest are this run's defaults
+    (F=30, H=20, d_in=600).
     """
     import jax
     import jax.numpy as jnp
     from invariant_estimation.contactnet import (
         online as cn_online, network as cn_network,
         normalize as cn_normalize, train as cn_train, features as cn_features)
-    from invariant_estimation.contactnet.config import ContactNetConfig
+    from invariant_estimation.contactnet.checkpoint import config_for_checkpoint
 
-    cfg = ContactNetConfig()
+    cfg = config_for_checkpoint(ckpt, verbose=verbose)
     # `run_contactnet.save_norm` writes only {mean, std, names, floored}; `normalize.load`
     # additionally wants the provenance fields (n_ticks, source) that `apply`/the online
     # provider never read. Load directly so either artifact format works.
@@ -363,7 +366,7 @@ def build_contactnet_provider(fused, reader, ckpt, norm_path, *, verbose=True):
         n_ticks=int(z["n_ticks"]) if "n_ticks" in z.files else 0,
         source=str(z["source"]) if "source" in z.files else str(norm_path))
     like = cn_network.init(jax.random.PRNGKey(cfg.init_seed),
-                           cfg.d_in, cfg.widths, cfg.sigma_0, cfg.eps)
+                           cfg.d_in, cfg.widths, cfg.sigma_0, cfg.eps, cfg.diag_spec)
     params = cn_train.load_params(ckpt, like)
     sub = cn_features.subchain_for(fused, reader.unfiltered_names)
     _check_contact_geometry(ckpt, len(sub))
@@ -375,6 +378,8 @@ def build_contactnet_provider(fused, reader, ckpt, norm_path, *, verbose=True):
         print(f"ContactNet: ATTACHED  ckpt={ckpt}  norm={norm_path}")
         print(f"            cfg F={cfg.F} H={cfg.H} d_in={cfg.d_in} "
               f"span={cfg.window_span_seconds * 1e3:.0f}ms contacts={len(sub)}")
+        print(f"            diag={cfg.diag_param} "
+              f"[{cfg.diag_lo:g}, {cfg.diag_hi:g}] eps={cfg.eps:g}")
     return provider_scan, ostate0
 
 
@@ -565,7 +570,9 @@ if __name__ == "__main__":
     ap.add_argument("--contactnet", default=None, metavar="PARAMS.npz",
                     help="run a trained ContactNet in the loop: its learned contact_chol "
                          "replaces the analytic stance/swing heuristic. Pass a params.npz "
-                         "from run_contactnet.py (built with the ContactNetConfig defaults)")
+                         "from run_contactnet.py; the diag(L) parameterisation is read "
+                         "back from the summary.json beside it, everything else is the "
+                         "ContactNetConfig defaults")
     ap.add_argument("--contacts-per-foot", type=int, choices=(1, 4), default=1,
                     help="contact slots per foot: 1 = the shipped N=2 sole pair "
                          "(default), 4 = the N=8 box corners. Must match what a "

@@ -52,7 +52,7 @@ from invariant_estimation.contactnet import (
     dataset, features as cn_features, network as cn_network,
     normalize as cn_normalize, online as cn_online, rollout as cn_rollout,
     train as cn_train)
-from invariant_estimation.contactnet.config import ContactNetConfig
+from invariant_estimation.contactnet.checkpoint import config_for_checkpoint
 from invariant_estimation.sim import collect
 
 
@@ -65,7 +65,7 @@ def main():
     args = ap.parse_args()
 
     ckpt = Path(args.ckpt)
-    cfg = ContactNetConfig()
+    cfg = config_for_checkpoint(str(ckpt))
     c = collect.build_collector(contacts_per_foot=args.contacts_per_foot, verbose=False)
     path = sorted(collect.DATA_DIR.glob(f"*_{args.pool}_seed*.npz"))[0]
     print(f"rollout: {path.name}   ckpt: {ckpt.name}")
@@ -95,7 +95,7 @@ def main():
         floored=tuple(str(s) for s in z["floored"]),
         n_ticks=0, source=str(ckpt))
     like = cn_network.init(jax.random.PRNGKey(cfg.init_seed), cfg.d_in, cfg.widths,
-                           cfg.sigma_0, cfg.eps)
+                           cfg.sigma_0, cfg.eps, cfg.diag_spec)
     params = cn_train.load_params(str(ckpt / "params.npz"), like)
 
     roll = collect.load_rollout(path)
@@ -136,7 +136,7 @@ def main():
     _, chol_online = jax.lax.scan(prov, cn_online.init_state(cfg, len(sub_off)), sensors)
     chol_online = np.asarray(chol_online)
     chol_offline = np.asarray(cn_rollout.contact_factors(
-        params, jnp.asarray(win_offline), cfg.eps))
+        params, jnp.asarray(win_offline), cfg.eps, cfg.diag_spec))
     print(f"\n[3] Sigma_C (contact_chol) over {len(k)} ready ticks")
     if len(k):
         d = np.abs(chol_online[k] - chol_offline[k])

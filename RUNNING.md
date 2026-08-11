@@ -326,21 +326,31 @@ This ranks; it does not explain. `experiments/z_budget.py` (branch
 `full-filter/z-debug`) remains the tool that attributes the sink to a specific filter
 write and sweeps terrain to catch cancellations.
 
-### The contact R floor — `scripts/zdrift_tonight.sh`, `zdrift_summary.py`
+### The contact R floor — `scripts/cl_floor_sweep.sh`, `cl_floor_summary.py`
 
-`--contact-meas-var` is the largest lever measured (27% on RMSE; it flipped
-ContactNet from 2.5× *worse* than the analytic heuristic on drift to 0.26×). Because
-the floor is applied to the **replayed** inputs, an existing checkpoint can be scored
-at any floor without retraining (~5 min/point), which is what makes a sweep cheap:
+**Closed-loop only.** The replay version of this sweep (`zdrift_tonight.sh` +
+`zdrift_summary.py`) was retracted by invariant N1: replay and closed loop agree on the
+analytic arm and disagree by 21× on a learned one, so every floor it chose is unusable.
+Closed loop costs ~3 min per configuration, *less* than the replay it replaces.
 
 ```bash
-FLOORS="0 3e-5 1e-4 3e-4 1e-3 3e-3" bash scripts/zdrift_tonight.sh
-uv run python scripts/zdrift_summary.py          # incremental: reads whatever exists
+FLOORS="0 3e-5 1e-4 3e-4 1e-3 3e-3" bash scripts/cl_floor_sweep.sh
+uv run python scripts/cl_floor_summary.py --dir results/zdrift_bexp/closed_loop
 ```
 
-Read **both** columns. The floor sets innovation covariance directly, so raising it
-pushes `NIS/dof` *away* from 1 while it may improve drift — if the two goals pull
-apart, that tension is the result, and the combined score hides it.
+Resumable — a floor whose metrics JSON already exists is skipped. `ARMS`, `CKPT`,
+`CPF`, `OUT`, `NOISE` are the other env knobs.
+
+Two things to know before reading the output (both measured 2026-08-10, results.md §9):
+
+* **Clean sensors by default, and never mixed with `--imu-noise`.** The harness is
+  bit-reproducible — the same flags reproduce every digit — but the noise flag is a
+  21% level shift on the same configuration.
+* **The analytic response is monotone across four decades**, so |e_z| alone selects
+  the edge of whatever range you sweep, and the vertical gain is paid in horizontal
+  error (~10× over the same range). The floor de-weights the contact FK measurement;
+  it does not model anything. Read the horizontal column and the per-motion signs
+  (`cl_floor_summary.py` prints both), not the total alone.
 
 ### Serialize GPU work — `scripts/gpu_lock.sh`
 

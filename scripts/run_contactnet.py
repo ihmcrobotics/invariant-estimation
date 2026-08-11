@@ -178,7 +178,7 @@ def validate(prep, cache, norm, cfg, params, fused, P0, eps):
                     nis_over_dof=nis, applied=applied)
 
     baseline = run(inputs.contact_chol)
-    L_c = cn_rollout.contact_factors(params, wins, eps, cfg.diag_param)
+    L_c = cn_rollout.contact_factors(params, wins, eps, cfg.diag_spec)
     learned = run(L_c)
     return baseline, learned
 
@@ -239,7 +239,7 @@ def resolve_pose_weights(cfg, params, fused, train_preps, P0, warm_in):
         mb, mc = meas.batch()
         measure_loss = cn_rollout.make_batch_loss(
             fused.ekf, fused.kinematics, cfg.eps, beta=cfg.beta,
-            objective="l2_velocity", remat=cfg.remat, diag_param=cfg.diag_param)
+            objective="l2_velocity", remat=cfg.remat, diag_param=cfg.diag_spec)
         _, (mout, _c) = measure_loss(params, mb, mc)
         L_vel = float(l2_velocity(mout.state.v, mout.state.R, mb.v_true, mb.R_true))
         L_pos = float(l2_position(mout.state.p, mb.p_true))
@@ -299,12 +299,28 @@ def main():
                          "one config lever ContactNet responds to (+31.1%%). Do NOT "
                          "raise to 1e-2: that is a flat-ground cancellation that "
                          "drifts UPWARD on both terrains.")
-    ap.add_argument("--diag-param", choices=["softplus", "exp"], default=None,
+    ap.add_argument("--diag-param", choices=list(network.DIAG_PARAMS), default=None,
                     help="positive parameterisation of diag(L). softplus goes LINEAR "
                          "above zero so relative sensitivity decays as 1/r exactly "
                          "where the swing regime lives; exp holds dlogL/dr=1 across "
-                         "all ten decades Sigma_C spans. RECORDED in summary.json -- a "
-                         "checkpoint must be evaluated under the one it was trained at.")
+                         "all ten decades Sigma_C spans but is unbounded and diverged "
+                         "(p99 raw +12.5 => Sigma_C 2.7e5); bounded_exp is exp confined "
+                         "to [--diag-lo, --diag-hi] by a sigmoid in log space. RECORDED "
+                         "in summary.json -- a checkpoint must be evaluated under the "
+                         "one it was trained at.")
+    ap.add_argument("--diag-lo", type=float, default=None,
+                    help="lower bound for bounded_exp, as a LINEAR per-axis contact STD "
+                         "(default 1e-5, a decade below the analytic stance value).")
+    ap.add_argument("--diag-hi", type=float, default=None,
+                    help="upper bound for bounded_exp, same units (default 1e2, a "
+                         "decade above the analytic swing value).")
+    ap.add_argument("--peak-lr", type=float, default=None,
+                    help="peak learning rate of the warmup-cosine schedule (default "
+                         "1e-4, tuned under softplus). The parameterisations do NOT "
+                         "share a scale: dlogL/dr is 0.1-0.8 under softplus against "
+                         "1 under exp and ~4 mid-range under bounded_exp, so the same "
+                         "LR is several times more aggressive in Sigma_C-space. Pair "
+                         "bounded_exp with ~3e-5.")
     ap.add_argument("--pool", type=str, default=None,
                     help="rollout pool tag, e.g. 'n8'. Selects data/*_<tag>_seed*.npz "
                          "and holds out one rollout PER TERRAIN for validation. "
@@ -326,6 +342,12 @@ def main():
         overrides["remat"] = args.remat
     if args.diag_param is not None:
         overrides["diag_param"] = args.diag_param
+    if args.diag_lo is not None:
+        overrides["diag_lo"] = args.diag_lo
+    if args.diag_hi is not None:
+        overrides["diag_hi"] = args.diag_hi
+    if args.peak_lr is not None:
+        overrides["peak_lr"] = args.peak_lr
     cfg = ContactNetConfig(**overrides)
 
     t_start = time.time()
@@ -401,7 +423,7 @@ def main():
 
     print("== building network + batcher ==")
     params = network.init(jax.random.PRNGKey(cfg.init_seed), cfg.d_in, cfg.widths,
-                          cfg.sigma_0, cfg.eps, cfg.diag_param)
+                          cfg.sigma_0, cfg.eps, cfg.diag_spec)
     warm_in = cn_rollout.make_warm_in(c.fused.ekf, c.fused.kinematics)
     batcher = dataset.ChainedBatcher(train_preps, cfg, P0, warm_in, seed=cfg.batcher_seed)
 
@@ -412,7 +434,7 @@ def main():
     batch_loss = cn_rollout.make_batch_loss(
         c.fused.ekf, c.fused.kinematics, cfg.eps, beta=cfg.beta,
         objective=cfg.objective, remat=cfg.remat, w_pos=w_pos, w_ori=w_ori,
-        diag_param=cfg.diag_param)
+        diag_param=cfg.diag_spec)
 
     # Fast-fail: one train step before committing to the full run.
     print("== training ==")
@@ -470,7 +492,11 @@ def main():
                 # 0.0 in build_collector with no record in the run summary. A run
                 # that cannot state its own filter configuration is not evidence.
                 "remat": cfg.remat,
+                # diag_param AND its bounds: `checkpoint.config_for_checkpoint` reads
+                # these back at load time, and nothing about the weights would reveal
+                # a mismatch (N5).
                 "diag_param": cfg.diag_param,
+                "diag_lo": cfg.diag_lo, "diag_hi": cfg.diag_hi,
                 "contact_meas_var": float(args.contact_meas_var),
                 "w_pos": w_pos, "w_ori": w_ori,
                 "pose_weight_ratio": cfg.pose_weight_ratio,

@@ -7,7 +7,7 @@ import jax.numpy as jnp
 from ..inEKF.filter import InEKFInputs, init_carry, make_step
 from ..inEKF.state import InEKFState
 from .losses import l2_velocity, beta_nll_from_diagnostics, pose_l2
-from .network import ContactNetParams, forward
+from .network import ContactNetParams, DiagSpec, forward
 
 class Segment(NamedTuple):
     """
@@ -40,7 +40,7 @@ def contact_factors(
     params: ContactNetParams,
     windows :Array,
     eps: float,
-    diag_param: str = "softplus",
+    diag_param: "str | DiagSpec" = "softplus",
 ) -> Array:
     """
     Network over every tick and contact, all at once.
@@ -53,9 +53,13 @@ def contact_factors(
     """
     L, N_c = windows.shape[0], windows.shape[1]
     flat = windows.reshape(L, N_c, -1) # last dim is D_in = H * F, the flattening
-    over_contacts = jax.vmap(forward, in_axes=(None, 0, None, None))
-    over_time = jax.vmap(over_contacts, in_axes=(None, 0, None, None))
-    return over_time(params, flat, eps, diag_param)
+    # `eps` and the parameterisation are CLOSED OVER rather than passed with
+    # `in_axes=None`: `diag_param` may be a `DiagSpec`, and a non-array object has no
+    # business being flattened as a pytree leaf just to be broadcast.
+    one = lambda p, xi: forward(p, xi, eps, diag_param)
+    over_contacts = jax.vmap(one, in_axes=(None, 0))
+    over_time = jax.vmap(over_contacts, in_axes=(None, 0))
+    return over_time(params, flat)
 
 # objective -> (use_pos, use_ori) for the composite pose objectives. Resolved at
 # build time (outside the traced region) so the branch never enters the graph.

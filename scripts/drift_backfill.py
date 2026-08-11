@@ -57,6 +57,7 @@ import jax.numpy as jnp
 import invariant_estimation  # noqa: F401  (x64)
 from invariant_estimation.contactnet import dataset, network, normalize
 from invariant_estimation.contactnet import rollout as cn_rollout
+from invariant_estimation.contactnet.checkpoint import config_for_checkpoint
 from invariant_estimation.contactnet.config import ContactNetConfig
 from invariant_estimation.inEKF.filter import init_carry, make_step
 from invariant_estimation.inEKF.state import InEKFState
@@ -102,7 +103,7 @@ def drift_of(prep, cache, norm, cfg, params, fused, P0, eps, dt):
                     seconds=float(t[-1]), path_m=path)
 
     baseline = run(inputs.contact_chol)
-    learned = run(cn_rollout.contact_factors(params, wins, eps))
+    learned = run(cn_rollout.contact_factors(params, wins, eps, cfg.diag_spec))
     return baseline, learned
 
 
@@ -131,6 +132,8 @@ def main():
         raise SystemExit(f"no cells with params.npz under {root}")
     print(f"cells: {[c.name for c in cells]}")
 
+    # Base config for dataset prep; the diag(L) parameterisation is restored PER CELL
+    # below, since a root can hold cells trained under different ones (N5).
     cfg = ContactNetConfig(L=EVAL_L)
     c = collect.build_collector(contacts_per_foot=args.contacts_per_foot,
                                 contact_meas_var=args.contact_meas_var)
@@ -194,9 +197,10 @@ def main():
         vcache = {vp.name: caches[p] for vp, p in zip(val_preps, val_paths)}
 
         for cell in group:
+            cell_cfg = config_for_checkpoint(str(cell), base=cfg, verbose=False)
             params = cn_train.load_params(str(cell / "params.npz"), like)
-            per = [drift_of(vp, vcache[vp.name], norm, cfg, params, c.fused, P0,
-                            cfg.eps, cfg.dt) for vp in val_preps]
+            per = [drift_of(vp, vcache[vp.name], norm, cell_cfg, params, c.fused, P0,
+                            cell_cfg.eps, cell_cfg.dt) for vp in val_preps]
             mean = lambda arm, k: float(np.mean([r[arm][k] for r in per]))
             summ = json.loads((cell / "summary.json").read_text())
             rmse = float(np.mean([v["learned"]["vel_rmse"] for v in summ["val"]]))
