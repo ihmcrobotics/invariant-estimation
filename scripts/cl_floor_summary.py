@@ -15,6 +15,14 @@ import re
 from pathlib import Path
 
 
+def _walking_stat(pm, key):
+    """Median over the walking motions of a per-motion field, or NaN if absent."""
+    nan = float("nan")
+    v = [q[key] for q in pm
+         if q["motion"] != "stand" and q.get(key, nan) == q.get(key, nan)]
+    return float(sorted(v)[len(v) // 2]) if v else nan
+
+
 def _walking_nis(pm):
     """Median-of-motions contact NIS/dof over the walking segments, or NaN.
 
@@ -22,10 +30,7 @@ def _walking_nis(pm):
     right size, drift says whether the filter is any good, and the project has
     already been burned once by ranking on a proxy.
     """
-    v = [q["nis_per_dof"] for q in pm
-         if q["motion"] != "stand" and q.get("nis_per_dof", float("nan"))
-         == q.get("nis_per_dof", float("nan"))]
-    return float(sorted(v)[len(v) // 2]) if v else float("nan")
+    return _walking_stat(pm, "nis_per_dof")
 
 
 def load(d: Path):
@@ -48,6 +53,10 @@ def load(d: Path):
             # Walking-only NIS/dof (the `stand` segment is a different regime and
             # would dilute it). Missing on runs recorded before it was instrumented.
             nis=_walking_nis(pm),
+            # Attitude is the other half of the story the closed-loop number hides:
+            # the z-budget puts 14.7% of the sink on attitude x specific force, and
+            # a change that improves height by degrading tilt is not an improvement.
+            tilt=_walking_stat(pm, "tilt_deg_rms"),
         ))
     return rows
 
@@ -68,7 +77,7 @@ def main():
         return {k: v for k, v in r["deltas"].items() if k != "stand"}
 
     print(f"{'floor':>8} {'arm':>16} {'total e_z':>10} {'|e_z|':>8} {'horiz':>7} "
-          f"{'NIS/dof':>8} {'signs':>7}  per-motion d(e_z)")
+          f"{'NIS/dof':>8} {'tiltRMS':>8} {'signs':>7}  per-motion d(e_z)")
     for r in sorted(rows, key=lambda r: (float(r["floor"]), r["arm"])):
         s = signs(r)
         pos = sum(1 for v in s.values() if v > 0)
@@ -76,8 +85,10 @@ def main():
         mixed = "MIXED" if pos and neg else f"{'+' if pos else '-'}only"
         per = " ".join(f"{k[:4]}{v:+.2f}" for k, v in s.items())
         nis = f"{r['nis']:8.4f}" if r["nis"] == r["nis"] else f"{'-':>8}"
+        tilt = f"{r['tilt']:8.3f}" if r["tilt"] == r["tilt"] else f"{'-':>8}"
         print(f"{r['floor']:>8} {r['arm']:>16} {r['total_ez']:>+10.4f} "
-              f"{abs(r['total_ez']):>8.4f} {r['horiz']:>7.3f} {nis} {mixed:>7}  {per}")
+              f"{abs(r['total_ez']):>8.4f} {r['horiz']:>7.3f} {nis} {tilt} "
+              f"{mixed:>7}  {per}")
 
     an = {r["floor"]: r for r in rows if r["arm"] == "analytic"}
     if an:
