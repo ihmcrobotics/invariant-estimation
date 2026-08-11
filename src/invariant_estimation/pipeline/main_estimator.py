@@ -33,7 +33,7 @@ from jax.typing import ArrayLike
 from ..config import load_config
 from ..inEKF import ekf as inekf_mod
 from ..inEKF import filter as inf
-from ..inEKF.gravity_update import UP, GravityRef
+from ..inEKF.gravity_update import UP, GravityRef, default_gravity_params
 from ..inEKF.state import InEKFState
 from ..jointKF import anchors as anch
 from ..jointKF import filter as jkf
@@ -409,6 +409,7 @@ def build_fused_estimator(
     contact_fk_unfiltered: bool = False,
     zero_velocity: bool = False,
     nv_scale: float = 1.0,
+    gravity_gates: tuple[float, float, float] | None = None,
 ) -> FusedEstimator:
     """Assemble the joint KF + InEKF into one fused estimator (plain Python, I7).
 
@@ -455,9 +456,18 @@ def build_fused_estimator(
     params = default_params(dt=dt, imu_bias_process_var=imu_bias_process_var)
 
     K = len(foot_sites)
+    # `gravity_gates = (norm_tol, rot_tol, horiz_tol)` overrides the quasi-static
+    # thresholds. Exposed because the shipped values pass 0 of 20 000 walking ticks,
+    # so gravity leveling contributes exactly nothing during gait and attitude runs
+    # open-loop on the gyro. Whether that is the right call is an empirical question
+    # and this is the knob that lets it be asked. NOTE the F.3 trap (CLAUDE.md §6):
+    # relaxing the thresholds is safe, replacing the sensor-driven reference is not.
+    gp = None if gravity_gates is None else default_gravity_params(
+        norm_tol=float(gravity_gates[0]), rot_tol=float(gravity_gates[1]),
+        horiz_tol=float(gravity_gates[2]))
     ekf = inekf_mod.create(
         number_of_contacts=K, gyro_var=gyro_var, accel_var=accel_var,
-        contact_var=contact_var, dt=dt,
+        contact_var=contact_var, dt=dt, gravity_params=gp,
     )
 
     base_site = site_names.index(imu_sites[base_imu])

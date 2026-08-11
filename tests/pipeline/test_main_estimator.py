@@ -385,3 +385,54 @@ def test_bias_correction_reaches_the_inekf(fused):
     a1 = _rotation_angle(ic1.state.R)
     assert a0 > 1e-4                  # the unbiased run integrated a real yaw
     assert a1 < 0.9 * a0             # the bias correction subtracted from it (I1 wired)
+
+
+# ---------------------------------------------------------------------------
+# `gravity_gates` is not a dead knob
+# ---------------------------------------------------------------------------
+# This project has shipped four knobs that were accepted and then dropped on the
+# floor (`remat`, `contact_meas_var`, the `contact_trust` YAML block, the N5
+# read-back). The symptom every time was a number that stayed BIT-IDENTICAL across
+# a config change, which reads as "conservative" and is actually "disconnected".
+# So the test for a new knob asserts the observable moves, not that the field is set.
+
+def _gate_on(est, accel, gyro):
+    """The `quasi_static` mask a one-tick run publishes for these sensors."""
+    carry = init_fused_carry(est, q0=jnp.zeros(N))
+    _, out = make_fused_step(est)(carry, _sensors(accel=accel, gyro=gyro))
+    return float(np.asarray(out.inekf.quasi_static))
+
+
+def test_gravity_gates_override_changes_the_published_gate():
+    model = MjxModel.from_xml_string(
+        _biped_mjcf(), site_names=IMU_SITES + FOOT_SITES, pairs=PAIRS)
+    kw = dict(imu_sites=IMU_SITES, pairs=PAIRS, foot_sites=FOOT_SITES,
+              base_imu=0, dt=DT)
+    shipped = build_fused_estimator(model, **kw)
+
+    # A tick that fails the ROTATION gate on the shipped 0.15 rad/s and nothing else:
+    # the specific force is exactly gravity, so norm and horizontal both pass.
+    accel, gyro = np.array([0.0, 0.0, G]), np.array([0.0, 0.0, 0.5])
+    assert _gate_on(shipped, accel, gyro) == 0.0, (
+        "fixture no longer rejects this tick — pick a different one")
+
+    relaxed = build_fused_estimator(model, gravity_gates=(0.05, 5.0, 0.5), **kw)
+    assert _gate_on(relaxed, accel, gyro) == 1.0, (
+        "relaxing rot_tol 0.15 -> 5.0 did not open the gate: the override does not "
+        "reach `is_quasi_static`, i.e. the knob is dead")
+
+    # ...and the shipped configuration is untouched by the override existing.
+    assert relaxed.ekf.gravity_params.norm_tol == shipped.ekf.gravity_params.norm_tol
+    assert relaxed.ekf.gravity_params.horiz_tol == shipped.ekf.gravity_params.horiz_tol
+    assert build_fused_estimator(model, **kw).ekf.gravity_params == \
+        shipped.ekf.gravity_params
+
+
+def test_gravity_gates_default_leaves_every_threshold_at_the_config_value():
+    from invariant_estimation.inEKF.gravity_update import default_gravity_params
+
+    model = MjxModel.from_xml_string(
+        _biped_mjcf(), site_names=IMU_SITES + FOOT_SITES, pairs=PAIRS)
+    est = build_fused_estimator(model, imu_sites=IMU_SITES, pairs=PAIRS,
+                                foot_sites=FOOT_SITES, base_imu=0, dt=DT)
+    assert est.ekf.gravity_params == default_gravity_params()

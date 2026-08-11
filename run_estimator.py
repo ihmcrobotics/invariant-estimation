@@ -390,7 +390,7 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
                         threaded=False, max_backlog_ticks=2,
                         contactnet=None, contactnet_norm=None, contacts_per_foot=1,
                         zero_velocity=False, nv_scale=1.0,
-                        gyro_var=None, accel_var=None):
+                        gyro_var=None, accel_var=None, gravity_gates=None):
     t0 = time.time()
     policy = rp.load_policy(policy_name)
     m = rp.build_sim_model(policy, with_visuals=with_visuals, with_imu_sensors=True)
@@ -401,7 +401,8 @@ def make_estimated_loop(policy_name, *, with_visuals, sources=DEFAULT_SOURCES,
     fused = me.build_alex_fused_estimator_from_urdf(
         urdf, contacts_per_foot, dt=dt, contact_meas_var=contact_meas_var,
         contact_fk_unfiltered=contact_fk_unfiltered, zero_velocity=zero_velocity,
-        nv_scale=nv_scale, gyro_var=gyro_var, accel_var=accel_var)
+        nv_scale=nv_scale, gyro_var=gyro_var, accel_var=accel_var,
+        gravity_gates=gravity_gates)
     reader = SimSensorReader(m, fused, foot_geoms=rp.FOOT_GEOMS, dt=dt, noise=noise,
                              stance_chol=stance_chol, swing_chol=swing_chol)
     if verbose:

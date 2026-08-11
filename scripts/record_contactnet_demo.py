@@ -103,12 +103,21 @@ def main():
                     help="InEKF process noise on the accelerometer channel "
                          "[(m/s^2)^2/Hz]. Default (None) takes the config's 1e-3; "
                          "the sim's accel white noise is 3e-2 m/s^2.")
+    ap.add_argument("--gravity-gates", default=None, metavar="NORM,ROT,HORIZ",
+                    help="override the quasi-static gate thresholds (defaults "
+                         "0.05,0.15,0.5). Measured: the shipped values pass 0 of "
+                         "20000 walking ticks, so gravity leveling does nothing "
+                         "during gait and attitude runs open-loop on the gyro. "
+                         "This relaxes the THRESHOLDS only -- the gate still reads "
+                         "the sensor-driven gravity reference (regression F.3).")
     ap.add_argument("--noise-seed", type=int, default=0)
     ap.add_argument("--metrics", default=None, metavar="PATH.json",
                     help="also record per-motion vertical drift (estimate vs truth)")
     args = ap.parse_args()
 
     w, h = (int(v) for v in args.size.lower().split("x"))
+    gates = (tuple(float(v) for v in args.gravity_gates.split(","))
+             if args.gravity_gates else None)
     loop = re_mod.make_estimated_loop(
         "baseline", with_visuals=True, contactnet=args.contactnet,
         contactnet_norm=args.contactnet_norm, verbose=True,
@@ -116,6 +125,7 @@ def main():
         contact_meas_var=args.contact_meas_var,
         zero_velocity=args.zero_velocity, nv_scale=args.nv_scale,
         gyro_var=args.gyro_var, accel_var=args.accel_var,
+        gravity_gates=gates,
         noise=(re_mod.IMUNoise(seed=args.noise_seed) if args.imu_noise else None))
     print(f"  contact_meas_var={args.contact_meas_var:g} "
           f"zero_velocity={args.zero_velocity} nv_scale={args.nv_scale:g} "
@@ -154,7 +164,11 @@ def main():
                 # consistent and still sink.
                 trace.append((label, tick * control_dt, float(e[2]),
                               float(np.linalg.norm(e[:2])),
-                              float(loop.history[-1]["nis"]) / nis_dof))
+                              float(loop.history[-1]["nis"]) / nis_dof,
+                              # tilt (roll/pitch) error: the z-budget puts 14.7%
+                              # of the sink on attitude x specific force, and it
+                              # is the channel gravity leveling is responsible for.
+                              float(loop.history[-1]["tilt_deg"])))
             if tick % stride == 0:
                 capture_with_ghost(rec, loop.d, ghost, est)
             tick += 1
@@ -168,17 +182,18 @@ def main():
         import json
         from collections import OrderedDict
         by = OrderedDict()
-        for label, t, ez, eh, nis in trace:
-            by.setdefault(label, []).append((t, ez, eh, nis))
+        for label, t, ez, eh, nis, tilt in trace:
+            by.setdefault(label, []).append((t, ez, eh, nis, tilt))
         print("\n  closed-loop vertical error, per motion "
               "(e_z = p_hat_z - p_true_z; CUMULATIVE across the clip)")
         print(f"    {'motion':10s} {'secs':>5s} {'e_z start':>10s} {'e_z end':>9s} "
-              f"{'d(e_z)':>8s} {'rate m/s':>9s} {'horiz':>7s} {'NIS/dof':>8s}")
+              f"{'d(e_z)':>8s} {'rate m/s':>9s} {'horiz':>7s} {'NIS/dof':>8s} {'tiltRMS':>8s}")
         rows = []
         for label, seg in by.items():
             t = np.array([r[0] for r in seg]); ez = np.array([r[1] for r in seg])
             eh = np.array([r[2] for r in seg])
             nis = np.array([r[3] for r in seg])
+            tilt = np.array([r[4] for r in seg])
             # rate WITHIN the motion: the clip is one continuous run, so absolute e_z
             # carries in from earlier motions and only the slope is attributable here.
             rate = float(np.polyfit(t, ez, 1)[0]) if len(t) > 2 else float("nan")
@@ -192,10 +207,13 @@ def main():
                              nis_per_dof=float(np.median(finite)) if finite.size else
                              float("nan"),
                              nis_per_dof_mean=float(finite.mean()) if finite.size else
-                             float("nan")))
+                             float("nan"),
+                             tilt_deg_rms=float(np.sqrt((tilt ** 2).mean())),
+                             tilt_deg_max=float(tilt.max())))
             print(f"    {label:10s} {rows[-1]['seconds']:5.1f} {ez[0]:+10.3f} "
                   f"{ez[-1]:+9.3f} {rows[-1]['ez_delta']:+8.3f} {rate:+9.5f} "
-                  f"{eh[-1]:7.3f} {rows[-1]['nis_per_dof']:8.4f}")
+                  f"{eh[-1]:7.3f} {rows[-1]['nis_per_dof']:8.4f} "
+                  f"{rows[-1]['tilt_deg_rms']:8.3f}")
         if args.metrics:
             pathlib_out = args.metrics
             with open(pathlib_out, "w") as f:
@@ -204,6 +222,7 @@ def main():
                                zero_velocity=args.zero_velocity,
                                nv_scale=args.nv_scale,
                                gyro_var=args.gyro_var, accel_var=args.accel_var,
+                               gravity_gates=gates,
                                nis_dof=nis_dof, per_motion=rows), f, indent=2)
             print(f"  metrics -> {pathlib_out}")
 
