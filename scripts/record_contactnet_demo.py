@@ -113,6 +113,14 @@ def main():
     ap.add_argument("--noise-seed", type=int, default=0)
     ap.add_argument("--metrics", default=None, metavar="PATH.json",
                     help="also record per-motion vertical drift (estimate vs truth)")
+    ap.add_argument("--history", default=None, metavar="PATH.npz",
+                    help="dump the full per-control-tick history (est/true position "
+                         "and velocity vectors, tilt, NIS). Needed to split the "
+                         "vertical error into the part INTEGRATED from velocity "
+                         "error and the part DEPOSITED directly by the update -- "
+                         "the deposited component is the fingerprint of the "
+                         "common-mode null mode and sat at -0.18..-0.21 m across "
+                         "four earlier arms regardless of what was changed.")
     args = ap.parse_args()
 
     w, h = (int(v) for v in args.size.lower().split("x"))
@@ -225,6 +233,13 @@ def main():
                                gravity_gates=gates,
                                nis_dof=nis_dof, per_motion=rows), f, indent=2)
             print(f"  metrics -> {pathlib_out}")
+        if args.history:
+            h = loop.history
+            np.savez(args.history,
+                     **{k: np.array([r[k] for r in h])
+                        for k in ("t", "est_p", "true_p", "est_v", "true_v",
+                                  "tilt_deg", "att_deg", "nis", "v_err", "p_err")})
+            print(f"  history -> {args.history}")
 
 
 if __name__ == "__main__":
