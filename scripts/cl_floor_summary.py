@@ -15,6 +15,19 @@ import re
 from pathlib import Path
 
 
+def _walking_nis(pm):
+    """Median-of-motions contact NIS/dof over the walking segments, or NaN.
+
+    Reported beside drift, never instead of it (N2): NIS says whether ``S`` is the
+    right size, drift says whether the filter is any good, and the project has
+    already been burned once by ranking on a proxy.
+    """
+    v = [q["nis_per_dof"] for q in pm
+         if q["motion"] != "stand" and q.get("nis_per_dof", float("nan"))
+         == q.get("nis_per_dof", float("nan"))]
+    return float(sorted(v)[len(v) // 2]) if v else float("nan")
+
+
 def load(d: Path):
     rows = []
     for p in sorted(d.glob("cmv_*_*.json")):
@@ -32,6 +45,9 @@ def load(d: Path):
             horiz=pm[-1]["horiz_end"] if pm else float("nan"),
             deltas={q["motion"]: q["ez_delta"] for q in pm},
             rates={q["motion"]: q["rate_mps"] for q in pm},
+            # Walking-only NIS/dof (the `stand` segment is a different regime and
+            # would dilute it). Missing on runs recorded before it was instrumented.
+            nis=_walking_nis(pm),
         ))
     return rows
 
@@ -51,16 +67,17 @@ def main():
     def signs(r):
         return {k: v for k, v in r["deltas"].items() if k != "stand"}
 
-    print(f"{'floor':>8} {'arm':>9} {'total e_z':>10} {'|e_z|':>8} {'horiz':>7} "
-          f"{'signs':>7}  per-motion d(e_z)")
+    print(f"{'floor':>8} {'arm':>16} {'total e_z':>10} {'|e_z|':>8} {'horiz':>7} "
+          f"{'NIS/dof':>8} {'signs':>7}  per-motion d(e_z)")
     for r in sorted(rows, key=lambda r: (float(r["floor"]), r["arm"])):
         s = signs(r)
         pos = sum(1 for v in s.values() if v > 0)
         neg = sum(1 for v in s.values() if v < 0)
         mixed = "MIXED" if pos and neg else f"{'+' if pos else '-'}only"
         per = " ".join(f"{k[:4]}{v:+.2f}" for k, v in s.items())
-        print(f"{r['floor']:>8} {r['arm']:>9} {r['total_ez']:>+10.4f} "
-              f"{abs(r['total_ez']):>8.4f} {r['horiz']:>7.3f} {mixed:>7}  {per}")
+        nis = f"{r['nis']:8.4f}" if r["nis"] == r["nis"] else f"{'-':>8}"
+        print(f"{r['floor']:>8} {r['arm']:>16} {r['total_ez']:>+10.4f} "
+              f"{abs(r['total_ez']):>8.4f} {r['horiz']:>7.3f} {nis} {mixed:>7}  {per}")
 
     an = {r["floor"]: r for r in rows if r["arm"] == "analytic"}
     if an:

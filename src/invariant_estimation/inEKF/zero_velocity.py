@@ -40,6 +40,58 @@ from jax import Array
 
 from .state import InEKFState
 
+# ===========================================================================
+# *** J̇ = 0 IS A LARGE, UNJUSTIFIED ASSUMPTION AND A DEVIATION FROM THE
+# *** DERIVATION. READ THIS BEFORE TRUSTING ANY NOISE NUMBER FROM THIS MODULE.
+# ===========================================================================
+#
+# `main_estimator._make_contact_kinematics` returns `J_dot = jnp.zeros_like(J)`
+# with `q_dot` accepted and unused. That is a PORT STUB, not a modelling choice:
+# J̇ vanishes only if h(q) were linear in q -- forward kinematics is trigonometric
+# in joint angles -- or if q̇ = 0.
+#
+# MEASURED on the real model (9 filtered + 4 aux joints, 8 contacts, a plausible
+# walking pose, q̇ ~ 2 rad/s):
+#
+#     ||J||        = 1.342  m/rad
+#     ||J_dot||    = 3.513  m/(rad s)      <- stubbed to zero
+#     ||[w] J||    = 0.497  m/(rad s)
+#     ratio        = 7.06                  <- J_dot DOMINATES
+#
+# `contact-zero-velocity.pdf` carries an encoder term J̇ Σ_q J̇ᵀ and no [w]J term;
+# an earlier note in this module claimed the write-up had "omitted" the coupling.
+# Both are halves of ONE sensitivity, and neither statement was complete:
+#
+#     ∂y^v/∂q = -( [w]x J + J̇ )
+#
+# (the δJ q̇ term equals J̇ δq exactly, by symmetry of ∂²h/∂q² in its two q-slots).
+# The write-up has the larger half; the earlier note here had the smaller one.
+#
+# WHY IT IS TOLERATED FOR NOW, AND EXACTLY HOW FAR THAT GOES. The whole encoder
+# channel is negligible against foot roll at this Σ_q = 3.3e-8 rad²:
+#
+#     encoder, J̇ only      std 6.4e-4 m/s
+#     encoder, [w]J only    std 9.0e-5 m/s
+#     encoder, both         std 6.4e-4 m/s
+#     ROLL TERM (measured)  std 7e-2 .. 2e-1 m/s     <- 100-300x larger
+#
+# So it does not change whether the zero-velocity constraint helps: that is decided
+# by the roll model. It WOULD become load-bearing if Σ_q ever grows (e.g. the
+# contact_meas_var floor is folded into it -- at 1e-3 rad² this term reaches
+# 0.11 m/s, i.e. the same size as roll), or if J̇ is used for anything else.
+#
+# FIXING IT IS THREE LINES and stays constant-graph:
+#     _, J_dot = jax.jvp(lambda x: _foot_y_jacobian(x), (q,), (q_dot,))
+# one forward-mode pass, about the cost of J itself.
+#
+# NOTE FOR WHOEVER IMPLEMENTS IT: `test_measurement_actually_holds_the_contact_
+# world_static` uses a synthetic FK h = h0 + A q, which has J̇ = 0 BY CONSTRUCTION
+# and is therefore blind to this term. It needs a nonlinear h to have an opinion.
+J_DOT_IS_ZERO = True
+"""Whether `ContactFrames.J_dot` is the zero stub. See the block comment above.
+Kept as a named constant so the assumption is greppable and so a future fix has an
+obvious thing to flip and a test to hang off."""
+
 
 def velocity_jacobian(n_contacts: int) -> Array:
     r"""The zero-velocity block ``H^v = [0 | -I₃ | 0 | 0]``, shape ``(3, 3N+9)``.
@@ -78,7 +130,7 @@ def velocity_measurement(omega: Array, h: Array, J: Array, q_dot: Array) -> Arra
     Note this needs ``J``, **not** ``J̇``. `filter.contact_velocity_noise` and the TODO
     that points at it are built on ``ContactFrames.J_dot``, which
     `main_estimator` currently stubs to zeros — anything resting on that seam is
-    silently zero.
+    silently zero. See `J_DOT_IS_ZERO` below.
     """
     return -(jnp.cross(jnp.broadcast_to(omega, h.shape), h) + J @ q_dot)
 
@@ -92,7 +144,8 @@ def velocity_residual(state: InEKFState, y_v: Array) -> Array:
 
 
 def velocity_noise(state: InEKFState, sigma_c: Array, J: Array, sigma_q_dot: Array,
-                   h: Array, sigma_omega: Array) -> Array:
+                   h: Array, sigma_omega: Array, dt: float,
+                   nv_scale: float = 1.0) -> Array:
     r"""``N^v_i``, shape ``(N, 3, 3)`` — the noise on the zero-velocity constraint.
 
     Propagating first-order uncertainty through the constraint, with
@@ -118,12 +171,27 @@ def velocity_noise(state: InEKFState, sigma_c: Array, J: Array, sigma_q_dot: Arr
     true. The rule from `anchor_rate_gain` carries over unchanged — **it must inflate,
     never disable**: an over-large Σ_C removes the only absolute velocity observation
     and reintroduces the drift the constraint was added for.
+
+    ``nv_scale`` (κ) is a **diagnostic** multiplier on the whole block, not part of the
+    model: ``N^v ← κ N^v``. It exists because the derivation fixes the trust level with
+    no free parameter, and that claim needs a falsification — if the constraint only
+    helps at some κ ≠ 1 then ``N^v`` as derived is not the right noise. ``κ → ∞`` must
+    reproduce the no-ZV baseline exactly (``K → 0``): that is the graceful-degradation
+    check, and it failing would be a bug in the update, not a modelling result.
+    ``κ = 1`` is bit-identical to the unscaled path, so every recorded number stands.
     """
     h_x = _skew(h)                                             # (N, 3, 3)
-    joint = J @ jnp.diag(sigma_q_dot) @ jnp.swapaxes(J, -1, -2)
+    joint = J @ sigma_q_dot @ jnp.swapaxes(J, -1, -2)
     gyro = h_x @ sigma_omega @ jnp.swapaxes(h_x, -1, -2)
-    body = joint + gyro + sigma_c
-    return state.R @ body @ state.R.T
+    # UNITS. Sigma_C is a spectral DENSITY: `propagate.build_Qd` forms
+    # `Qd = M Qc M^T * dt`, so Sigma_C carries m^2/s and the per-tick contact position
+    # variance is Sigma_C*dt. N^v is a VELOCITY covariance, (m/s)^2. The average
+    # velocity over one tick of a white-noise-driven contact has variance Sigma_C/dt --
+    # NOT Sigma_C. Using Sigma_C raw understates the slip term by 1/dt = 1000x at
+    # dt = 1 ms, which is what made the first Z6 run trust the constraint ~1000x too
+    # much during stance.
+    body = joint + gyro + sigma_c / dt
+    return nv_scale * (state.R @ body @ state.R.T)
 
 
 def velocity_position_cross(state: InEKFState, J: Array, sigma_q: Array,
@@ -141,14 +209,13 @@ def velocity_position_cross(state: InEKFState, J: Array, sigma_q: Array,
     `testBiasColumnsOfHgAreExactlyL` as the precedent for asserting the exact joint
     ``L Σ Lᵀ`` rather than assuming independence.
 
-    **Deviation from `contact-zero-velocity.pdf`, deliberate.** The write-up's ``N^v``
-    lists an encoder term ``J̇ Σ_q J̇ᵀ``; the ``-[ω]× J δq`` coupling above is not in it.
-    That term is first order in Σ_q and does not vanish when ``J̇`` does — and ``J̇``
-    *is* currently zero (`main_estimator` stubs it), so building the encoder
-    contribution on ``J̇`` alone would make it identically zero. Implemented as derived;
-    flagged here so the discrepancy is not silently absorbed.
+    **This is only HALF the encoder sensitivity — see the `J_DOT_IS_ZERO` block at the
+    top of the module.** The full term is ``∂y^v/∂q = -([ω]× J + J̇)``; this function
+    carries the ``[ω]J`` half because ``J̇`` is stubbed to zero upstream. Measured, the
+    missing half is the *larger* one by 7×. Both are negligible against foot roll at
+    today's Σ_q, which is the only reason this is tolerable.
     """
-    JSJ = J @ jnp.diag(sigma_q) @ jnp.swapaxes(J, -1, -2)       # (N, 3, 3)
+    JSJ = J @ sigma_q @ jnp.swapaxes(J, -1, -2)       # (N, 3, 3)
     body = -_skew(jnp.broadcast_to(omega, (J.shape[0], 3))) @ JSJ
     return state.R @ jnp.swapaxes(body, -1, -2) @ state.R.T
 

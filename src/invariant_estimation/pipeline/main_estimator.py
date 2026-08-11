@@ -407,6 +407,8 @@ def build_fused_estimator(
     accel_var: float | None = None,
     contact_var: float | None = None,
     contact_fk_unfiltered: bool = False,
+    zero_velocity: bool = False,
+    nv_scale: float = 1.0,
 ) -> FusedEstimator:
     """Assemble the joint KF + InEKF into one fused estimator (plain Python, I7).
 
@@ -489,7 +491,8 @@ def build_fused_estimator(
         model, base_body_ord, foot_site_ords,
         aux_qpos=aux_qpos, n_filtered=build.n_joints,
     )
-    inekf_step = inf.make_step(ekf, kinematics)
+    inekf_step = inf.make_step(ekf, kinematics, zero_velocity=zero_velocity,
+                               nv_scale=nv_scale)
 
     return FusedEstimator(
         model=model,

@@ -104,6 +104,7 @@ from .gravity_update import (
 )
 from .propagate import propagate
 from .state import InEKFState
+from . import zero_velocity as zero_velocity_mod
 
 # ---------------------------------------------------------------------------
 # Boundary types
@@ -235,11 +236,29 @@ def contact_velocity_noise(J_dot: Array, sigma_q_dot: Array) -> Array:
 # The scan body
 # ---------------------------------------------------------------------------
 
-def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
+def make_step(ekf: InvariantEKF, kinematics: ContactKinematics,
+              zero_velocity: bool = False, nv_scale: float = 1.0):
     """Build the jitted scan body for a given filter wiring and robot model.
 
     ``ekf`` and ``kinematics`` are closed over (static); everything that varies
     per tick arrives through `InEKFInputs`.
+
+    ``zero_velocity`` adds the contact zero-velocity block (`inEKF/zero_velocity.py`)
+    as a **second, sequential** update after the contact-position one. Default off, so
+    every existing number and test is untouched.
+
+    *Sequential rather than stacked, with the measurement that justifies it.* ``ν^p``
+    and ``ν^v`` share the encoder error, so a stacked update would need their
+    cross-covariance (`zero_velocity.velocity_position_cross`) and a sequential one
+    assumes it away — nominally I6's error. Measured, the correlation coefficient is
+    ``|N^pv| / sqrt(N^p N^v) ~ 1e-3``: ``N^v`` is dominated by the roll term
+    (7e-2–2e-1 m/s) while the shared encoder channel is 6.4e-4 m/s. Sequential is
+    therefore exact to three digits here and much simpler. **This stops being true if
+    Σ_q grows** — at the `contact_meas_var` floor of 1e-3 rad² the encoder term reaches
+    0.11 m/s and the two blocks become genuinely correlated. Revisit then.
+
+    ``nv_scale`` (κ) multiplies ``N^v`` and is a diagnostic only — see
+    `zero_velocity.velocity_noise`. Ignored entirely when ``zero_velocity=False``.
 
     Returns
     -------
@@ -247,6 +266,8 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
         ``step(carry, inputs) -> (carry, outputs)`` — the `lax.scan` body.
     """
     gravity_params = ekf.gravity_params
+    H_v = zero_velocity_mod.velocity_jacobian(ekf.N)
+    sigma_omega = ekf.params.gyro_var * jnp.eye(3)
 
     def step(carry: InEKFCarry, inputs: InEKFInputs) -> tuple[InEKFCarry, InEKFOutputs]:
         state, gravity_ref = carry
@@ -274,6 +295,23 @@ def make_step(ekf: InvariantEKF, kinematics: ContactKinematics):
         state, contact_diagnostics = linear_update(
             state, ekf.params.H, nu, measurement_noise(Np)
         )
+
+        # -- 2b. contact zero-velocity constraint (optional) -----------------
+        # The block that gives H columns for velocity. Fused across contacts first:
+        # every stance contact contributes the SAME three rows, so stacking is N
+        # redundant observations of one 3-vector, and cond(S) is already 1.09e9
+        # against a 1e9 gate at N=8. Σ_C weights the fusion, so a rolling or swinging
+        # corner contributes almost nothing — which is exactly what keeps the
+        # constraint honest while the foot rolls.
+        if zero_velocity:
+            y_v = zero_velocity_mod.velocity_measurement(
+                inputs.omega, frames.y, frames.J, inputs.joint.q_dot)
+            N_v = zero_velocity_mod.velocity_noise(
+                state, sigma_c, frames.J, inputs.joint.sigma_q_dot,
+                frames.y, sigma_omega, ekf.params.dt, nv_scale)
+            nu_v, N_f = zero_velocity_mod.fuse_contacts(
+                zero_velocity_mod.velocity_residual(state, y_v).reshape(-1, 3), N_v)
+            state, _ = linear_update(state, H_v, nu_v, N_f)
 
         # -- 3. gravity leveling (G4), gated --------------------------------
         gate = is_quasi_static(

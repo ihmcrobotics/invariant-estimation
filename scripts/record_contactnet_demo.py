@@ -84,6 +84,25 @@ def main():
                          "net trained on noisy IMU against clean sensors is a "
                          "distribution shift, and the estimator's bias state has "
                          "nothing to estimate.")
+    ap.add_argument("--zero-velocity", action="store_true",
+                    help="add the contact zero-velocity measurement block (Z6 gate): "
+                         "H gains velocity columns instead of Sigma_C reweighting a "
+                         "correction whose direction H fixes")
+    ap.add_argument("--nv-scale", type=float, default=1.0, metavar="KAPPA",
+                    help="diagnostic multiplier on the zero-velocity block's noise "
+                         "N^v (only with --zero-velocity). The derivation fixes this "
+                         "at 1 with no free parameter; sweeping it is the "
+                         "falsification of that claim. KAPPA -> inf must reproduce "
+                         "the no-ZV baseline exactly.")
+    ap.add_argument("--gyro-var", type=float, default=None,
+                    help="InEKF process noise on the gyro channel [(rad/s)^2/Hz]. "
+                         "Default (None) takes config/filter_cfg.yaml's 1e-4, which "
+                         "is inherited from the Java config and was never fitted to "
+                         "this sim (sim/sensors.IMUNoise: gyro white 1e-3 rad/s).")
+    ap.add_argument("--accel-var", type=float, default=None,
+                    help="InEKF process noise on the accelerometer channel "
+                         "[(m/s^2)^2/Hz]. Default (None) takes the config's 1e-3; "
+                         "the sim's accel white noise is 3e-2 m/s^2.")
     ap.add_argument("--noise-seed", type=int, default=0)
     ap.add_argument("--metrics", default=None, metavar="PATH.json",
                     help="also record per-motion vertical drift (estimate vs truth)")
@@ -95,8 +114,15 @@ def main():
         contactnet_norm=args.contactnet_norm, verbose=True,
         contacts_per_foot=args.contacts_per_foot,
         contact_meas_var=args.contact_meas_var,
+        zero_velocity=args.zero_velocity, nv_scale=args.nv_scale,
+        gyro_var=args.gyro_var, accel_var=args.accel_var,
         noise=(re_mod.IMUNoise(seed=args.noise_seed) if args.imu_noise else None))
-    print(f"  contact_meas_var={args.contact_meas_var:g}")
+    print(f"  contact_meas_var={args.contact_meas_var:g} "
+          f"zero_velocity={args.zero_velocity} nv_scale={args.nv_scale:g} "
+          f"gyro_var={loop.rt.fused.ekf.params.gyro_var:g} "
+          f"accel_var={loop.rt.fused.ekf.params.accel_var:g}")
+    # dof of the contact-update NIS: the block is 3 rows per contact slot.
+    nis_dof = 3 * loop.rt.fused.n_contacts
     ghost = Ghost(loop.m, loop.maps, loop.filtered_slots, mode=args.ghost)
 
     rec = rp.VideoRecorder(loop.m, args.out, body=loop.maps["BASE_BID"],
@@ -108,7 +134,7 @@ def main():
           f"contactnet={'yes' if args.contactnet else 'no (baseline)'}")
     tick = 0
     stop = False
-    trace = []                       # (label, t, e_z, horiz_err) per control tick
+    trace = []                       # (label, t, e_z, horiz_err, nis/dof) per control tick
     for label, cmd, secs in SCHEDULE:
         if stop:
             break
@@ -122,8 +148,13 @@ def main():
             if est is not None:
                 p_true = np.asarray(loop.d.xpos[loop.maps["BASE_BID"]], dtype=float)
                 e = np.asarray(est.p, dtype=float) - p_true
+                # Contact-update NIS on the PRIOR (CLAUDE.md §6), normalised by its
+                # 3N dof so the target is 1.0 regardless of `--contacts-per-foot`.
+                # Reported BESIDE drift, never instead of it (N2): a filter can be
+                # consistent and still sink.
                 trace.append((label, tick * control_dt, float(e[2]),
-                              float(np.linalg.norm(e[:2]))))
+                              float(np.linalg.norm(e[:2])),
+                              float(loop.history[-1]["nis"]) / nis_dof))
             if tick % stride == 0:
                 capture_with_ghost(rec, loop.d, ghost, est)
             tick += 1
@@ -137,31 +168,43 @@ def main():
         import json
         from collections import OrderedDict
         by = OrderedDict()
-        for label, t, ez, eh in trace:
-            by.setdefault(label, []).append((t, ez, eh))
+        for label, t, ez, eh, nis in trace:
+            by.setdefault(label, []).append((t, ez, eh, nis))
         print("\n  closed-loop vertical error, per motion "
               "(e_z = p_hat_z - p_true_z; CUMULATIVE across the clip)")
         print(f"    {'motion':10s} {'secs':>5s} {'e_z start':>10s} {'e_z end':>9s} "
-              f"{'d(e_z)':>8s} {'rate m/s':>9s} {'horiz':>7s}")
+              f"{'d(e_z)':>8s} {'rate m/s':>9s} {'horiz':>7s} {'NIS/dof':>8s}")
         rows = []
         for label, seg in by.items():
             t = np.array([r[0] for r in seg]); ez = np.array([r[1] for r in seg])
             eh = np.array([r[2] for r in seg])
+            nis = np.array([r[3] for r in seg])
             # rate WITHIN the motion: the clip is one continuous run, so absolute e_z
             # carries in from earlier motions and only the slope is attributable here.
             rate = float(np.polyfit(t, ez, 1)[0]) if len(t) > 2 else float("nan")
+            finite = nis[np.isfinite(nis)]
             rows.append(dict(motion=label, seconds=float(t[-1] - t[0]),
                              ez_start=float(ez[0]), ez_end=float(ez[-1]),
                              ez_delta=float(ez[-1] - ez[0]), rate_mps=rate,
-                             horiz_end=float(eh[-1])))
+                             horiz_end=float(eh[-1]),
+                             # median, not mean: the NIS distribution has a heavy
+                             # touchdown tail and a mean is set by a handful of ticks.
+                             nis_per_dof=float(np.median(finite)) if finite.size else
+                             float("nan"),
+                             nis_per_dof_mean=float(finite.mean()) if finite.size else
+                             float("nan")))
             print(f"    {label:10s} {rows[-1]['seconds']:5.1f} {ez[0]:+10.3f} "
                   f"{ez[-1]:+9.3f} {rows[-1]['ez_delta']:+8.3f} {rate:+9.5f} "
-                  f"{eh[-1]:7.3f}")
+                  f"{eh[-1]:7.3f} {rows[-1]['nis_per_dof']:8.4f}")
         if args.metrics:
             pathlib_out = args.metrics
             with open(pathlib_out, "w") as f:
                 json.dump(dict(contact_meas_var=args.contact_meas_var,
-                               contactnet=args.contactnet, per_motion=rows), f, indent=2)
+                               contactnet=args.contactnet,
+                               zero_velocity=args.zero_velocity,
+                               nv_scale=args.nv_scale,
+                               gyro_var=args.gyro_var, accel_var=args.accel_var,
+                               nis_dof=nis_dof, per_motion=rows), f, indent=2)
             print(f"  metrics -> {pathlib_out}")
 
 
