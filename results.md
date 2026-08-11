@@ -475,3 +475,102 @@ cannot see this mode".
 
 Evidence: `results/zdrift_bexp/closed_loop/cmv_1e-3_bexp.json`, summary and span plot
 in the run directory.
+
+---
+
+## 11. Zero velocity, process noise, and the gravity gate (2026-08-11)
+
+Twenty closed-loop runs on the 25 s six-motion clip, clean sensors, N=8,
+`contact_meas_var = 1e-3`. Batches: `scripts/overnight_{zv_qc_sweep,gate_sweep,
+zv_kappa_hi,zv_mechanism}.sh`; evidence under `results/zv_qc_2026-08-11/`.
+**Four leads, four dead ends** — recorded so none of them is re-derived.
+
+### 11.1 The correction that matters most
+
+The analytic stance Σ_C asserts a contact slip of **0.1414 m/s**, not the 3.2e-3
+m/s that has been quoted. `contact.digest` applies `contact_floor` **additively**
+and it is 10 000x `stance_chol^2`:
+
+    Sigma_C = stance_chol^2 + contact_floor = 1e-8 + 1e-4 = 1.0001e-4 m^2/s
+    sqrt(Sigma_C / dt) = sqrt(1.0001e-4 / 5e-3)             = 0.1414 m/s
+
+which sits at the TOP of the measured 0.07-0.20 m/s foot roll. Two consequences:
+the shipped stance trust level is already physically right, and **the "learned
+Sigma_C is ~100x looser than analytic" claim does not survive into the deployed
+filter** — post-floor, both arms sit at the floor. Measured independently: under
+the zero-velocity block the learned arm behaves like kappa ~ 1-2, not kappa ~ 100
+(§11.2).
+
+### 11.2 Zero velocity: no trust level is a win, and the gain is a cancellation
+
+kappa multiplies `N^v` (`--nv-scale`); kappa -> inf is "ZV off".
+
+    kappa      e_z      horiz   NIS/dof   tiltRMS
+    0.1     +0.2261     0.822    0.0086     0.850   deg
+    1       +0.0802     0.669    0.0054     0.815
+    10      -0.0764     0.261    0.0026     0.431
+    100     -0.1100     0.087    0.0012     0.195
+    1e3     -0.1155     0.062    0.0014     0.224
+    1e4     -0.1179     0.061    0.0014     0.225
+    1e6     -0.1165     0.060    0.0014     0.225   <- reproduces `base` to 4 dp
+    off     -0.1165     0.060    0.0014     0.225
+
+Every point is single-signed across the six motions. **No kappa beats the baseline
+on both axes**; the best vertical (kappa=10, 0.0764 m, 34% better) costs 4.3x
+horizontally. Graceful degradation is verified twice — as a unit-test property
+(kappa*|dv| constant over kappa in {1e6, 1e9, 1e12}) and as `zvK1e6` above.
+
+**The mechanism, from `--history` + `scripts/zv_signature.py`** — both predictions
+the ZV plan wrote down in advance FAIL:
+
+               e_z      integrated    DEPOSITED    signature
+    base     -0.1159      -0.0501      -0.0658     LINEAR (R2 .999 vs sqrt .951)
+    kappa=1  +0.0797      +0.1312      -0.0514     LINEAR (R2 .994 vs sqrt .930)
+    kappa=10 -0.0754      -0.0111      -0.0643     LINEAR (R2 .998 vs sqrt .962)
+
+The signature never turns sqrt(t), and the update-DEPOSITED null-mode component is
+untouched (-0.0658 -> -0.0643 at kappa=10) while the headline swings 0.20 m. What
+changes is the velocity-integrated term: ZV injects a POSITIVE vertical velocity
+bias (mean dv_z -0.0021 -> +0.0055 m/s) that overshoots the sink. Sweeping kappa
+scales that injected bias, which is why e_z passes smoothly through zero between
+kappa=1 and 10. **Nothing was starved; something equal and opposite was added.**
+
+Under the learned `bounded_exp` Sigma_C: `zvBexp` -0.1535 / 0.604 against `bexp`
+-0.3123 / 0.095 — the same trade (2.0x better vertical, 6.4x worse horizontal),
+and worse than the plain analytic filter on both axes.
+
+**Do not retrain ContactNet on top of the zero-velocity block.** Gate Z6 of the
+plan ("if it does not improve the analytic arm, training on top of it is
+premature") is failed unambiguously.
+
+### 11.3 Non-contact process noise is not the missing tuning
+
+`gyro_var` and `accel_var` swept x0.1/x10 on the analytic arm (drift AND NIS/dof
+together): drift moves <=13%, contact NIS/dof stays in the 1e-3 decade (0.0008 to
+0.0025 over four decades of Q_c), and the two configurations that improve drift
+move NIS in OPPOSITE directions. Reaching NIS/dof = 1 needs ~700x. `S` is not set
+by the gyro/accel blocks of `Q_c` — consistent with CLAUDE.md 7a's `H P H^T`
+argument, now confirmed from the other side.
+
+### 11.4 The gravity gate never fires because the signal is not gravity
+
+Instrumented per tick in closed loop (`scripts/gravity_gate_trace.py`; the
+reconstructed `GravityRef` is verified against the filter's own published
+`quasi_static` mask on all 5000 ticks). The gate passes **23 of 4800 walking
+ticks (0.479%)**. Walking-tick medians against tolerances:
+
+    norm  ||f|-g|/g   0.084 / 0.05   passes 27.5%
+    rot   |w_raw|     0.326 / 0.15   passes 14.3%
+    horiz |f_perp|    1.472 / 0.50   passes  2.2%   <- binding
+    leave-one-out: dropping horiz reaches only 4.50%
+
+Every median is 1.7-2.9x its tolerance, so the thresholds are not marginally
+mis-set: during gait the specific force genuinely is not gravity (median
+|f_perp| = 1.47 m/s^2 reads as 8.6 deg of apparent tilt, against a true walking
+tilt error of 0.225 deg RMS). Opening the gate anyway (`--gravity-gates`, new)
+does not blow up and does not fix anything: past every p99, drift -0.1165 ->
+-0.1013 (13%), horizontal 0.060 -> 0.057, tilt RMS 0.225 -> 0.255 deg. This
+retires the "cheap and never checked" item in `what-has-been-tried.md` 7.
+
+Full write-up, including the process failure that cost one run:
+`.claude-reports/2026-08-11-zero-vel-overnight.md` (local, gitignored).
