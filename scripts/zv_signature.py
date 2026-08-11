@@ -70,6 +70,16 @@ def report(path):
     print(f"  |dv_z| rms {np.sqrt((dv[k0:] ** 2).mean()):.4f} m/s, "
           f"mean {dv[k0:].mean():+.5f} m/s   "
           f"tilt rms {np.sqrt((z['tilt_deg'][k0:] ** 2).mean()):.3f} deg")
+    # The TRUE trajectory, because this is closed loop: the estimate feeds
+    # `projected_gravity` and `base_ang_vel` to the policy, so an arm that degrades
+    # attitude makes the ROBOT walk differently. Two arms whose true paths differ
+    # are not being scored on the same motion, and a horizontal-error comparison
+    # between them means less than it looks.
+    tp = z["true_p"]
+    path = float(np.linalg.norm(np.diff(tp[:, :2], axis=0), axis=1).sum())
+    print(f"  true path length {path:.3f} m, "
+          f"true final xy ({tp[-1, 0]:+.3f}, {tp[-1, 1]:+.3f}), "
+          f"true z range {tp[:, 2].min():.3f}..{tp[:, 2].max():.3f} m")
     return dict(total=total, integrated=integrated, deposited=deposited,
                 r2_lin=r2_lin, r2_sqrt=r2_sqrt)
 
