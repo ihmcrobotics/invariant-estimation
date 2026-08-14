@@ -227,12 +227,22 @@ typings/
 experiments/sim_runs/*.npz
 
 # ContactNet overnight run: the ~600 MB of *.npz rollouts + channel caches
-# (regenerate via `scripts/run_contactnet.py --collect`). results/ IS committed
-# (plots, summary.json, history.npy, P0.npy, params.npz) as the run's evidence;
-# each run now writes its own results/<YYYY-MM-DD_HH-MM-SS>/ directory, so commit
-# the run dirs you want as evidence and leave the rest untracked.
+# (regenerate via `scripts/run_contactnet.py --collect`).
 data/
 results/latest
+
+# results/ POLICY, tightened 2026-08-10. Track the EVIDENCE (*.json summaries and
+# metrics) and nothing else: the binaries are regenerable, and tracking them had put
+# 87 MB of weights, histories, plots and demo videos in the tree against 256 KB of
+# JSON that the docs actually cite. Weights for an arm still under comparison are
+# kept on disk but untracked; everything pruned on 2026-08-10 remains in git history.
+results/**/*.npz
+results/**/*.npy
+results/**/*.png
+results/**/*.mp4
+results/**/*.gif
+results/**/*.log
+results/**/*.out
 
 # Ignore MuJoCo logs
 MUJOCO_LOG.TXT

@@ -10,7 +10,7 @@ doing forward / backward / strafe L,R / turn L,R with the learned contact-noise
 model in the loop.
 
     uv run --extra gpu python scripts/record_contactnet_demo.py \
-        --contactnet results/latest/params.npz \
+        --contactnet results/latest/params.npz --contacts-per-foot 4 \
         --out results/latest/closed_loop/contactnet_demo_ghost.mp4
 
 Drop --contactnet for the analytic-baseline version. `--ghost attitude` pins the
@@ -60,18 +60,87 @@ def main():
     ap.add_argument("--contactnet", default=None, metavar="PARAMS.npz",
                     help="run the trained ContactNet in the loop (omit for the analytic baseline)")
     ap.add_argument("--contactnet-norm", default=None)
+    ap.add_argument("--contacts-per-foot", type=int, choices=(1, 4), default=1,
+                    help="contact slots per foot; must match the checkpoint's training "
+                         "geometry (the N=8 ladder arms need 4). run_estimator.py "
+                         "enforces this against the checkpoint's summary.json")
     ap.add_argument("--out", required=True, metavar="PATH.mp4")
     ap.add_argument("--ghost", choices=("full", "attitude"), default="full")
     ap.add_argument("--seconds", type=float, default=None,
                     help="override every motion's duration (default: the schedule's own)")
     ap.add_argument("--fps", type=float, default=50.0)
     ap.add_argument("--size", default="1280x720", metavar="WxH")
+    ap.add_argument("--contact-meas-var", type=float, default=1.0e-3,
+                    help="InEKF contact measurement-noise floor. MUST match what the "
+                         "checkpoint was TRAINED at -- the 2026-08-10 sweep found this "
+                         "parameter dominates drift (it is ~30,000x the measured "
+                         "Sigma_q, so it effectively sets how much the contact FK "
+                         "measurement is listened to at all). The recommended "
+                         "checkpoint was trained at 1e-3; running it at 0 evaluates a "
+                         "configuration it never saw.")
+    ap.add_argument("--imu-noise", action="store_true",
+                    help="corrupt the IMU as the training pool was collected "
+                         "(n8fix has imu_noise=True and a true gyro bias). Running a "
+                         "net trained on noisy IMU against clean sensors is a "
+                         "distribution shift, and the estimator's bias state has "
+                         "nothing to estimate.")
+    ap.add_argument("--zero-velocity", action="store_true",
+                    help="add the contact zero-velocity measurement block (Z6 gate): "
+                         "H gains velocity columns instead of Sigma_C reweighting a "
+                         "correction whose direction H fixes")
+    ap.add_argument("--nv-scale", type=float, default=1.0, metavar="KAPPA",
+                    help="diagnostic multiplier on the zero-velocity block's noise "
+                         "N^v (only with --zero-velocity). The derivation fixes this "
+                         "at 1 with no free parameter; sweeping it is the "
+                         "falsification of that claim. KAPPA -> inf must reproduce "
+                         "the no-ZV baseline exactly.")
+    ap.add_argument("--gyro-var", type=float, default=None,
+                    help="InEKF process noise on the gyro channel [(rad/s)^2/Hz]. "
+                         "Default (None) takes config/filter_cfg.yaml's 1e-4, which "
+                         "is inherited from the Java config and was never fitted to "
+                         "this sim (sim/sensors.IMUNoise: gyro white 1e-3 rad/s).")
+    ap.add_argument("--accel-var", type=float, default=None,
+                    help="InEKF process noise on the accelerometer channel "
+                         "[(m/s^2)^2/Hz]. Default (None) takes the config's 1e-3; "
+                         "the sim's accel white noise is 3e-2 m/s^2.")
+    ap.add_argument("--gravity-gates", default=None, metavar="NORM,ROT,HORIZ",
+                    help="override the quasi-static gate thresholds (defaults "
+                         "0.05,0.15,0.5). Measured: the shipped values pass 0 of "
+                         "20000 walking ticks, so gravity leveling does nothing "
+                         "during gait and attitude runs open-loop on the gyro. "
+                         "This relaxes the THRESHOLDS only -- the gate still reads "
+                         "the sensor-driven gravity reference (regression F.3).")
+    ap.add_argument("--noise-seed", type=int, default=0)
+    ap.add_argument("--metrics", default=None, metavar="PATH.json",
+                    help="also record per-motion vertical drift (estimate vs truth)")
+    ap.add_argument("--history", default=None, metavar="PATH.npz",
+                    help="dump the full per-control-tick history (est/true position "
+                         "and velocity vectors, tilt, NIS). Needed to split the "
+                         "vertical error into the part INTEGRATED from velocity "
+                         "error and the part DEPOSITED directly by the update -- "
+                         "the deposited component is the fingerprint of the "
+                         "common-mode null mode and sat at -0.18..-0.21 m across "
+                         "four earlier arms regardless of what was changed.")
     args = ap.parse_args()
 
     w, h = (int(v) for v in args.size.lower().split("x"))
+    gates = (tuple(float(v) for v in args.gravity_gates.split(","))
+             if args.gravity_gates else None)
     loop = re_mod.make_estimated_loop(
         "baseline", with_visuals=True, contactnet=args.contactnet,
-        contactnet_norm=args.contactnet_norm, verbose=True)
+        contactnet_norm=args.contactnet_norm, verbose=True,
+        contacts_per_foot=args.contacts_per_foot,
+        contact_meas_var=args.contact_meas_var,
+        zero_velocity=args.zero_velocity, nv_scale=args.nv_scale,
+        gyro_var=args.gyro_var, accel_var=args.accel_var,
+        gravity_gates=gates,
+        noise=(re_mod.IMUNoise(seed=args.noise_seed) if args.imu_noise else None))
+    print(f"  contact_meas_var={args.contact_meas_var:g} "
+          f"zero_velocity={args.zero_velocity} nv_scale={args.nv_scale:g} "
+          f"gyro_var={loop.rt.fused.ekf.params.gyro_var:g} "
+          f"accel_var={loop.rt.fused.ekf.params.accel_var:g}")
+    # dof of the contact-update NIS: the block is 3 rows per contact slot.
+    nis_dof = 3 * loop.rt.fused.n_contacts
     ghost = Ghost(loop.m, loop.maps, loop.filtered_slots, mode=args.ghost)
 
     rec = rp.VideoRecorder(loop.m, args.out, body=loop.maps["BASE_BID"],
@@ -83,6 +152,7 @@ def main():
           f"contactnet={'yes' if args.contactnet else 'no (baseline)'}")
     tick = 0
     stop = False
+    trace = []                       # (label, t, e_z, horiz_err, nis/dof) per control tick
     for label, cmd, secs in SCHEDULE:
         if stop:
             break
@@ -92,14 +162,84 @@ def main():
         print(f"    {label:10s} cmd={cmd} for {n} ticks")
         for _ in range(n):
             loop.control_tick()
+            est = loop.current_estimate()
+            if est is not None:
+                p_true = np.asarray(loop.d.xpos[loop.maps["BASE_BID"]], dtype=float)
+                e = np.asarray(est.p, dtype=float) - p_true
+                # Contact-update NIS on the PRIOR (CLAUDE.md §6), normalised by its
+                # 3N dof so the target is 1.0 regardless of `--contacts-per-foot`.
+                # Reported BESIDE drift, never instead of it (N2): a filter can be
+                # consistent and still sink.
+                trace.append((label, tick * control_dt, float(e[2]),
+                              float(np.linalg.norm(e[:2])),
+                              float(loop.history[-1]["nis"]) / nis_dof,
+                              # tilt (roll/pitch) error: the z-budget puts 14.7%
+                              # of the sink on attitude x specific force, and it
+                              # is the channel gravity leveling is responsible for.
+                              float(loop.history[-1]["tilt_deg"])))
             if tick % stride == 0:
-                capture_with_ghost(rec, loop.d, ghost, loop.current_estimate())
+                capture_with_ghost(rec, loop.d, ghost, est)
             tick += 1
             if not np.all(np.isfinite(loop.d.qpos)):
                 print(f"    !! non-finite state during {label}; stopping")
                 stop = True
                 break
     rec.close()
+
+    if trace:
+        import json
+        from collections import OrderedDict
+        by = OrderedDict()
+        for label, t, ez, eh, nis, tilt in trace:
+            by.setdefault(label, []).append((t, ez, eh, nis, tilt))
+        print("\n  closed-loop vertical error, per motion "
+              "(e_z = p_hat_z - p_true_z; CUMULATIVE across the clip)")
+        print(f"    {'motion':10s} {'secs':>5s} {'e_z start':>10s} {'e_z end':>9s} "
+              f"{'d(e_z)':>8s} {'rate m/s':>9s} {'horiz':>7s} {'NIS/dof':>8s} {'tiltRMS':>8s}")
+        rows = []
+        for label, seg in by.items():
+            t = np.array([r[0] for r in seg]); ez = np.array([r[1] for r in seg])
+            eh = np.array([r[2] for r in seg])
+            nis = np.array([r[3] for r in seg])
+            tilt = np.array([r[4] for r in seg])
+            # rate WITHIN the motion: the clip is one continuous run, so absolute e_z
+            # carries in from earlier motions and only the slope is attributable here.
+            rate = float(np.polyfit(t, ez, 1)[0]) if len(t) > 2 else float("nan")
+            finite = nis[np.isfinite(nis)]
+            rows.append(dict(motion=label, seconds=float(t[-1] - t[0]),
+                             ez_start=float(ez[0]), ez_end=float(ez[-1]),
+                             ez_delta=float(ez[-1] - ez[0]), rate_mps=rate,
+                             horiz_end=float(eh[-1]),
+                             # median, not mean: the NIS distribution has a heavy
+                             # touchdown tail and a mean is set by a handful of ticks.
+                             nis_per_dof=float(np.median(finite)) if finite.size else
+                             float("nan"),
+                             nis_per_dof_mean=float(finite.mean()) if finite.size else
+                             float("nan"),
+                             tilt_deg_rms=float(np.sqrt((tilt ** 2).mean())),
+                             tilt_deg_max=float(tilt.max())))
+            print(f"    {label:10s} {rows[-1]['seconds']:5.1f} {ez[0]:+10.3f} "
+                  f"{ez[-1]:+9.3f} {rows[-1]['ez_delta']:+8.3f} {rate:+9.5f} "
+                  f"{eh[-1]:7.3f} {rows[-1]['nis_per_dof']:8.4f} "
+                  f"{rows[-1]['tilt_deg_rms']:8.3f}")
+        if args.metrics:
+            pathlib_out = args.metrics
+            with open(pathlib_out, "w") as f:
+                json.dump(dict(contact_meas_var=args.contact_meas_var,
+                               contactnet=args.contactnet,
+                               zero_velocity=args.zero_velocity,
+                               nv_scale=args.nv_scale,
+                               gyro_var=args.gyro_var, accel_var=args.accel_var,
+                               gravity_gates=gates,
+                               nis_dof=nis_dof, per_motion=rows), f, indent=2)
+            print(f"  metrics -> {pathlib_out}")
+        if args.history:
+            h = loop.history
+            np.savez(args.history,
+                     **{k: np.array([r[k] for r in h])
+                        for k in ("t", "est_p", "true_p", "est_v", "true_v",
+                                  "tilt_deg", "att_deg", "nis", "v_err", "p_err")})
+            print(f"  history -> {args.history}")
 
 
 if __name__ == "__main__":

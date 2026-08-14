@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+from . import network
+
 
 @dataclass(frozen=True)
 class ContactNetConfig:
@@ -31,18 +33,64 @@ class ContactNetConfig:
     dt: float = 1.0e-3             # sim/filter tick period [s]
 
     widths: tuple[int, ...] = (256, 256)  # trunk
-    eps: float = 1.0e-6            # softplus floor on diag(L)
+    eps: float = 1.0e-6            # positivity floor on diag(L)
+
+    diag_param: str = "softplus"
+    """Positive parameterisation of diag(L). RECORDED per run; a checkpoint must be
+    loaded under the one it was trained with, or its head's raw outputs are rescaled.
+
+    `softplus` is the original. For r << 0 it IS exp, so it behaves well at the tight
+    end -- but it goes LINEAR above zero, where relative sensitivity dlogL/dr decays
+    as 1/r. Sigma_C spans ~1e10 stance->swing (analytic tr 3e-8 -> 3e2), and reaching
+    the swing end needs r=+10 at sensitivity 0.10. Measured: the softplus run achieved
+    3.6 of the 19.2 raw units that span requires (19%), leaving Sigma_C 685x too tight
+    in swing -- which is what pushes the base upward once the feet leave the ground.
+
+    `exp` gives dlogL/dr = 1 everywhere; the same target is r=+2.30 at sensitivity
+    1.00. For a scale parameter spanning ten decades this is the natural choice.
+    MEASURED: it opened the span (12.8 -> 21.9 raw units) and then diverged -- p99 raw
+    +12.5 is a per-axis Sigma_C of 2.7e5, at which the contact update switches itself
+    off. Nothing bounds it.
+
+    `bounded_exp` is that log parameterisation confined to [diag_lo, diag_hi] by a
+    sigmoid in log space. Smooth saturation, not a clip: at the bounds the gradient
+    shrinks rather than vanishing."""
+
+    diag_lo: float = network.DIAG_LO_DEFAULT
+    diag_hi: float = network.DIAG_HI_DEFAULT
+    """Range `bounded_exp` spans, as LINEAR per-axis contact STDs (the units of
+    `sigma_0`), logged internally. Ignored by `softplus` and `exp`.
+
+    1e-5 -> 1e2 brackets the analytic heuristic's 1e-4 (stance) -> 1e1 (swing) with a
+    decade of headroom either side, so the network can go tighter than stance and
+    looser than swing without being able to reach the 2.7e5 that killed the unbounded
+    run. RECORDED and read back with `diag_param`: different bounds rescale a
+    checkpoint's head exactly the way the wrong `diag_param` does."""
 
     # BPTT / data
     L: int = 128                   # ticks the gradient traverses
     B: int = 32                    # segments per batch
 
-    # objective. "beta_nll" is accepted vocabulary but NOT implemented --
-    # `rollout.make_segment_loss` raises NotImplementedError on it (the loss fn is
-    # missing from losses.py, and the InEKF diagnostics publish no `logdet_S`).
-    # `beta` is its plumbed-but-unused hyperparameter.
+    # objective. Both are implemented: `l2_velocity` is the CoCo-faithful run-1
+    # objective and the trusted baseline; `beta_nll` is the Seitzer beta-weighted
+    # innovation NLL. The comment here used to say beta_nll was NOT implemented
+    # while the default had already been flipped TO it -- so a run that meant to
+    # be the L2 baseline silently trained beta_nll. Pass --objective explicitly.
     objective: str = "l2_velocity"
     beta: float = 0.5
+
+    # pose-loss weights for the composite objectives
+    # (`l2_vel_pos` / `l2_vel_ori` / `l2_vel_pos_ori`): loss = L_vel + w_pos*L_pos
+    # + w_ori*L_ori. `None` => sized ONCE on the first warm batch so each added term
+    # starts at `pose_weight_ratio` x the velocity term, then FROZEN for the run
+    # (measure-once, not per-step adaptive). An explicit float overrides the
+    # auto-measure. Velocity stays the lead term; ratio 0.5 gives the pose terms
+    # comparable-but-secondary pull. The added terms are segment-relative
+    # (displacement / incremental rotation) because base position and yaw are
+    # unobservable and their absolute error drifts unbounded (see losses.py).
+    w_pos: float | None = None
+    w_ori: float | None = None
+    pose_weight_ratio: float = 0.5
 
     # optimizer
     peak_lr: float = 1.0e-4
@@ -85,6 +133,31 @@ class ContactNetConfig:
     init_seed: int = 0
     batcher_seed: int = 0
 
+    # environment variables for domain randomization
+    env_dr: bool = False
+    friction_range: tuple = (0.6, 1.2)
+    friction_low_tail_prob: float = 0.25
+    # MEASURED, 2026-08-05: the original (0.15, 0.45) tail put mu as low as 0.15 --
+    # effectively ice -- and the flat-trained policy fell on it. An axis ablation
+    # through the real collect path (friction-only vs pushes-only) attributed the
+    # falls to FRICTION, not to the pushes: with pushes at their configured
+    # 30-120 N the robot stayed up. 7 of the first 8 DR rollouts were lost this
+    # way, INCLUDING one on flat ground, which is what ruled the terrain out.
+    # 0.45-0.70 against a ~1.0 nominal is still a real slip regime; a tail the
+    # policy cannot survive yields no data at all, which trains nothing.
+    friction_low_tail: tuple = (0.45, 0.70)
+    disturb_rate_hz: float = 0.4
+    disturb_mag_N: tuple = (30.0, 120.0)
+    disturb_dur_s: float = 0.1
+    terrain_mix: tuple = (("flat", 0.25), ("waves", 0.25), ("stepping_stones",0.25), ("hard_stepping",0.25))
+
+    @property
+    def diag_spec(self) -> "network.DiagSpec":
+        """The diag(L) parameterisation as one object. Pass THIS to `network.init` /
+        `network.forward`, never the bare `diag_param` string, or the bounds are
+        silently the module defaults."""
+        return network.DiagSpec(self.diag_param, self.diag_lo, self.diag_hi)
+
     @property
     def d_in(self) -> int:
         return self.F * self.H
@@ -121,10 +194,32 @@ class ContactNetConfig:
             )
         if self.L <= 0 or self.B <= 0:
             raise ValueError(f"L and B must be positive, got L={self.L} and B={self.B}")
-        if self.objective not in ("beta_nll", "l2_velocity"):
+        if self.diag_param not in network.DIAG_PARAMS:
+            raise ValueError(
+                f"diag_param must be one of {network.DIAG_PARAMS}, "
+                f"got {self.diag_param!r}")
+        if not 0.0 < self.diag_lo < self.diag_hi:
+            raise ValueError(
+                f"need 0 < diag_lo < diag_hi, got diag_lo={self.diag_lo}, "
+                f"diag_hi={self.diag_hi}")
+        if self.diag_param == "bounded_exp" and not (
+                self.diag_lo < self.sigma_0 - self.eps < self.diag_hi):
+            # The init bias is logit((log(sigma_0 - eps) - log lo)/(log hi - log lo));
+            # outside the range it is not finite and the run starts saturated.
+            raise ValueError(
+                f"bounded_exp needs diag_lo < sigma_0 - eps < diag_hi, got "
+                f"diag_lo={self.diag_lo}, sigma_0-eps={self.sigma_0 - self.eps}, "
+                f"diag_hi={self.diag_hi}")
+        if self.objective not in (
+            "beta_nll", "l2_velocity",
+            "l2_vel_pos", "l2_vel_ori", "l2_vel_pos_ori",
+        ):
             raise ValueError(f"Unknown objective: {self.objective!r}")
         if not 0.0 <= self.beta <= 1.0:
             raise ValueError(f"Beta must be in [0,1], got {self.beta}")
+        if not self.pose_weight_ratio > 0.0:
+            raise ValueError(
+                f"pose_weight_ratio must be positive, got {self.pose_weight_ratio}")
         if self.warmup_steps >= self.total_steps:
             raise ValueError(
                 f"warmup_steps ({self.warmup_steps}) must be < total_steps"

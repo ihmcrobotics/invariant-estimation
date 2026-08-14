@@ -27,6 +27,7 @@ Load-bearing points (see the reference dataset.py docstring for the full argumen
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,7 +86,7 @@ def chunked_fk(kinematics, q: np.ndarray, chunk: int = 2_000) -> np.ndarray:
 
 def build_channel_cache(paths: Sequence[Path | str], collector: collect.Collector, *,
                         cache_dir: Path | str = CACHE_DIR, chunk: int = 2_000,
-                        verbose: bool = True) -> list[Path]:
+                        reuse: bool = True, verbose: bool = True) -> list[Path]:
     r"""Write raw (not normalized) channels + y_fk for every rollout in paths.
 
     channels is features.make_contact_channels over Rollout.sensors (raw: the
@@ -100,15 +101,47 @@ def build_channel_cache(paths: Sequence[Path | str], collector: collect.Collecto
     channels = features.make_contact_channels(
         sub, fused.base_imu, fused.kinematics, collector.dt)
 
+    expect_names = np.asarray(features.channel_names())
+    n_c = int(fused.n_contacts)
+
+    def _reusable(out: Path, src: Path) -> bool:
+        """Is `out` a cache we can trust for `src` under the CURRENT feature code?
+
+        Rebuilding every channel cache costs ~4 min/rollout, which dominates a
+        training run whose inputs have not changed. But a stale cache is worse
+        than a slow one -- it trains on features that no longer match the code
+        and nothing downstream would notice -- so reuse is allowed only when all
+        of these hold, and ANY mismatch falls through to a rebuild:
+          * the cache is newer than the rollout it came from;
+          * the channel NAMES are identical (catches a changed/reordered channel
+            set, which is the realistic way this goes wrong);
+          * the contact axis matches this collector's N (an N=2 cache must never
+            be reused for an N=8 run).
+        """
+        if not (out.exists() and out.stat().st_mtime >= src.stat().st_mtime):
+            return False
+        try:
+            with np.load(out, allow_pickle=False) as z:
+                if not np.array_equal(z["names"], expect_names):
+                    return False
+                return z["channels"].shape[1] == n_c and z["y_fk"].shape[1] == n_c
+        except Exception:
+            return False
+
     written = []
     for p in paths:
         p = Path(p)
+        out = cache_dir / f"{p.stem}_feat.npz"
+        if reuse and _reusable(out, p):
+            written.append(out)
+            if verbose:
+                print(f"  reused {out.name} (cache newer than rollout, channels match)")
+            continue
         roll = collect.load_rollout(p)
         x = collect.contact_channels_chunked(channels, roll.sensors, chunk=chunk)
         y = chunked_fk(fused.kinematics, roll.inputs.joint.q, chunk=chunk)
         if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
             raise RuntimeError(f"{p.name}: non-finite features/FK in the cache pass")
-        out = cache_dir / f"{p.stem}_feat.npz"
         np.savez_compressed(
             out, channels=x, y_fk=y,
             names=np.asarray(features.channel_names()),
@@ -229,6 +262,89 @@ def prepare(paths: Sequence[Path | str], norm: normalize.NormConstants,
     return out
 
 
+def apply_contact_meas_floor(preps: Sequence[PreparedRollout],
+                             contact_meas_var: float, recorded: float = 0.0
+                             ) -> list[PreparedRollout]:
+    r"""Re-apply the InEKF contact measurement-noise floor to RECORDED inputs.
+
+    `contact_meas_var` (main_estimator "landmine #2") is applied at the joint-KF ->
+    InEKF boundary: `_boundary` sets ``sigma_q_eff = sigma_q + contact_meas_var * I``
+    and writes it into `InEKFInputs.joint.sigma_q` (`main_estimator.py:697,713`). That
+    boundary runs inside `make_fused_step` -- the COLLECTION path.
+
+    ContactNet trains and validates by replaying recorded `InEKFInputs` through
+    `inEKF.filter.make_step`, which consumes `inputs.joint.sigma_q` directly
+    (`filter.py:264`, via `contact_position_noise`). It never calls `_boundary`. So
+    passing `contact_meas_var` to `build_collector` at TRAINING time sets
+    `fused.contact_meas_var` and changes nothing at all: the value that matters was
+    baked into the recorded `sigma_q` when the pool was collected. Symptom, if you
+    ever see it again: the analytic baseline is bit-identical across a change to the
+    floor, because the floor is not in the graph.
+
+    This function closes that gap on the replay path, and it is EXACT rather than an
+    approximation, for two reasons:
+
+      * `sigma_q_eff` is a pure transformation of the joint KF's OUTPUT -- it is used
+        only to build the InEKF input and never fed back into the joint filter -- so
+        re-applying it downstream reproduces it identically; and
+      * the collection policy is driven by ground truth (`collect` calls
+        `rp.build_obs(self.m, self.d, ...)`), so the recorded trajectory does not
+        depend on the filter configuration at all. Re-collecting at a different floor
+        would yield the same sensors and the same truth.
+
+    `recorded` is the floor the pool was collected under (from its meta), so the
+    delta applied is `contact_meas_var - recorded` and calling this twice is not a
+    double-add.
+    """
+    delta = float(contact_meas_var) - float(recorded)
+    if delta == 0.0:
+        return list(preps)
+    out = []
+    for prep in preps:
+        sq = prep.inputs.joint.sigma_q
+        n = sq.shape[-1]
+        floored = sq + delta * np.eye(n, dtype=np.float64)
+        joint = prep.inputs.joint._replace(sigma_q=floored)
+        out.append(dataclasses.replace(prep, inputs=prep.inputs._replace(joint=joint)))
+    return out
+
+
+def scale_sigma_q(preps: Sequence[PreparedRollout], scale) -> list[PreparedRollout]:
+    r"""Rescale the RECORDED joint covariance per joint: ``Sigma_q <- D Sigma_q D``.
+
+    Measured on the n8fix pool, joint-level NEES over the 9 filtered joints is 48.5
+    against a target of 9 -- the joint KF is OVERCONFIDENT by ~5.4x. And the error is
+    structured, not a uniform scale: per-joint ``e^2/sigma^2`` runs 0.56 to 6.41.
+
+    That matters because `contact_meas_var` is an ISOTROPIC floor, and the port's
+    invariant I9 is "per-joint noise scaling, never uniform". A single scalar cannot
+    represent a 12x spread across joints, which is the likeliest reason that knob
+    behaves like a bias trim -- moving drift monotonically through zero -- rather
+    than like a noise parameter.
+
+    ``D = diag(sqrt(scale))`` scales VARIANCES by ``scale`` per joint while leaving
+    the correlation structure intact; the joint KF's Sigma_q is genuinely coupled
+    through the mass matrix and diagonalising it would discard exactly what
+    ``J Sigma_q J^T`` needs.
+
+    `scale` is a scalar or a length-9 sequence. Only the filtered block is touched --
+    the off-path (aux) joints have no measured ratio, so they are left alone rather
+    than scaled on a guess.
+    """
+    scale = np.asarray(scale, dtype=np.float64)
+    out = []
+    for prep in preps:
+        sq = np.array(prep.inputs.joint.sigma_q, dtype=np.float64, copy=True)
+        n = 9 if scale.ndim and scale.size == 9 else sq.shape[-1]
+        d = np.ones(sq.shape[-1], dtype=np.float64)
+        d[:n] = np.sqrt(np.broadcast_to(scale, (n,)))
+        D = np.diag(d)
+        sq = D @ sq @ D
+        joint = prep.inputs.joint._replace(sigma_q=sq)
+        out.append(dataclasses.replace(prep, inputs=prep.inputs._replace(joint=joint)))
+    return out
+
+
 def _assert_float64(prep: PreparedRollout) -> None:
     """I8 at the dataset boundary: a float32 leaf here silently downcasts the filter."""
     leaves = [prep.channels, prep.y_fk, prep.R_true, prep.v_true, prep.p_true]
@@ -277,7 +393,8 @@ def make_segment(prep: PreparedRollout, t0: int, cfg: ContactNetConfig,
     state0 = InEKFState(R=R0, v=prep.v_true[t0], p=p0, d=d0, P=np.asarray(P0))
 
     return Segment(inputs=inputs, windows=windows, state0=state0,
-                   v_true=prep.v_true[sl], R_true=prep.R_true[sl])
+                   v_true=prep.v_true[sl], R_true=prep.R_true[sl],
+                   p_true=prep.p_true[sl])
 
 
 def sample_starts(rng: np.random.Generator, preps: Sequence[PreparedRollout],

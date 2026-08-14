@@ -33,8 +33,9 @@
    `TEST_SUITE_MAP.md` (its "Porting guide" section is binding). Tests are not an
    afterthought per module — each build gate below IS a set of ported test classes.
 
-**Out of scope:** ContactNet internals (Lucas implements; build the socket, §7),
-GMO/wrench axis, yaw seeding (`enableYawSeeding=false` in the tested config).
+**Out of scope:** GMO/wrench axis, yaw seeding (`enableYawSeeding=false` in the
+tested config). *(ContactNet internals were out of scope through 2026-07; the
+module has since landed and has its own status and invariants in §7.)*
 
 ---
 
@@ -275,7 +276,7 @@ recompilation IS the port's "no per-tick allocation."
 
 ---
 
-## 7. ContactNet interface slot (build the socket, not the plug)
+## 7. ContactNet — socket AND plug (status: 2026-08-10)
 
 ```python
 class ContactUncertaintyProvider(Protocol):
@@ -287,10 +288,78 @@ class ContactUncertaintyProvider(Protocol):
 Default = current heuristics (constant diagonal Σ_C + per-tick swing-foot
 inflation restored in stance, `setContactSlipVariance` semantics; constant
 Σ_ε = 4e-4·I₃). `Features` is a typed container of sensor-history quantities only
-— no filter mean states. Note the Java contract: `update(..., learnedFlag=true)`
-currently raises `NotImplementedException` and the ported test asserts
-`NotImplementedError` — keep that behavior until Lucas lands the module. No
-`stop_gradient` between provider output and either filter.
+— no filter mean states. No `stop_gradient` between provider output and either
+filter. The Java `update(..., learnedFlag=true)` still raises
+`NotImplementedException` and the ported test still asserts `NotImplementedError`;
+that is the **Java** contract and is unrelated to the Python module below.
+
+**The module has landed.** `contactnet/` trains a network that emits Σ_C into the
+process socket; `online.make_provider` is the deployment seam and
+`run_estimator.build_contactnet_provider` the loader. ContactNet internals are
+therefore no longer out of scope.
+
+### 7a. Status — what is and is not established
+
+- **Not deployable, but no longer inverted.** Closed-loop vertical error over the 25 s
+  six-motion clip at `cmv=1e-3`: analytic **−0.117 m**, `bounded_exp` **−0.312 m**,
+  softplus **+2.49 m**. The softplus arm pushes the base *up* the moment walking
+  starts; `bounded_exp` (2026-08-10) sinks like the analytic filter at 2.7× its
+  magnitude — 8× better than softplus and sign-corrected, still ~1.2 cm/s and not
+  acceptable. Anything reporting the +2.49 m figure as the current state is stale.
+- **Mechanism, measured.** Learned Σ_C modulates stance→swing by **885×**; the
+  analytic heuristic by **1e10**. The learned factor is ~685× too *tight* in swing
+  and ~16 500× too *loose* in stance. Too-tight in swing makes the filter treat a
+  lifting foot as world-static and absorb the FK residual by moving the **base** —
+  upward, exactly when feet leave the ground.
+- **Range was the binding constraint; `bounded_exp` is the fix, and it is not enough.**
+  Unbounded `exp` opened the span (12.8 → 21.9 raw units, swing Σ_C 685× → 8× too
+  tight) and diverged (p99 raw +12.5 ⇒ Σ_C 2.7e5, contact update switches itself off).
+  `diag_param="bounded_exp"` — sigmoid in log space over [`diag_lo`, `diag_hi`],
+  default 1e-5 → 1e2, with `--peak-lr 3e-5` — trained clean (0 non-finite, `applied`
+  1.00, beats analytic on 4/4 terrains) and took closed-loop drift from +2.488 to
+  −0.312 m. **Amplitude was the dominant cause and it is now spent.** The residual is
+  the analytic filter's own sink, i.e. the null-space mode of §7c — not reachable by
+  any Σ_C.
+- **Consistency is Σ_C's, not the R floor's.** `S = H P Hᵀ + N^p` is dominated by
+  `H P Hᵀ`; `N^p = J Σ_q Jᵀ` is negligible, so neither a uniform nor a per-joint
+  `Σ_q` correction moves contact NIS. At floor 0 the learned net reaches NIS/dof
+  0.301 against the analytic 0.010 — a real 30× and within 3.3× of target.
+
+### 7b. Invariants — silent failure if violated
+
+- **N1 — Never evaluate a learned Σ_C by offline replay.** Replay over recorded
+  inputs and closed-loop simulation agree for the *analytic* arm and disagree by
+  **21×** on the learned one (replay: −0.085 m and "2.3× better than analytic";
+  closed loop: +2.49 m and 21× worse). `scripts/online_offline_oracle.py` confirms
+  the deployed path is faithful to 1e-15, so this is not a code bug — replay is
+  simply not a valid metric here. Closed loop costs ~3 min per configuration,
+  *less* than the ~8 min replay evaluation. There is no cost argument for replay.
+- **N2 — Never rank arms on held-out velocity RMSE.** Spearman(|drift_z|, RMSE) =
+  **+0.05** over nine checkpoints. It is uncorrelated with the goal.
+- **N3 — Never accept a mean drift number without a per-terrain sign check.**
+  Drift crosses zero in `contact_meas_var`, so a small mean is usually four
+  terrains cancelling, not a fix. Four of five floors swept were mixed-sign.
+- **N4 — `contact_meas_var` does not reach the training/eval path by itself.** It
+  is applied in `main_estimator._boundary`, which runs during **collection** only;
+  ContactNet replays recorded `InEKFInputs` and never calls it.
+  `dataset.apply_contact_meas_floor` re-applies it as a delta. Symptom of the
+  disconnect: a metric **bit-identical** across a config change.
+- **N5 — the diag(L) parameterisation must be read back from the checkpoint.**
+  `softplus`, `exp` and `bounded_exp` give the head's raw outputs different
+  meanings, and `bounded_exp` additionally carries `diag_lo`/`diag_hi` — different
+  bounds rescale a checkpoint exactly the way the wrong kind does. Loading under
+  the wrong one silently rescales Σ_C and nothing flags it. All three fields are
+  recorded in `summary.json`. **The read-back did not exist until 2026-08-10** —
+  every loader constructed a default `ContactNetConfig()`, so the `exp` checkpoint
+  could only ever have been read as softplus. It is now
+  `contactnet.checkpoint.config_for_checkpoint`, used by
+  `run_estimator.build_contactnet_provider`, `evaluate_run`, `drift_backfill`,
+  `online_offline_oracle` and `plot_contact_phase`. Pass `cfg.diag_spec` to the
+  network, never `cfg.diag_param`: a bare `"bounded_exp"` string is refused by
+  `network._as_spec` precisely because it would silently mean the default bounds.
+- **N6 — One JAX process per GPU.** JAX preallocates ~75% of the device, so a
+  second process does not run slower — it OOMs *and takes the first one down*.
+  Wrap GPU work in `scripts/gpu_lock.sh`.
 
 ---
 

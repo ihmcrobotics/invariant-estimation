@@ -80,11 +80,17 @@ TERRAIN_GROUP = dict(contype="2", conaffinity="1")
 # The collision set SCS2 actually emits, from `AlexSimulationCollisionModel` — NOT the URDF
 # `<collision>` tags, whose foot box is 29% narrower. MuJoCo sizes: box = half-extents,
 # capsule = (radius, half-length). Poses are in the ankle-roll frame = the `*_FOOT` body frame.
+_FOOT_BOX_SIZE = " ".join(repr(v) for v in me.ALEX_FOOT_BOX_HALF)
+_FOOT_BOX_POS = " ".join(repr(v) for v in me.ALEX_FOOT_BOX_CENTER)
+
 SCS2_COLLISION_GEOMS = (
     ("PELVIS_LINK",          "capsule", "0.135 0.025",      "-0.06 0 -0.02",
      "0.70710678118654746 -0.70710678118654768 0 0"),
-    ("LEFT_FOOT",            "box",     "0.13 0.07 0.0275", "0.045 0 -0.05", "1 0 0 0"),
-    ("RIGHT_FOOT",           "box",     "0.13 0.07 0.0275", "0.045 0 -0.05", "1 0 0 0"),
+    # Half-extents/center come from `main_estimator`, which is also where the N=8
+    # corner FK offsets are derived from -- one constant, so a geom change moves
+    # the estimator's corners with it instead of silently desyncing them.
+    ("LEFT_FOOT",            "box",     _FOOT_BOX_SIZE, _FOOT_BOX_POS, "1 0 0 0"),
+    ("RIGHT_FOOT",           "box",     _FOOT_BOX_SIZE, _FOOT_BOX_POS, "1 0 0 0"),
     ("TORSO_LINK",           "capsule", "0.1 0.05",         "-0.01 0 0.22",  "1 0 0 0"),
     ("LEFT_GRIPPER_Z_LINK",  "capsule", "0.06 0.03",        "0 0 0",         "1 0 0 0"),
     ("RIGHT_GRIPPER_Z_LINK", "capsule", "0.06 0.03",        "0 0 0",         "1 0 0 0"),
@@ -292,7 +298,7 @@ def _add_visual_meshes(root, urdf_path):
              contype="0", conaffinity="0", group="1", material="robot")
 
 
-def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
+def build_sim_model(policy, with_visuals=True, with_imu_sensors=False, terrain=None):
     """Free-base Alex: estimator MJCF + floor + SCS2's collision set + per-joint position servos.
 
     kd is applied as MuJoCo joint damping, which with a kp-only `position` actuator reproduces
@@ -312,8 +318,6 @@ def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
     # compile the same dynamics with neither.
     if with_visuals:
         _add_scene_look(root)
-    _geom(root.find("worldbody"), "floor", TERRAIN_GROUP, type="plane", size="20 20 0.1",
-          **({"material": "groundplane"} if with_visuals else {}))
     bodies = {b.get("name"): b for b in root.iter("body")}
     for body, typ, size, pos, quat in SCS2_COLLISION_GEOMS:
         _geom(bodies[body], f"{body}_collision_0", ROBOT_GROUP,
@@ -334,10 +338,26 @@ def build_sim_model(policy, with_visuals=True, with_imu_sensors=False):
 
     if with_visuals:
         _add_visual_meshes(root, urdf)
+    if terrain is None:
+        _geom(root.find("worldbody"), "floor", TERRAIN_GROUP, type="plane", size="20 20 0.1",
+              **({"material": "groundplane"} if with_visuals else {}))
+    else:
+        from invariant_estimation.sim import terrain as terr
+        hf = ET.SubElement(_asset(root), "hfield")
+        hf.set("name","terrain")
+        hf.set("nrow", str(terr.N))
+        hf.set("ncol",str(terr.N))
+        hf.set("size", f"{terr.EXTENT/2} {terr.EXTENT/2} {terr.EZ} 0.1")
+        _geom(root.find("worldbody"), "floor", TERRAIN_GROUP, type="hfield", hfield="terrain",
+              **({"material": "groundplane"} if with_visuals else {}))
     if with_imu_sensors:
         from invariant_estimation.sim.sensors import add_imu_sensors
         add_imu_sensors(root, me.ALEX_IMU_SITES)
-    return mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+    m = mujoco.MjModel.from_xml_string(ET.tostring(root, encoding="unicode"))
+    if terrain is not None:
+        from invariant_estimation.sim import terrain as terr
+        m.hfield_data[:] = (np.asarray(terrain, np.float32) /  terr.EZ).clip(0,1).ravel()
+    return m
 
 
 # ---------------------------------------------------------------------------
@@ -790,8 +810,16 @@ class VideoRecorder:
              "-pix_fmt", "yuv420p", path],
             stdin=subprocess.PIPE)
 
-    def capture(self, d):
+    def capture(self, d, overlay=None):
+        """Render one frame. `overlay(scn)` may append geoms to the offscreen scene.
+
+        The hook is what lets the estimator ghost -- previously viewer-only, because
+        headless "has nothing to draw into" -- be recorded: `mujoco.Renderer` owns a
+        real `mjvScene`, so `Ghost.draw` works against it unchanged.
+        """
         self.renderer.update_scene(d, camera=self.cam, scene_option=self.opt)
+        if overlay is not None:
+            overlay(self.renderer.scene)
         self.proc.stdin.write(self.renderer.render().tobytes())
         self.n += 1
 

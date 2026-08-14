@@ -28,6 +28,14 @@ Run artifacts: `results/2026-08-03_11-45-30_coco-faithful-f30/`, written `<run>/
 - **Training run: COMPLETE.** 300 steps, loss `0.0815 → 0.000958`, final
   `reseeds=91`, `floored=[]`, wall ~2883 s (`<run>/summary.json`,
   `<run>/training.png`).
+> **READ THIS FIRST (added 2026-08-10).** The headline below is an *offline replay*
+> number, and replay was subsequently measured to be an invalid metric for a learned
+> Sigma_C: replay and closed-loop agree for the analytic arm and disagree by **21x**
+> on the learned one. Velocity RMSE is also uncorrelated with vertical drift
+> (Spearman +0.05). This document remains an accurate record of the 2026-08-03 run as
+> it was assessed at the time; it is **not** evidence that ContactNet works. See
+> `results.md` §8 and `CLAUDE.md` §7 (N1, N2).
+
 - **Held-out validation (learned vs analytic baseline, 2 disjoint held-out flat
   rollouts): learned body-frame velocity RMSE 0.0283 m/s vs analytic 0.0857 m/s —
   a ~3× (≈67%) reduction.** Velocity NEES (target 3): learned ≈1.05 vs baseline

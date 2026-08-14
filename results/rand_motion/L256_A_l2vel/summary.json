@@ -1,0 +1,176 @@
+{
+  "run": {
+    "dir": "L256_A_l2vel",
+    "started_at": "2026-08-09T20:16:41",
+    "tag": null,
+    "args": {
+      "collect": false,
+      "train_seeds": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "val_seeds": [
+        4,
+        5,
+        6,
+        7
+      ],
+      "seconds": 45.0,
+      "steps": 6000,
+      "warmup_steps": 100,
+      "time_budget_s": 86400.0,
+      "tag": null,
+      "out_dir": "results/rand_motion/L256_A_l2vel",
+      "contacts_per_foot": 4,
+      "objective": "l2_velocity",
+      "w_pos": null,
+      "w_ori": null,
+      "pose_weight_ratio": null,
+      "L": 256,
+      "remat": false,
+      "contact_meas_var": 0.0001,
+      "pool": "n8rand"
+    }
+  },
+  "n_train": 12,
+  "n_val": 4,
+  "steps_run": 6000,
+  "final_reseeds": 3645,
+  "floored": [],
+  "cfg": {
+    "F": 30,
+    "d_in": 600,
+    "H": 20,
+    "window_span_s": 0.019,
+    "L": 256,
+    "B": 32,
+    "objective": "l2_velocity",
+    "remat": false,
+    "contact_meas_var": 0.0001,
+    "w_pos": 0.0,
+    "w_ori": 0.0,
+    "pose_weight_ratio": 0.5,
+    "episode_s": 43.0,
+    "warm_in_s": 1.0,
+    "peak_lr": 0.0001,
+    "init_seed": 0,
+    "batcher_seed": 0,
+    "cmd_ranges": {
+      "vx": [
+        0.3,
+        0.9
+      ],
+      "vy": [
+        0.25,
+        0.5
+      ],
+      "yaw": [
+        0.3,
+        1.5
+      ]
+    }
+  },
+  "wall_s": 10554.62032175064,
+  "val": [
+    {
+      "mode": "flat/seed12",
+      "rollout": "flat/seed12",
+      "baseline": {
+        "vel_rmse": 0.07243082843211981,
+        "vel_nees": 5.652244910222866,
+        "vel_nees_tangent": 8.20406592240468,
+        "vel_nees_x": 0.38809673201877953,
+        "vel_nees_y": 0.3365289144920869,
+        "vel_nees_z": 2.551950192715003,
+        "nis_over_dof": 0.02021842311678511,
+        "applied": 0.9999999999999999
+      },
+      "learned": {
+        "vel_rmse": 0.0654062493159913,
+        "vel_nees": 4.156454541068797,
+        "vel_nees_tangent": 6.309435613909047,
+        "vel_nees_x": 0.21949661290387373,
+        "vel_nees_y": 0.20957804611041056,
+        "vel_nees_z": 2.162702125492177,
+        "nis_over_dof": 0.13176128516677718,
+        "applied": 0.9999999999999999
+      }
+    },
+    {
+      "mode": "hard_stepping/seed15",
+      "rollout": "hard_stepping/seed15",
+      "baseline": {
+        "vel_rmse": 0.06994413366359363,
+        "vel_nees": 5.379392911581583,
+        "vel_nees_tangent": 7.1308612769403,
+        "vel_nees_x": 0.34496405419338383,
+        "vel_nees_y": 0.2633050049215261,
+        "vel_nees_z": 2.696530749014422,
+        "nis_over_dof": 0.015266004811900125,
+        "applied": 0.9999999999999999
+      },
+      "learned": {
+        "vel_rmse": 0.06927533279521486,
+        "vel_nees": 5.1166260431183455,
+        "vel_nees_tangent": 8.372660056341617,
+        "vel_nees_x": 0.28844398523376746,
+        "vel_nees_y": 0.3566238293044656,
+        "vel_nees_z": 2.8271893860475137,
+        "nis_over_dof": 0.12454181192529944,
+        "applied": 0.9999999999999999
+      }
+    },
+    {
+      "mode": "stepping_stones/seed14",
+      "rollout": "stepping_stones/seed14",
+      "baseline": {
+        "vel_rmse": 0.09596646433054376,
+        "vel_nees": 7.107344185861491,
+        "vel_nees_tangent": 10.992794233254639,
+        "vel_nees_x": 0.4572519599002471,
+        "vel_nees_y": 0.2934607141402896,
+        "vel_nees_z": 2.8489072182273847,
+        "nis_over_dof": 0.028718171843689296,
+        "applied": 0.9999999999999999
+      },
+      "learned": {
+        "vel_rmse": 0.08023843434218592,
+        "vel_nees": 5.455621174907519,
+        "vel_nees_tangent": 9.120166166176466,
+        "vel_nees_x": 0.3147861700268864,
+        "vel_nees_y": 0.29634737762226343,
+        "vel_nees_z": 2.2782913788430283,
+        "nis_over_dof": 0.15749266274285417,
+        "applied": 0.9999999999999999
+      }
+    },
+    {
+      "mode": "waves/seed13",
+      "rollout": "waves/seed13",
+      "baseline": {
+        "vel_rmse": 0.06822534885918868,
+        "vel_nees": 4.23886738820529,
+        "vel_nees_tangent": 6.618044388551617,
+        "vel_nees_x": 0.2842580079945029,
+        "vel_nees_y": 0.17750267505522674,
+        "vel_nees_z": 2.0936673291488286,
+        "nis_over_dof": 0.014087394444287615,
+        "applied": 0.9999999999999999
+      },
+      "learned": {
+        "vel_rmse": 0.07603349422352514,
+        "vel_nees": 4.150111250699844,
+        "vel_nees_tangent": 7.51600003565157,
+        "vel_nees_x": 0.36889648279573556,
+        "vel_nees_y": 0.3001774771851834,
+        "vel_nees_z": 1.5611461813444758,
+        "nis_over_dof": 0.13760679697626269,
+        "applied": 0.9999999999999999
+      }
+    }
+  ],
+  "loss_first": 0.2347830979106429,
+  "loss_last": 0.0020990645150151636
+}

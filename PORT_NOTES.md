@@ -1921,3 +1921,314 @@ a `stride` key, which is now written as `window_span_s` instead. If a longer,
 genuinely decimated window is ever wanted again, restore the boxcar with it — a
 strided gather without the prefilter aliases the torque channel, which is what the
 deleted Nyquist warning was guarding.
+
+---
+
+## ContactNet: three dead knobs, one invalid metric (2026-08-09/10)
+
+A 24-hour investigation into the InEKF's vertical drift. The training-side findings
+are recorded here because each one silently invalidated results that looked fine.
+Status and the resulting invariants live in `CLAUDE.md` §7.
+
+### 1. `remat` — a regression, not an original defect
+
+`make_segment_loss` accepted `remat=True`, documented it as wrapping the scan body
+in `jax.checkpoint`, and did not apply it. All four L2-options arms recorded
+`remat: true` in `summary.json` and trained without rematerialization.
+
+**It used to work.** `contactnet/take-two` applies it correctly
+(`rollout.py:91-92`). The two lines were deleted by `a492d69`, whose message reads
+"beta-nll loss function added" — an unrelated change. So the fix is a *restoration*,
+`take-two` never needed it, and every branch descending from that deletion
+(`beta-nll` → `env-dr` → `l2-options` → `full-filter/z-debug`, `fix/*`) still lacks
+it.
+
+A value test cannot catch this: remat is mathematically identity, so a dead flag and
+a live one agree on every number. `tests/contactnet/test_remat.py` therefore asserts
+the **jaxpr contains the primitive**, alongside gradient identity. The gradient
+tolerance is 1e-9, derived rather than tuned: the measured on/off residual is 5.2e-12
+and the noise floor is exactly zero (repeat runs and `everything_saveable` — the same
+wrapper with nothing recomputed — are bit-identical), which localises the residual to
+XLA fusing the recomputed body differently. The filter's own conditioning bounds
+float64 error at eps·cond(S) ≈ 2e-7, five orders above what is observed.
+
+### 2. `contact_meas_var` never reached the replay path
+
+The floor is applied at the joint-KF → InEKF boundary: `_boundary` sets
+`sigma_q_eff = sigma_q + contact_meas_var·I` and writes it into
+`InEKFInputs.joint.sigma_q` (`main_estimator.py:697,713`). That boundary runs inside
+`make_fused_step` — the **collection** path. ContactNet trains and validates by
+replaying recorded `InEKFInputs` through `make_step`, which consumes
+`inputs.joint.sigma_q` directly (`filter.py:264`) and never calls `_boundary`.
+
+**Symptom worth memorising:** the held-out analytic baseline came back
+*bit-identical* across a 0 → 1e-4 change. A filter parameter that moves nothing is
+not conservative, it is disconnected.
+
+`dataset.apply_contact_meas_floor` re-applies it to the replayed inputs as a delta
+from the pool's recorded value. This is exact, not approximate: `sigma_q_eff` is a
+pure transformation of the joint KF's *output* and never feeds back into it, and the
+collection policy is driven by ground truth (`rp.build_obs` on MuJoCo state), so the
+recorded trajectory does not depend on filter configuration.
+
+### 3. The `contact_trust` YAML block is dead
+
+Nothing in `src/` reads `cfg["contact_trust"]`; `sim/sensors.ContactTrust` hardcodes
+`dwell=0.04`. Editing the YAML does nothing. Already fixed on the unmerged
+`fix/wire-contact-trust-config` (`d3182cb`) — merge it rather than re-deriving.
+
+### 4. Offline replay is not a valid metric for a learned Σ_C
+
+The largest finding, and it invalidates work that predates it. Replay over recorded
+rollouts and closed-loop simulation **agree for the analytic arm and disagree by 21×
+for the learned one**: the same weights measure −0.085 m (and "2.3× better than
+analytic") in replay, and +2.49 m (21× *worse* than analytic) in closed loop.
+
+`scripts/online_offline_oracle.py` rules out a code-path bug — online and offline
+features and Σ_C agree to ~1e-15, and the median tr Σ_C matches. The deployed path is
+faithful; the metric is wrong.
+
+Cost note, since replay was chosen partly for speed: a closed-loop configuration
+takes **~3 min**, *less* than the ~8 min replay evaluation. There was never a cost
+argument for replay.
+
+Consequently the floor sweep, the sign-consistency analysis and the arm ranking
+derived from replay are **unestablished** and need redoing closed-loop. The
+analytic-baseline rows are unaffected.
+
+### 5. Σ_C dynamic range, and the softplus parameterisation
+
+Measured stance→swing modulation: analytic heuristic **1e10** (the shipped
+stance 1e-4 / swing 1e1 Cholesky switch), learned **885×** — 685× too tight in swing,
+16 500× too loose in stance.
+
+`network.py` parameterised diag(L) with softplus. For a scale parameter spanning ten
+decades that is wrong **at the top**, not the bottom — a correction worth stating,
+because the opposite was assumed first:
+
+    raw r        softplus dlogL/dr    exp dlogL/dr
+    -9.21 (init)      1.000               1.000
+    -0.76             0.831               1.000
+    +2.30             0.379               1.000
+    +10.0 (swing)     0.100               1.000
+
+For `r << 0`, `softplus(r) ≈ exp(r)`, so relative sensitivity at init is 1.0 and
+there is no vanishing-gradient trap at the tight end. softplus goes linear above
+zero, where sensitivity decays as 1/r — exactly where swing lives. The softplus run
+achieved 3.6 of the 19.2 raw units its span requires (19%).
+
+`diag_param` is now an option (`softplus` | `exp`), defaulting to `softplus` and
+recorded in `summary.json`. It must be read back: the two give the head's raw outputs
+different meanings, so loading under the wrong one silently rescales Σ_C. `sigma_0`
+stays 1e-4 — the tight end was never the problem, and it preserves the "iteration 0
+emits the shipped filter's stance value" property `tests/sim/test_n8_network.py`
+asserts.
+
+**Result (2026-08-10, `results/zdrift_exp/L256_A_cmv1e-3_exp`, 6000 steps): the
+mechanism works, the optimisation does not.**
+
+    parameterisation   raw span      tr(Sigma_C) stance   swing      ratio
+    softplus           12.82 / 19.2  4.9e-4               0.44       8.9e2
+    exp                21.90 / 11.5  3.5e-4               37.5       1.07e5
+    analytic target    --            3.0e-8               3.0e+2     1.0e10
+
+The span more than doubled and overshot what `exp` requires; swing Sigma_C went from
+685x too tight to **8x** too tight — an 86x improvement on the exact quantity that
+makes the filter lift the base. Range was genuinely the binding constraint.
+
+But the run is unusable: held-out velocity RMSE 1.374 against the analytic baseline's
+0.0607, loss rising 0.376 -> 0.933 (peak 3.87), a gradient-norm spike to 13.9 near
+step 200, and 30 non-finite steps skipped by the train-step guard.
+
+Two coupled causes, both worth fixing before retrying:
+
+* **`exp` is unbounded and used it.** p99 raw output is +12.5, i.e. per-axis
+  Sigma_C ~ 2.7e5 — at those ticks the contact update is effectively switched off.
+  Clamping the map into the physically meaningful range (~[1e-4, 1e2]) would prevent
+  the escape without giving back the span.
+* **`exp` raises the effective learning rate.** Under softplus `dlogL/dr` is < 1 and
+  falling toward the swing end; under `exp` it is exactly 1 everywhere. `peak_lr =
+  1e-4` was tuned against the softplus geometry and is materially more aggressive in
+  Sigma_C-space.
+
+So: right diagnosis, right fix, wrong hyperparameters. `diag_param` stays defaulted
+to `softplus` until a bounded/retuned `exp` run beats it.
+
+### 6. Measurements worth not re-deriving
+
+* **Velocity RMSE does not predict drift.** Spearman(|drift_z|, RMSE) = +0.05 over
+  nine checkpoints.
+* **Drift crosses zero in `contact_meas_var`.** A small *mean* is usually four
+  terrains cancelling; four of five floors swept were mixed-sign. Check the sign
+  per terrain, always.
+* **The floor is not a noise model.** At 1e-3 rad² it is ~30 000× the measured Σ_q
+  diagonal (0.182 mrad ⇒ 3.3e-8 rad²) — claiming 1.8° of joint uncertainty where
+  0.01° exists. It reduces drift by de-weighting the contact FK measurement toward
+  irrelevance.
+* **The joint KF is overconfident.** Joint-level NEES 48.5 against a target of 9
+  (~5.4×, structured 0.56–6.41 per joint). A real defect — but *not* the cause of
+  contact over-coverage, since `N^p` is negligible against `H P Hᵀ`; correcting it
+  uniformly or per-joint moves contact NIS by <10%.
+* **Randomized-motion training data.** Spectrally successful (gait line 62% → 34% of
+  in-band power, sub-gait 9% → 19%) and 2.4× *worse* on drift when scored on
+  walking. Mechanism working ≠ outcome improving.
+* **Gait geometry of this pool:** stride ≈ 1.0 s (sway 1.0 Hz, vertical 2.1 Hz,
+  ratio 2.0). `cmd_resample_s = 3.0` is *slower* than the stride, which is what lets
+  the limit cycle form.
+
+### 7. Deliberate deviations
+
+* `results/` stays untracked except small JSON evidence files; checkpoints,
+  histories and plots are regenerable.
+* `scripts/overnight_loss_ladder.sh` should be **deleted**, not retired: its
+  deadline-split gave the four L2-options arms 7639–9839 steps and made D-vs-B
+  unattributable. Keeping it invites repeating that.
+* `scripts/{zdrift_stage2,3,4, queue_l1024, queue_rand_arms_cd, recover_tonight,
+  overnight_decision, zdrift_tonight}.sh` are one-off orchestration for this
+  investigation, not tooling. Reusable: `gpu_lock.sh`, `online_offline_oracle.py`,
+  `remat_probe.py`, `plot_pool_psd.py`, `rand_motion_check.sh`, and
+  `drift_backfill.py` — the last **only** as a replay tool, never for selection
+  (see §4).
+
+## ContactNet: bounded `exp`, and the N5 read-back that was never implemented (2026-08-10)
+
+### 1. The read-back was a documented invariant with no code behind it
+
+N5 has said since it was written that the diag(L) parameterisation "must be read back
+when loading a checkpoint". Nothing did. `run_estimator.build_contactnet_provider`,
+`scripts/evaluate_run.py`, `scripts/drift_backfill.py` and
+`scripts/online_offline_oracle.py` each constructed a bare `ContactNetConfig()`, whose
+`diag_param` is `softplus`. `scripts/plot_contact_phase.py` was the sole exception, and
+only because it made the caller pass `--diag-param` by hand.
+
+The consequence is exact: **the `exp` checkpoint could only ever have been evaluated as
+softplus** through any of those paths. It is invisible by construction — the checkpoint
+is bare `np.savez` leaves with no metadata, the same weights are a valid head under
+every parameterisation, and the resulting Σ_C is wrong by orders of magnitude with no
+shape error, no NaN and no diagnostic.
+
+Fixed by `contactnet/checkpoint.py`:
+
+```python
+config_for_checkpoint(ckpt, base=None, **overrides) -> ContactNetConfig
+```
+
+which restores `RESTORED_FIELDS = ("diag_param", "diag_lo", "diag_hi")` from the
+`summary.json` beside the checkpoint, tolerating a missing file or key the way
+`_check_contact_geometry` does (those are pre-option runs, and the default *is* their
+behaviour). Deliberately narrow: shape-bearing fields need no rescue because a mismatch
+fails loudly in `load_params`.
+
+Verified on the real artifacts — `results/zdrift_exp/L256_A_cmv1e-3_exp` now resolves
+to `exp` where it previously resolved to softplus, and
+`results/zdrift/L256_A_l2vel_cmv1e-3` (no `diag_param` key at all) still resolves to
+softplus.
+
+**Size of the error on the real `_exp` checkpoint**, over 4000 ticks × 8 contacts of
+`flat_n8fix_seed000`:
+
+    read as            median tr(Sigma_C)    p99 tr(Sigma_C)
+    exp (recorded)         3.5073e-04           3.52e+06
+    softplus (the bug)     3.5073e-04           6.24e+01
+                           identical            5.6e4x apart
+
+That is the whole character of the defect in one table. The median is **bit-identical**
+— down at the tight end softplus *is* exp — so every typical-value diagnostic agrees
+while the swing tail, the only regime that matters for the sink, is wrong by four and
+a half orders of magnitude.
+
+**One failure mode was made structural rather than documented.** `network._as_spec`
+refuses a bare `"bounded_exp"` string: bounds are part of that parameterisation, so a
+caller forwarding `cfg.diag_param` instead of `cfg.diag_spec` would silently get the
+module defaults while the config said otherwise. Every other mis-load is silent; this
+one raises at build time.
+
+### 2. `bounded_exp`
+
+A sigmoid in log space, added as a THIRD `diag_param` (never a repurposing of `exp` —
+a checkpoint exists under that name):
+
+    L_ii = exp( ln(lo) + (ln(hi) - ln(lo)) * sigmoid(r) ),   default lo=1e-5, hi=1e2
+
+Not a hard clip: a clip has zero gradient at the bound, this only shrinks it. Bounds
+live on the config (`diag_lo` / `diag_hi`, LINEAR per-axis STDs) and are recorded and
+read back with the kind.
+
+Measured (`tests/contactnet/test_diag_param.py`):
+
+    raw r        exp diag(L)     bounded_exp diag(L)    bounded_exp dlogL/dr
+    -1e3         0.0             1.00e-5 (floor)        ~0
+     0.0         1.0             3.16e-2                4.03
+    +12.5        2.68e+05        99.99  (ceiling)       ~0
+    +1e3         inf             1.00e+2 (ceiling)      ~0
+
++12.5 is the diverged `exp` run's p99 raw output, i.e. exactly the escape that switched
+the contact update off. Across the span that matters — analytic stance 1e-4 to analytic
+swing 1e1 — `dlogL/dr` stays ≥ 1.97 against softplus's 0.10 at the swing end, and the
+whole span is **3.6 raw units** wide against softplus's 19.2 (the softplus run covered
+3.6 of those 19.2, i.e. 19%; under `bounded_exp` 3.6 units IS the whole span).
+
+Init is unchanged in every parameterisation: `_diag_inv` puts the head bias at
+`logit((ln(σ₀-ε) - ln lo)/(ln hi - ln lo))` = −1.797, and `diag(L)` at init is 1e-4 to
+1e-12 relative. That preserves the "iteration 0 emits the shipped filter's stance
+value" property `tests/sim/test_n8_network.py` asserts.
+
+`--peak-lr` was added to `run_contactnet.py` at the same time. It was a config field
+with no CLI override, which made the paired LR change impossible to run. The
+parameterisations do not share a scale — `dlogL/dr` is 0.1–0.8 under softplus, 1 under
+`exp`, ~4 mid-range under `bounded_exp` — so a fixed `peak_lr` means a different
+effective step in Σ_C-space under each.
+
+### 3. The closed-loop harness is bit-reproducible, and the reference used CLEAN IMU
+
+`results/zdrift/closed_loop/best_A_cmv1e-3.json` (the +2.4884 m reference) does not
+record whether `--imu-noise` was set, so it was determined by re-running both ways:
+
+    clean sensors   +2.4884 m   <- identical to the reference in ALL SEVEN motions
+    --imu-noise     +1.9750 m
+
+Three things follow. The reference was clean-sensor. The harness is **deterministic**
+— same flags reproduce every digit, so a difference between two runs is a real
+difference and not run-to-run spread. And `--imu-noise` is a **21% level shift** on the
+same configuration, so the two settings must never be mixed inside one comparison
+(`scripts/cl_floor_sweep.sh` therefore defaults to clean, matching the reference).
+
+That re-run also serves as the regression check on §1: the softplus path through the
+rewritten loader reproduces its own prior number exactly.
+
+### 4. The eager-test trap: `float(jnp.log(...))` under `jit`
+
+`bounded_exp` passed 24 unit tests and then died at step 0 of its first training run:
+
+    jax.errors.ConcretizationTypeError: Abstract tracer value encountered where
+    concrete value is expected  ... in DiagSpec.log_bounds
+
+`log_bounds` computed `float(jnp.log(self.lo))`. Eagerly that is a concrete array and
+`float()` is fine. Inside `jit` — which is where **every** real call site lives
+(`train_step`, `make_provider`'s scan) — a `jnp` op on a Python constant is staged into
+the jaxpr as a tracer, and `float()` of a tracer raises. `math.log` on the Python float
+is the fix, and it also keeps the bounds compile-time constants, which is what I7
+wants.
+
+The generalisable lesson is about the test suite, not the bug: **the unit tests were
+all eager.** `tests/contactnet/test_diag_param.py::test_forward_traces_under_jit` now
+runs `forward` and its gradient under `jax.jit` for all three parameterisations, and
+reverting the fix turns it red. Anything added to the forward path needs a traced test,
+not only an eager one.
+
+### 5. The floor sweep, redone closed-loop
+
+Twelve runs, `scripts/cl_floor_sweep.sh` + `cl_floor_summary.py`; full table in
+results.md §9. Two conclusions that change how the floor should be treated:
+
+* **The analytic response is monotone over four decades** (−0.198 m at floor 0 to
+  −0.085 m at 3e-3), so the sweep identifies no operating point — minimising |e_z|
+  just returns the top of whatever range is swept. Horizontal error rises ~10× over
+  the same range. This is the de-weighting mechanism, visible directly.
+* **The floor is not the lever for the learned arm.** It moves learned drift over
+  2.06–2.97 m and never within an order of magnitude of the analytic ~0.1 m. §4's
+  replay-derived "the one config lever ContactNet responds to (+31.1%)" survives in
+  magnitude but not in importance.
+
+`scripts/zdrift_tonight.sh` and `zdrift_summary.py` are superseded by the closed-loop
+pair for this purpose.

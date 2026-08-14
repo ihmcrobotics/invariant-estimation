@@ -163,11 +163,15 @@ def make_provider(subchain, base_imu: int, kinematics, cfg: ContactNetConfig,
     """
     feats = make_online_features(subchain, base_imu, kinematics, cfg, constants)
     n_c = jnp.asarray(subchain).shape[0]
+    # `cfg.diag_spec`, not `cfg.diag_param`: the bounds are as load-bearing as the kind
+    # (N5). The caller is responsible for `cfg` matching the checkpoint --
+    # `checkpoint.config_for_checkpoint` is how.
+    spec = cfg.diag_spec
 
     def step(state: OnlineState, sensors):
         state, win, ready = feats(state, sensors)
-        L = jax.vmap(forward, in_axes=(None, 0, None))(
-            params, win.reshape(n_c, -1), cfg.eps)          # (N_c, 3, 3)
+        L = jax.vmap(lambda p, x: forward(p, x, cfg.eps, spec), in_axes=(None, 0))(
+            params, win.reshape(n_c, -1))                            # (N_c, 3, 3)
         return state, jnp.where(ready, L, sensors.contact_chol)
 
     return step

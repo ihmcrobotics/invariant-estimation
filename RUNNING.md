@@ -172,9 +172,219 @@ naming entirely with `--out-dir path/to/dir`. The validated run written up in
 predates this layout and was moved into it by hand, so its `summary.json` has no
 `run` block.
 
+### Loss-function options (velocity + position + orientation)
+
+`--objective` selects the training loss. Beyond `l2_velocity` (body-frame velocity
+MSE, the trusted baseline) and `beta_nll`, three composites add **segment-relative**
+pose terms on top of the velocity loss:
+
+| objective | loss |
+|---|---|
+| `l2_velocity` | `L_vel` (unchanged) |
+| `l2_vel_pos` | `L_vel + w_pos·L_pos` |
+| `l2_vel_ori` | `L_vel + w_ori·L_ori` |
+| `l2_vel_pos_ori` | `L_vel + w_pos·L_pos + w_ori·L_ori` |
+
+`L_pos` is the world-frame **displacement** MSE over the segment and `L_ori` is
+`‖Log(ΔR_estᵀ ΔR_true)^∨‖²`, the SO(3) log-map error of the **incremental** rotation.
+Both are segment-relative on purpose: base position and yaw are unobservable, so
+their *absolute* error drifts unbounded in chained BPTT and would swamp `L_vel`
+(see `contactnet/losses.py`). The weights default to **auto-measure**: on the first
+warm batch each active term is sized to `--pose-weight-ratio` (default 0.5) × `L_vel`
+and then frozen for the run (logged to `summary.json`'s `cfg`). Override with
+`--w-pos` / `--w-ori`. Validation metrics are objective-independent, so all arms stay
+directly comparable.
+
+**Overnight 4-arm ladder.** `scripts/overnight_loss_ladder.sh [STOP_BY_HHMM]` (default
+`08:45`) collects a fresh, fixed-terrain (`waves` seed bug fixed) N=8 DR pool under
+tag `n8fix`, pre-builds channel caches once, then trains all four arms back-to-back.
+It is **deadline-aware** — each arm gets an equal slice of the time left before
+`STOP_BY`, so the ladder always finishes on time whatever collection costs:
+
+```bash
+nohup scripts/overnight_loss_ladder.sh 08:45 > results/ladder.out 2>&1 &
+# env knobs: POOL_TAG CONTACTS SECONDS_PER COLLECT_SEEDS STEPS_CAP WARMUP VAL_RESERVE
+```
+
 Last validated run (flat ground, seeds 0–3 train / 4–5 held out): velocity RMSE
 **0.086 → 0.028 m/s**, NEES **19.4 → 1.05** vs the analytic `contact_chol`
 baseline. Full numbers and caveats (flat-terrain only, etc.) in `RESULTS.md`.
+
+> **The deadline split is a confound.** Each arm gets an equal slice of the
+> *remaining* time, and caches warm as the night goes on, so the arms do not get
+> equal **steps** (the 2026-08-06 run: A 7639 → D 9839, +29%). Do not compare arms
+> from this script without checking `steps_run` in each `summary.json`. Use
+> `scripts/l_ablation_ladder.sh` below when you need a matched-step comparison.
+
+### BPTT length `L`, rematerialization, and the contact R floor
+
+Three knobs on `run_contactnet.py` that the loss ladder does not touch:
+
+| flag | default | what it does |
+|---|---|---|
+| `--L` | 128 | BPTT segment length in **ticks** — how far the gradient traverses the InEKF scan. Independent of `H` (history per network evaluation). |
+| `--remat` / `--no-remat` | `True` | Wrap the scan body in `jax.checkpoint(prevent_cse=False)`. |
+| `--contact-meas-var` | `1e-4` | InEKF contact-measurement noise floor (`main_estimator` "landmine #2"). |
+
+**`L` is a memory axis, not just a horizon.** Reverse-mode AD stores the scan's
+per-tick residuals, so activation memory is `O(L × residuals-per-tick)`; at N=8 the
+body's interior (`Φ`, `Ad_X̂`, `Q_d`, `H`, `S`, `K`, the Joseph products — all
+33-square) dwarfs the ~9 kB carry crossing each tick. `remat` saves only the carry
+and recomputes the interior on the backward pass: `O(L × carry)` memory for one
+extra forward evaluation of the body. It is **identity, not an approximation** —
+`tests/contactnet/test_remat.py` pins the gradients to 1e-9 relative and pins the
+noise floor at bit-equality, so a truncated backward pass cannot hide in it.
+
+> **`remat` was a dead flag until 2026-08-08.** `make_segment_loss` accepted it,
+> documented it, and never applied it, so all four 2026-08-06 arms trained with no
+> rematerialization while their `summary.json` said `remat: true`. `summary.json`
+> now records `remat` and `contact_meas_var` explicitly, and `test_remat.py`
+> asserts the primitive is actually in the jaxpr. Measure before choosing:
+>
+> ```bash
+> uv run --extra gpu python scripts/remat_probe.py     # temp/peak MB + s/step per L
+> ```
+
+Measured on the RTX 4070 (12 GB), N=8, B=32, `n8fix`, 2026-08-08 — `temp` is compiled
+scratch for the train step, `peak` is the runtime device high-water mark:
+
+| L | peak MB (off) | peak MB (on) | s/step (off) | s/step (on) |
+|---|---|---|---|---|
+| 128 | 1310 | 672 | 0.457 | 0.523 |
+| 256 | 2371 | 1081 | 0.958 | 1.123 |
+| 512 | 5201 | 2619 | 2.047 | 2.351 |
+
+remat buys a consistent **~2× memory for ~1.16× time**. The operational conclusion:
+**L=512 fits on this card without remat** (5.2 GB against ~11.4 GB free), so remat is
+headroom rather than a requirement up to L=512 — it is what makes L=1024 (≈10 GB raw)
+practical. Note `peak_bytes_in_use` never resets within a process, which is why the
+probe runs each cell in its own subprocess; measuring both cells in one process
+reports the first one twice.
+
+**The R floor.** `--contact-meas-var` defaults to `0.0` inside `build_collector`
+(the port's original behaviour); `run_contactnet.py` now passes `1e-4`, the tuned
+value from the 2026-08-07 z-drift study — the one config lever ContactNet
+measurably responds to (+31.1%). **Do not raise it to `1e-2`:** that is a
+flat-ground cancellation which drifts *upward* on both terrains. The contact-trust
+`dwell` knob from the same study is deliberately **not** set here: ContactNet is
+measured immune to it (0.9%, it overwrites `contact_chol`), and the
+`contact_trust` block in `config/filter_cfg.yaml` is not wired on this branch —
+nothing in `src/` reads it and `sim/sensors.ContactTrust` hardcodes `dwell=0.04`.
+
+**Matched-step L ablation.** `scripts/l_ablation_ladder.sh` runs 4 objectives ×
+`L ∈ {128, 256, 512}` with **identical `--steps` in every cell**, into one nested
+`results/l_ablation/` so twelve run directories do not land loose in `results/`:
+
+```bash
+REMAT=on nohup scripts/l_ablation_ladder.sh > results/l_ablation/ladder.out 2>&1 &
+# env knobs: REMAT(required) LVALS STEPS WARMUP POOL_TAG CONTACTS CONTACT_MEAS_VAR
+#            TIME_BUDGET OUT_ROOT
+```
+
+It refuses to start without `REMAT`, skips cells that already have a
+`summary.json` (so a re-run resumes), and **fails loudly on any cell whose
+`steps_run` ≠ `STEPS`** rather than quietly tabulating a short arm. Two caveats
+that belong on any table it produces: pose weights are auto-sized per cell so
+`w_pos`/`w_ori` differ across `L` (each term is held at `0.5 × L_vel` at init,
+which is what keeps "the same objective" meaningful), and at matched steps `L=512`
+sees 4× the trajectory of `L=128`, so *data seen* is not matched — inherent to a
+matched-step L ablation.
+
+### Measuring drift, not RMSE — `scripts/drift_backfill.py`
+
+**Do not rank ContactNet arms on held-out velocity RMSE.** Measured over nine
+checkpoints, Spearman(|drift_z|, vel RMSE) = **+0.05** — the metric every arm has
+been selected on is uncorrelated with the drift we care about.
+
+```bash
+uv run --extra gpu python scripts/drift_backfill.py --root results/l_ablation
+uv run --extra gpu python scripts/drift_backfill.py --root results/rand_motion \
+    --pool n8fix --only L256_A_l2vel     # cross-pool: train anywhere, score on walking
+```
+
+Replays each checkpoint over an identical held-out region (truth-seeded, so vertical
+error starts at exactly zero) and reports `drift_z` (least-squares slope, m/s),
+`final_ez`, `horiz_pct` (against **true** path length), and contact `NIS/dof`. It
+prints both rankings and their Spearman correlation.
+
+Three things it does deliberately, each of which would silently invalidate the
+comparison otherwise:
+
+* **One region for every cell.** `prepare` sets `t_hi = T − L`, so scoring each cell
+  at its own `L` would give different-`L` cells different spans. `EVAL_L` pins one.
+* **Each cell's own frozen `norm_constants.npz`**, never refit from the evaluation
+  pool. Refitting is invisible for a same-pool cell and silently distribution-shifting
+  for a cross-pool one — i.e. wrong for exactly the comparison worth making.
+* **`--pool` selects evaluation rollouts, `--root` selects checkpoints.** Training on
+  one distribution and scoring on another is a supported, deliberate combination.
+
+`drift_z` and `final_ez` **rank cells differently** — slope answers "where in ten
+minutes", accumulated error answers "where now". Pick the one your deployment cares
+about; they disagree.
+
+This ranks; it does not explain. `experiments/z_budget.py` (branch
+`full-filter/z-debug`) remains the tool that attributes the sink to a specific filter
+write and sweeps terrain to catch cancellations.
+
+### The contact R floor — `scripts/cl_floor_sweep.sh`, `cl_floor_summary.py`
+
+**Closed-loop only.** The replay version of this sweep (`zdrift_tonight.sh` +
+`zdrift_summary.py`) was retracted by invariant N1: replay and closed loop agree on the
+analytic arm and disagree by 21× on a learned one, so every floor it chose is unusable.
+Closed loop costs ~3 min per configuration, *less* than the replay it replaces.
+
+```bash
+FLOORS="0 3e-5 1e-4 3e-4 1e-3 3e-3" bash scripts/cl_floor_sweep.sh
+uv run python scripts/cl_floor_summary.py --dir results/zdrift_bexp/closed_loop
+```
+
+Resumable — a floor whose metrics JSON already exists is skipped. `ARMS`, `CKPT`,
+`CPF`, `OUT`, `NOISE` are the other env knobs.
+
+Two things to know before reading the output (both measured 2026-08-10, results.md §9):
+
+* **Clean sensors by default, and never mixed with `--imu-noise`.** The harness is
+  bit-reproducible — the same flags reproduce every digit — but the noise flag is a
+  21% level shift on the same configuration.
+* **The analytic response is monotone across four decades**, so |e_z| alone selects
+  the edge of whatever range you sweep, and the vertical gain is paid in horizontal
+  error (~10× over the same range). The floor de-weights the contact FK measurement;
+  it does not model anything. Read the horizontal column and the per-motion signs
+  (`cl_floor_summary.py` prints both), not the total alone.
+
+### Serialize GPU work — `scripts/gpu_lock.sh`
+
+JAX preallocates ~75% of the device per process, so a second JAX job on this 12 GB
+card does not run slower — it OOMs, **and takes the first one down with it**. On
+2026-08-09 a drift evaluation launched alongside a training cell killed the cell 2.5
+minutes in and then died itself, costing the night's queue. Wrap anything that touches
+the GPU:
+
+```bash
+bash scripts/gpu_lock.sh uv run --extra gpu python scripts/run_contactnet.py …
+```
+
+`flock` blocks rather than failing, so a queued job waits its turn. The victim is
+whichever process next instantiates a CUDA graph, not the one that over-committed,
+which is why care alone is not a control.
+
+### Breaking the stride clock — motion randomization
+
+`collect_dr_pool.py` takes `--cmd-resample-s`, `--cmd-vx/vy/yaw`, `--disturb-rate-hz`.
+The default `cmd_resample_s=3.0` is *slower* than the measured ~1.0 s stride, so the
+gait settles into a limit cycle and gait phase becomes nearly deterministic from the
+sensor window — which lets the network regress Σ_C off phase (phase R² = 0.942)
+instead of contact condition.
+
+```bash
+bash scripts/rand_motion_check.sh 0.4 0.8        # survivability FIRST — falls yield no data
+uv run python scripts/plot_pool_psd.py           # did periodicity actually break?
+```
+
+It works spectrally (gait line 62% → 34% of in-band power, sub-gait 9% → 19%) but
+**measured worse for deployment**: scored on walking, the randomized-trained net was
+2.4× worse on drift slope. Breaking the shortcut removed something useful for the
+distribution we deploy into.
 
 **Gate before pushing:** `bash scripts/verify.sh` — the Layer-1 deterministic
 checks (F=30, `d_in=600`, `stride=1`, channel order q,q̇,τ; process-socket-only;
@@ -446,8 +656,16 @@ uv run python run_estimator.py ... --out run.npz                                
 uv run python run_estimator.py --policy baseline --ticks 1500 --vx 0.6 \
        --video walk.mp4                                                             # 30 s video
 uv run --extra gpu python run_estimator.py --policy baseline --headless --ticks 500 \
-       --vx 0.45 --contactnet results/latest/params.npz                            # ContactNet in the loop
+       --vx 0.45 --contacts-per-foot 4 \
+       --contactnet results/latest/params.npz                                       # ContactNet in the loop
 ```
+
+`--contacts-per-foot` must match what the checkpoint trained under — the current
+ladder arms (A/B/C/D) are all N=8, so they need `4`. It is not optional and not
+inferable: the network's per-contact input is foot-major duplicated, so it accepts
+either N without a shape error and simply applies corner-calibrated Σ_C to
+whole-sole anchors. `run_estimator.py` reads the training geometry from the
+checkpoint's `summary.json` and refuses the mismatch rather than let it run.
 
 Every run prints an error table against the sim's own state (tilt as the policy sees it,
 attitude, gyro, velocity, position drift, joint state) over the whole run and over its last half.
@@ -459,6 +677,7 @@ attitude, gyro, velocity, position drift, joint state) over the whole run and ov
 | `--contact-fk measured\|pinned` | whether the InEKF contact FK uses the measured ankle angles (default) or pins them at `qpos0`, as the library default still does — worth ~2x on attitude error, see below |
 | `--stance-chol` / `--swing-chol` | the Σ_C factor for a trusted / airborne foot. The InEKF has **no contact mask**; contact condition rides entirely in Σ_C, so a swing foot needs a large factor or the filter keeps believing it is planted |
 | `--contactnet PARAMS.npz` (+ `--contactnet-norm`) | run a trained ContactNet in the loop: its learned per-tick `contact_chol` (via `contactnet.online.make_provider`) replaces the analytic stance/swing heuristic. Reads `norm_constants.npz` beside `PARAMS.npz` unless overridden; config is the `ContactNetConfig()` defaults the checkpoint trained under. Run the same command without the flag for the closed-loop A/B |
+| `--contacts-per-foot 1\|4` | contact slots per foot: `1` = the shipped N=2 sole pair (default), `4` = the N=8 box corners. Must match a `--contactnet` checkpoint's training geometry, which is enforced against its `summary.json` |
 | `--contact-meas-var` | flight's `1e-4` contact measurement-noise floor (port default 0) |
 | `--video walk.mp4` | record the run offscreen to H.264 (implies `--headless`, `--video-fps` / `--video-size` tune it) |
 | `--ghost [mode]` | draw a translucent robot at the estimated state: `full` (default) or `attitude`. Viewer only |
