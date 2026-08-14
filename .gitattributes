@@ -26,3 +26,4 @@
 # link and skips them when tallying review coverage. Nothing about storage, checkout, or local
 # `git diff` changes -- this is purely how GitHub renders the review.
 results/** linguist-generated=true
+*.npz
