@@ -172,6 +172,35 @@ L2 need not uniquely identify physical Q/R. A separate Gaussian likelihood test
 recovers empirical variance where that parameter IS identifiable; this is not
 a claim that arbitrary filter Q/R can be recovered from pelvis error alone.
 
+## contact_chol / accel_body design decisions (item 2/3, 2026-09-14)
+
+Before today neither piece had a design, not just an implementation. Added
+`invariant_estimation/learning/realdata.py` (8 tests, `tests/learning/test_realdata.py`):
+
+- `contact_chol_heuristic(contact_probability, firm_variance, swing_variance)`:
+  the "constant diagonal factor, inflated for swing feet" fallback that
+  `inEKF/filter.py`'s own `InEKFInputs.contact_chol` docstring already named as
+  the default. Linear-in-probability so `p=1`/`p=0` hit the named endpoints
+  exactly with no division; the probability is meant to be whatever
+  `FootSwitchContactProbabilityProvider.getContactProbability` (or a JAX
+  equivalent) already produces -- this adds no new contact detector.
+- `estimate_static_accel_bias` / `accel_body_from_raw`: `two_stage.py`'s own
+  docstring says accel-bias correction is "the caller's responsibility;
+  JointKF estimates gyro bias only" -- there is no accel-bias state anywhere
+  in this pipeline (Java or JAX), and none is added here. The decision is a
+  one-shot per-session calibration from a stationary window at capture start
+  (mocap-supervised captures already start with the robot standing still),
+  not an online-estimated quantity -- `estimate_static_accel_bias` runs once
+  outside the scan, `accel_body_from_raw` is the plain per-tick subtraction
+  that runs inside it.
+
+Still missing, deliberately out of scope for `realdata.py`: the actual
+per-tick reader from a real hardware log's byte format into `SensorInputs`,
+and the mocap-to-`truth_rotation`/`truth_velocity` converter -- both need a
+real capture to write against (robot time starts 2026-09-15) and are not
+designed-but-unbuilt the way `contact_chol`/`accel_body` were; they are
+straightforwardly unbuilt.
+
 ## Pending parity gates
 
 - Common math parity is separate from full policy parity: Python contact/gravity
