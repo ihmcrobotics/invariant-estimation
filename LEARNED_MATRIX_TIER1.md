@@ -32,10 +32,50 @@ Full suite after this change: see the run recorded below.
 
 No existing filter kernel, Java file, config or lockfile changed. A local .venv
 was installed with uv sync --frozen --no-default-groups --group dev.
-Java loading (item 4), the real capture-to-JAX-input loader, real-data
-training and robot activation remain pending -- robot time starts
-2026-09-15, and the `ihmclog` decoder `tests/replay/`'s own harness needs is
-not installed on this machine, so neither can be exercised yet regardless.
+The real capture-to-JAX-input loader, real-data training and robot activation
+remain pending -- robot time starts 2026-09-15, and the `ihmclog` decoder
+`tests/replay/`'s own harness needs is not installed on this machine, so
+neither can be exercised yet regardless.
+
+**Claude review of item 4 (artifact.py/test_artifact.py), 2026-09-14, same day
+Codex landed it:** found and fixed two real bugs, both in the direction of
+"this schema can't actually be produced by its own producer":
+
+1. `_positive`'s validation used `type(value) not in (float, int)`, an
+   exact-type check that rejects `numpy.float64` -- a genuine `float`
+   subclass that `json.dumps` already serializes fine on its own. Every
+   `dt`/variance value flowing out of the JAX training pipeline (`noise.py`'s
+   `NoiseSpec.scales`, a live `build`/`ekf`) is `numpy.float64`/`jax.Array`,
+   never a hand-typed Python literal -- so the ONLY inputs Codex's own
+   `test_artifact.py` used (Python float literals in `payload()`) were
+   exactly the one case this bug did not affect, which is why it shipped
+   passing. Fixed to `isinstance(value, (int, float))`, with an explicit
+   `isinstance(value, bool)` exclusion added back (bool IS an int subclass in
+   Python, and the original exact-type check happened to reject it too --
+   `isinstance` alone would have silently started accepting `True`/`False` as
+   1/0, a regression the fix had to guard against on purpose).
+2. `from_fit` passed `baseline["imu_gyro_covariances"]`'s matrices straight
+   into `json.dumps` unmodified. `validate_artifact` already accepts either a
+   raw ndarray or a nested list for these (it goes through `np.asarray`
+   itself), but a real ndarray -- exactly what `build.gyro_sigma[i]` is --
+   crashes `json.dumps` outright (`TypeError: Object of type ndarray is not
+   JSON serializable`), which `_positive`'s fix alone does nothing for. Fixed
+   by normalizing `imu_gyro_covariances` values via `np.asarray(...).tolist()`
+   inside `from_fit`, guarded so a baseline that's missing the key still
+   falls through to `validate_artifact`'s own (friendlier) schema error
+   instead of a bare `KeyError` from the normalization step itself.
+
+Added 3 regression tests to `test_artifact.py` pinning: real numpy
+scalars/arrays (matching what the actual pipeline produces, not
+hand-written literals) now round-trip through `from_fit`; `bool` is still
+rejected despite the `isinstance` relaxation; a malformed baseline still
+surfaces `validate_artifact`'s error, not a `KeyError`, when reached through
+`from_fit`. No other issues found in a full re-read of `validate_artifact`'s
+remaining checks (session-overlap detection, SPD covariance checks, the
+frozen-channel-must-equal-exactly-1 check -- verified safe given
+`NoiseSpec.scales`'s mask construction makes a frozen channel's scale
+*exactly* 1.0 via IEEE754, not approximately, so an exact-equality check on
+it is not fragile).
 
 ## Parameter contract for Claude / Java integration
 
@@ -119,9 +159,13 @@ Item 3 tests were not run by Codex and are not included in this claim.
 Result: **619 passed, 0 failed** (tests/replay excluded: those need a real
 hardware log plus the `ihmclog` decoder, neither present on this machine --
 confirmed by direct attempt, not assumed). Includes item 3's 10 tests
-(captures.py, now verified) and the 2 new integration tests. Also independently
-re-ran `tests/learning/test_captures.py` alone (10/10) and the full `tests/inEKF/`
-suite alone (287, including item 1's parity test) to confirm no test was only
+(captures.py, now verified) and the 2 new integration tests. Re-run again
+after the item 4 (artifact.py) bug fixes above: **625 passed, 0 failed**
+(+6 from `test_artifact.py`'s 3 original tests plus the 3 regression tests
+added during review). Also independently re-ran `tests/learning/test_captures.py`
+alone (10/10), `tests/learning/test_artifact.py` alone (6/6), and the full
+`tests/inEKF/` suite alone (287, including item 1's parity test) to confirm
+no test was only
 passing as a side effect of import/fixture ordering in the combined run.
 
 L2 need not uniquely identify physical Q/R. A separate Gaussian likelihood test
