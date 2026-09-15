@@ -313,6 +313,46 @@ advertised covariance, never whether they are small. It is a regularizer
 alongside a state-error loss, not a replacement for one, and it does not
 substitute for the mocap-supervised NEES check.
 
+## End-to-end rehearsal on generated data (2026-09-15)
+
+`learning/synthetic.py` + `learning/dryrun.py` -- runs the whole chain the real
+study will run (manifest, split, train on the train partition only, evaluate
+held-out, export artifact) against generated sessions instead of a robot log.
+Every stage is the real one; only the data source is substituted. Runnable:
+`python -m invariant_estimation.learning.dryrun`.
+
+`synthetic.py` differs from the existing test fixtures in the way that matters:
+the trajectory is chosen first and **every sensor is derived from it
+analytically**, matching the filters' own conventions (`Ṙ = R[ω]ₓ`,
+`v̇ = R a_body + g` so a static upright base reads +9.81 on z, a world-fixed
+contact at `Rᵀ(d−p)` in body). Known Gaussian noise is then added. Arbitrary
+arrays can prove gradients flow; only a self-consistent trajectory can show
+that better noise parameters produce a better estimate.
+
+Measured on the first full run (5 sessions, 3 train / 2 test, 120 ticks,
+60 Adam steps, arm 7): training loss 0.0378 → 0.0096, and **every held-out
+session improved** -- checked separately over four held-out sessions, three of
+them by 71–80%, one by 4% (an unusually easy trajectory whose baseline was
+already an order of magnitude lower). The exported artifact reloads through
+the strict reader.
+
+What the rehearsal establishes: gradients reach every channel through both
+filter stages, the split is honoured end to end, training generalizes to
+sessions the optimizer never saw, and the fit serializes into something Java
+accepts. Those are the failures that would otherwise surface during scarce
+robot time.
+
+What it does not: anything about real data. The generated sessions have
+exactly the i.i.d. Gaussian noise the filters assume, perfect contact, no
+model error, and a 3-coordinate joint abstraction rather than a kinematic
+chain. Both module docstrings and the run's own printed report say so — the
+report ends with "not a robot" specifically so its numbers cannot be quoted as
+a performance claim. A pipeline that fails here is definitely broken; one that
+passes is merely not yet known to be broken.
+
+10 tests, no skips. The split test pins verified seeds and asserts they differ
+rather than skipping when they collide.
+
 ## Pending parity gates
 
 - Common math parity is separate from full policy parity: Python contact/gravity
