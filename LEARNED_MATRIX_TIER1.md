@@ -201,6 +201,38 @@ real capture to write against (robot time starts 2026-09-15) and are not
 designed-but-unbuilt the way `contact_chol`/`accel_body` were; they are
 straightforwardly unbuilt.
 
+## Java application hook (item 6, 2026-09-14)
+
+`LearnedNoiseArtifact` (alex repo, `us.ihmc.alex.logAnalysis`) was a strict
+reader only -- validates the JSON, applies nothing. Added
+`LearnedNoiseApplier` in the same package/repo (must live in `alex`, not
+`ihmc-state-estimation`, for the same reverse-dependency reason
+`InvariantEstimatorNeesChecker`/`InvariantEstimatorComparisonCsvWriter` do):
+
+- `createEstimatorFactory(...)`: scales `base_gyro_q`/`base_accel_q`/`contact_q`
+  against caller-supplied baselines and constructs an
+  `InvariantEKFStateEstimatorFactory` with the result -- these three are
+  constructor-only (no live setter), so the scale is applied before
+  construction, mirroring the existing `sigmaTauOverride` boot-time-override
+  precedent in `ProprioceptivePreFilterFactory`.
+- `applyGravityVariances(ekf, ...)`: scales `gravity_roll_r`/`gravity_pitch_r`
+  and calls `InvariantEKF.setGravityMeasurementVariances`, a live setter --
+  verified behaviorally (not just "doesn't throw"): a 100x-wider learned
+  gravity variance measurably shrinks `getLastCorrectionRotationNorm()` for
+  an identical tilt error, in `LearnedNoiseApplierTest`.
+
+**Two of the seven channels remain deliberately unwired**, both already named
+in "Pending parity gates" below: `imu_gyro:<name>` needs a hook added inside
+`JointKFBiasUpdate` (raw per-IMU covariance lives on the IMU sensor objects,
+not a constructor argument this class can reach), and `contact_fk_r` has no
+Java equivalent of the `J Σ_q Jᵀ` route yet -- Java's
+`contactMeasurementVariance` is a different, constant-only noise model, and
+applying the trained scale to it would silently deploy against a model the
+scale was never fit against.
+
+3 new tests, `:alex:alex-test:test --tests "...LearnedNoiseApplierTest"`, all
+passing (full-suite run not repeated here; this touches only new files).
+
 ## Pending parity gates
 
 - Common math parity is separate from full policy parity: Python contact/gravity
