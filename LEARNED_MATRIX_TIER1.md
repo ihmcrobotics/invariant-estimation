@@ -353,6 +353,42 @@ passes is merely not yet known to be broken.
 10 tests, no skips. The split test pins verified seeds and asserts they differ
 rather than skipping when they collide.
 
+## Deployment path actually wired (2026-09-15)
+
+The Java classes above were reachable only from their own tests -- `grep` found
+no caller for `LearnedNoiseArtifact`, `LearnedNoiseApplier`, or
+`JointCovarianceContactMeasurementNoiseProvider`. Hooks nothing invokes are
+half a deployment path. `AlexEstimatorLogReplay` now takes
+`--learned-noise <artifact.json>` and applies all seven channels:
+
+| where | channels |
+|---|---|
+| before construction | `base_gyro_q`, `base_accel_q`, `contact_q` |
+| `ProprioceptivePreFilterFactory.create` | `imu_gyro:<name>` |
+| live setter after construction | `gravity_roll_r`, `gravity_pitch_r` |
+| replaces the noise provider | `contact_fk_r` |
+
+**The reader now retains the dimensional baselines** rather than only
+validating them, and `LearnedNoiseApplier.resolve` refuses a multiplier whose
+recorded baseline disagrees with the constant the caller is about to scale.
+This is the failure the schema was designed to catch and could not previously:
+a multiplier is dimensionless and means nothing except relative to the baseline
+it was fitted on, so applying it to a different one yields a plausible,
+undetectable, wrong variance. The check is relative (1e-9) so a JSON round trip
+passes and a 0.1% real change does not.
+
+`contact_fk_r` goes through `scaleFor`, not `resolve`: its baseline is the live
+`J Σ_q Jᵀ`, not a constant an artifact could record. The `fk_noise_model`
+context field guards that channel instead.
+
+Cross-language test added: `pythonProducedNoiseArtifact.json` is committed
+output from `dryrun`, loaded through the strict Java reader. Every other test
+builds artifacts by hand and can therefore only prove the reader is
+self-consistent -- if the two sides disagreed about a field name or which keys
+are mandatory, a hand-written fixture would agree with the reader and hide it.
+This is the first test where the producer and consumer are actually different
+languages. 13 tests across the two files.
+
 ## Pending parity gates
 
 - Common math parity is separate from full policy parity: Python contact/gravity
