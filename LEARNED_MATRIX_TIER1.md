@@ -221,10 +221,23 @@ reader only -- validates the JSON, applies nothing. Added
   gravity variance measurably shrinks `getLastCorrectionRotationNorm()` for
   an identical tilt error, in `LearnedNoiseApplierTest`.
 
-**Two of the seven channels remain deliberately unwired**, both already named
-in "Pending parity gates" below: `imu_gyro:<name>` needs a hook added inside
-`JointKFBiasUpdate` (raw per-IMU covariance lives on the IMU sensor objects,
-not a constructor argument this class can reach), and `contact_fk_r` has no
+**`imu_gyro:<name>` is now wired too** (ihmc-open-robotics-software,
+`new-state-estimator` branch): `ProprioceptivePreFilterFactory.create` gained
+an optional `ToDoubleFunction<String> gyroSigmaScaleByImuName`, threaded
+through `JointLevelKFPreFilter` into `JointKFBiasUpdate.buildAndFloorSigma`,
+where it multiplies each IMU's 3x3 block **after** acquisition and flooring --
+the contract this doc's parameter table requires. It is construction-time for
+the same reason `sigmaTauOverride` is: Sigma is built and cached once, on the
+first stacked measurement, and never rebuilt. A non-finite or non-positive
+multiplier throws rather than degrading to 1.0, so a mis-keyed artifact cannot
+look like a successful no-op deployment. 4 tests
+(`JointLevelKFLearnedGyroSigmaScaleTest`) pin: a null override is bit-identical
+to the pre-hook baseline; a per-IMU factor scales exactly that IMU's block and
+no other; a sub-unity factor survives (proving no re-floor swallows it); and
+bad values are rejected.
+
+**One of the seven channels remains deliberately unwired**, already named
+in "Pending parity gates" below: `contact_fk_r` has no
 Java equivalent of the `J Σ_q Jᵀ` route yet -- Java's
 `contactMeasurementVariance` is a different, constant-only noise model, and
 applying the trained scale to it would silently deploy against a model the
