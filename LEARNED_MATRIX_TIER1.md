@@ -269,6 +269,50 @@ deviation and is documented as one.
 3 new tests, `:alex:alex-test:test --tests "...LearnedNoiseApplierTest"`, all
 passing (full-suite run not repeated here; this touches only new files).
 
+## NIS consistency harness (2026-09-15)
+
+`invariant_estimation/eval/consistency.py` -- the half of the objective that
+needs **no ground truth**, so it runs on any robot log with or without a mocap
+session. It consumes the NIS the filters already publish (`TickDiagnostics.
+encoder_nis`/`stacked_nis`, `InEKFOutputs.contact_diagnostics`/
+`gravity_diagnostics`) rather than recomputing any innovation, so it cannot
+disagree with what the filter actually did.
+
+- `channel_consistency(...)` scores one channel's ANIS against its chi-squared
+  band and returns a **directional** verdict: `overconfident` (ANIS above the
+  band -- Q/R too small) or `conservative` (below -- too large). The direction
+  is the tuning signal; a bare "inconsistent" would not be actionable.
+- `two_stage_consistency(...)` scores all four channels of a two-stage rollout.
+  The stacked channel's dof is read from its per-row diagnostic, not assumed,
+  since the row count moves with the active anchor count.
+- `nis_consistency_loss(...)` is the differentiable form, `(mean(NIS)/dof - 1)^2`,
+  usable as a regularizer inside `fit_scalars` -- normalized by dof so channels
+  of different measurement dimension can be summed without the widest
+  dominating.
+
+Chi-squared quantiles come from bisection on `jax.scipy.special.gammainc`
+(`chi2.cdf(x;k) == gammainc(k/2, x/2)`), so no SciPy dependency is added --
+SciPy is currently only a transitive install here, not a declared one.
+
+Two sampling traps are handled explicitly rather than left to the caller:
+gated and pre-first-update (NaN) samples are dropped instead of averaged in,
+and `effective_samples` exists because consecutive ticks of a 1 kHz estimator
+are not independent -- the raw count makes the band far too tight and will
+call a healthy filter inconsistent.
+
+36 tests. The statistical ones are real: true chi-squared draws must read
+`consistent`, draws inflated 4x must read `overconfident`, and shrunk 4x must
+read `conservative` -- a harness that always says "consistent", or that
+confuses the two directions, fails them. Validated end-to-end against an
+actual two-stage rollout, not a mock, since the module makes structural claims
+about another module's diagnostic shapes.
+
+**Scope caveat, stated in the module docstring:** NIS is blind to a filter that
+is confidently and consistently *wrong* -- it asks whether errors match the
+advertised covariance, never whether they are small. It is a regularizer
+alongside a state-error loss, not a replacement for one, and it does not
+substitute for the mocap-supervised NEES check.
+
 ## Pending parity gates
 
 - Common math parity is separate from full policy parity: Python contact/gravity
