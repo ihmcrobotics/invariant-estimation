@@ -236,12 +236,35 @@ to the pre-hook baseline; a per-IMU factor scales exactly that IMU's block and
 no other; a sub-unity factor survives (proving no re-floor swallows it); and
 bad values are rejected.
 
-**One of the seven channels remains deliberately unwired**, already named
-in "Pending parity gates" below: `contact_fk_r` has no
-Java equivalent of the `J Σ_q Jᵀ` route yet -- Java's
-`contactMeasurementVariance` is a different, constant-only noise model, and
-applying the trained scale to it would silently deploy against a model the
-scale was never fit against.
+**`contact_fk_r` is now wired too, and all seven channels have a Java
+deployment path.** The blocker was that Java's contact FK measurement noise
+was a constant isotropic diagonal, not the `J Σ_q Jᵀ` route the multiplier is
+trained against. That route now exists:
+`JointCovarianceContactMeasurementNoiseProvider` implements the existing
+`ContactMeasurementNoiseProvider` seam (its javadoc already named this as the
+intended implementation, and `InvariantEKFStateEstimator.
+setContactMeasurementNoiseProvider` is the documented injection point), taking
+`Σ_q` from `OneDoFJointStateSource.packPositionCovariance` and `J` from the
+pelvis-to-sole `GeometricJacobian`. The Jacobian is built from the same
+one-DoF joint path `Σ_q` is packed against, so columns cannot drift from
+indices; it is taken in the sole frame (the linear block of a twist in frame
+F is the velocity of F's *origin*, and the sole origin is the measured point)
+and then rotated into the pelvis frame the interface specifies.
+
+Correctness is established by differencing the model's own forward
+kinematics -- `testTheRoutedCovarianceMatchesAFiniteDifferencedForwardKinematics
+Jacobian` perturbs each leg joint and compares, matching to ~2e-9 relative.
+That is the only assertion here that can catch a frame error; the others
+("the number changed", "the scale multiplies") pass just as happily with a
+wrong rotation. When the joint source has no covariance yet the provider
+delegates to the constant one rather than fabricating an R, so the boot
+transient stays on the previously-shipping model. 5 tests; module suite
+221 -> 226, 0 failures.
+
+A `conditioningFloor` constructor argument exists for singular leg
+configurations but **defaults to 0.0 for exact parity with the offline
+model**, which has no such term -- a nonzero value is a deliberate Java-side
+deviation and is documented as one.
 
 3 new tests, `:alex:alex-test:test --tests "...LearnedNoiseApplierTest"`, all
 passing (full-suite run not repeated here; this touches only new files).
