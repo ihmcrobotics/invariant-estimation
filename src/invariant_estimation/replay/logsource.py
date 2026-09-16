@@ -18,7 +18,19 @@ handshake) is ~700 lines that already exist and are already exercised, in the
 kind of duplication.  So this module locates that file and imports it, in order:
 
 1. ``$IHMCLOG`` if set (an explicit override for CI or a moved checkout),
-2. ``~/.claude/skills/ihmc-log/ihmclog.py`` (where the skill installs it).
+2. ``~/.claude/skills/ihmc-log/ihmclog.py`` (where the skill installs it),
+3. the vendored ``replay/ihmclog.py`` beside this file.
+
+**Why a vendored copy now exists (2026-09-16).** The paragraph above was
+written when an external copy was known to exist. It could not be found on any
+machine here, its author has left, and the hardware log that harness ran
+against has since been deleted from the log store -- so the "already exists and
+is already exercised" premise no longer holds for anyone who has to run this
+today. The vendored reader is a port of the same Java sources
+(``LogDataReader``, ``LogIndex``, ``IDLYoVariableHandshakeParser``), kept
+narrow: named variables over a tick window, nothing else. An external copy
+still wins if present, so a maintained one can take over at any time without
+touching this module.
 
 If neither resolves, every entry point raises `LogToolUnavailable` with the
 remedy in the message, and the parity tests **skip** rather than fail: a missing
@@ -83,6 +95,7 @@ def ihmclog() -> ModuleType:
     """Import the `ihmc-log` skill's decoder, or explain how to get it."""
     candidates = [Path(os.environ["IHMCLOG"])] if os.environ.get("IHMCLOG") else []
     candidates.append(_DEFAULT_TOOL)
+    candidates.append(Path(__file__).with_name("ihmclog.py"))  # vendored floor; see the module docstring
     for path in candidates:
         if path.exists():
             spec = importlib.util.spec_from_file_location("ihmclog", path)
