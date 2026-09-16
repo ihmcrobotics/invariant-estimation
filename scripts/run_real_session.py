@@ -16,8 +16,12 @@ list of things a real study has to settle properly:
   from anywhere machine-readable);
 * the sole sites, which the URDF does not carry -- placed at the foot link
   origin here, which is not the real sole offset;
-* imu_to_body, left as identity, which is only right if the pelvis IMU is
-  mounted exactly body-aligned;
+* the frame the InEKF calls "body", which is set by `body_site`. It is the
+  pelvis IMU site here, so imu_to_body is identity and the filter estimates the
+  IMU frame's pose -- NOT the pelvis link's, which is what mocap registers and
+  what the Java estimator reports. Alex's pelvis IMU is mounted yawed 90 degrees
+  and offset ~12 cm, so the two frames are far apart; see the note where
+  imu_to_body is passed;
 * the window, chosen to begin on a genuinely stationary stretch and to stop
   before a logged controller stall;
 * the nominal specific force at rest, which assumes a level pelvis -- see the
@@ -38,6 +42,7 @@ from invariant_estimation.learning.log_adapter import ClockMapping, InitialState
 from invariant_estimation.learning.noise import NoiseSpec
 from invariant_estimation.learning.session_model import MjxSessionModel
 from invariant_estimation.model.mjx_model import MjxModel
+from invariant_estimation.model.mounts import describe as describe_mount, imu_to_body
 from invariant_estimation.model.urdf2mjcf import convert_log_model
 from invariant_estimation.replay.logsource import read_window
 
@@ -96,6 +101,7 @@ def main():
                              extra_sites={"LEFT_FOOT": "LEFT_FOOT", "RIGHT_FOOT": "RIGHT_FOOT"})
     mj_model = mujoco.MjModel.from_xml_string(spec.mjcf)
     print(f"model: {mj_model.njnt} joints, {mj_model.nsite} sites")
+    print(f"mount: {describe_mount(mj_model)}")
 
     sites = tuple(IMUS) + FEET
     tree = kinematic_tree(mj_model, spec, sites)
@@ -134,6 +140,17 @@ def main():
 
     session = prepare_session(
         window, channels, clock, session_model, build, joint_params, ekf, initial,
+        # Identity is correct ONLY because body_site is the pelvis IMU site itself, so the
+        # filter's "body" frame IS the IMU frame. That is self-consistent but it is not the
+        # frame the study wants: mocap registers the pelvis, and the Java estimator reports
+        # the pelvis, while this estimates a frame yawed 90 degrees and offset ~12 cm from it
+        # (mounts.imu_to_body reads that transform out of the robot's own description).
+        #
+        # Estimating the pelvis instead needs body_site on PELVIS_LINK with imu_to_body =
+        # mounts.imu_to_body(mj_model). MjxSessionModel rejects that today: it requires the
+        # base IMU site and the body site to share a body id, and they are separate bodies
+        # joined by a fixed joint. Loosening that check to "rigidly attached" is the fix, and
+        # it is a deliberate decision rather than something to slip in here.
         imu_to_body=np.eye(3), world_frame="registered_zup",
         stationary_window=(0, 200),
         # The joint-velocity limit is raised from 0.05 because it is checked over ALL 49 model
