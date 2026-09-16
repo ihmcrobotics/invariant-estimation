@@ -192,6 +192,7 @@ def prepare_session(
     firm_variance=None,
     swing_variance=None,
     stationary_limits=(0.15, 0.05, 0.2),
+    cadence_tolerance=1.0,
 ):
     """Validate a contiguous LogWindow and build a fresh independent session.
 
@@ -243,10 +244,27 @@ def prepare_session(
         or not np.isclose(dt, float(ekf.params.dt), rtol=0, atol=1e-12)
     ):
         raise ValueError("JointKF/InEKF dt mismatch")
-    if not np.isclose(window.dt, dt, rtol=0, atol=1e-12) or not np.allclose(
-        np.diff(time), dt, rtol=0, atol=1e-9
-    ):
-        raise ValueError("log cadence differs from filter dt; no implicit resampling")
+    if not np.isclose(window.dt, dt, rtol=0, atol=1e-12):
+        raise ValueError("log's declared rate differs from filter dt; no implicit resampling")
+    # Timestamp spacing is a SANITY BOUND, not an exactness requirement. A missing tick is
+    # already caught structurally above, by the contiguity check on window.tick -- these are
+    # wall-clock timestamps, and holding them to the filter's nominal dt exactly is a claim
+    # about the controller's scheduler, not about the data being complete.
+    #
+    # Measured on 40k ticks of a real Alex log: jitter is sigma ~= 0.017 ms about a 1 ms
+    # period, so the old 1 ns tolerance was ~17000x too tight to ever pass. The distribution
+    # separates cleanly -- jitter stays under 2 ms, genuine stalls start at 229 ms, and
+    # nothing lies between -- so a bound of one full dt accepts every jittered step and still
+    # catches every stall, with room on both sides.
+    steps = np.diff(time)
+    excess = np.abs(steps - dt)
+    if np.any(excess > cadence_tolerance * dt):
+        worst = int(np.argmax(excess))
+        raise ValueError(
+            f"log cadence breaks at tick {worst} -> {worst + 1}: step {steps[worst]:.6f} s "
+            f"against dt {dt:.6f} s. This is a discontinuity, not jitter; split the capture "
+            f"into independent sessions at that tick rather than compressing or filling it."
+        )
     timestamps = clock.timestamps(time)
     if not np.all(np.diff(timestamps) > 0) or not world_frame.strip():
         raise ValueError("invalid timestamp/world frame")
