@@ -398,3 +398,36 @@ languages. 13 tests across the two files.
   points; do not apply contact_q twice.
 - Match the J Sigma_q J.T route in Java before transferring contact_fk_r.
 - No cross-language equality, held-out improvement, or robot safety claim yet.
+
+## Real-log learning boundary completed in software (2026-09-16)
+
+The hardware-independent input path is now implemented. `learning/log_adapter.py`
+converts a contiguous, explicitly named `LogWindow` into fresh JointKF/InEKF
+session state and per-tick inputs. `learning/session_model.py` supplies the
+live MJX model quantities, including the filtered/unfiltered-joint split and
+the Java considered-subsystem mass convention. `LOG_INPUT_CONTRACT.md` is the
+normative v1 data/frame/time/initialization contract.
+
+The adapter deliberately fails instead of guessing when channels are absent,
+sensor ticks are discontinuous, cadence differs from either filter, values are
+non-finite, contact trust is not binary, rotations are invalid, or clock/world
+declarations disagree with mocap. It runs every sensor tick through both
+filters and applies the mocap validity mask only to the completed trajectory's
+loss. Each capture gets a fresh carry. The default contact process input is the
+Cholesky factor of the existing constant `sigma_c`; the probability schedule
+is a separately tagged opt-in that artifact schema v1 does not accept.
+
+Software-only verification now exercises synthetic `LogWindow` input through
+the adapter, JointKF, InEKF, train/held-out loss, and learned artifact export,
+as well as an actual MJX chain with independent FK/Jacobian finite-difference
+checks. Focused result: 17 tests pass. The broader learning plus synthetic
+Java-parity selection passed 88 tests before the final formatting-only change.
+
+Still hardware/log dependent: install the optional IHMC binary decoder;
+resolve Alex's exact processed estimator-input channel names; and measure or
+verify logger-to-mocap clock mapping, mocap-to-world registration, IMU mount,
+acceleration calibration, and the initial prior on real captures. These are
+data provenance/calibration gates, not missing filter or training-pipeline
+implementations. A sim-only direct `SensorInputs` exporter is therefore not
+on the critical path; simulation and hardware should both exercise this shared
+log boundary.
