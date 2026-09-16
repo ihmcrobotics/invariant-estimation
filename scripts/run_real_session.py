@@ -16,12 +16,7 @@ list of things a real study has to settle properly:
   from anywhere machine-readable);
 * the sole sites, which the URDF does not carry -- placed at the foot link
   origin here, which is not the real sole offset;
-* the frame the InEKF calls "body", which is set by `body_site`. It is the
-  pelvis IMU site here, so imu_to_body is identity and the filter estimates the
-  IMU frame's pose -- NOT the pelvis link's, which is what mocap registers and
-  what the Java estimator reports. Alex's pelvis IMU is mounted yawed 90 degrees
-  and offset ~12 cm, so the two frames are far apart; see the note where
-  imu_to_body is passed;
+* the sole sites, whose true offset the URDF does not carry (above);
 * the window, chosen to begin on a genuinely stationary stretch and to stop
   before a logged controller stall;
 * the nominal specific force at rest, which assumes a level pelvis -- see the
@@ -98,12 +93,16 @@ def main():
     # here -- a real study needs the actual sole offset, which the URDF does not carry.
     spec = convert_log_model(LOG, rotor_inertia=jk["rotor_inertia"],
                              rotor_inertia_default=jk["rotor_inertia_default"],
-                             extra_sites={"LEFT_FOOT": "LEFT_FOOT", "RIGHT_FOOT": "RIGHT_FOOT"})
+                             extra_sites={"LEFT_FOOT": "LEFT_FOOT", "RIGHT_FOOT": "RIGHT_FOOT",
+                                          # The pelvis LINK origin -- the frame mocap registers and
+                                          # the Java estimator reports. Without it the only pelvis-ish
+                                          # site is the IMU's own, 90 deg and ~12 cm away.
+                                          "pelvis": "PELVIS_LINK"})
     mj_model = mujoco.MjModel.from_xml_string(spec.mjcf)
     print(f"model: {mj_model.njnt} joints, {mj_model.nsite} sites")
     print(f"mount: {describe_mount(mj_model)}")
 
-    sites = tuple(IMUS) + FEET
+    sites = tuple(IMUS) + FEET + ("pelvis",)
     tree = kinematic_tree(mj_model, spec, sites)
     build = build_joint_kf(tree, imu_sites=list(IMUS), pairs=list(PAIRS),
                            foot_sites=list(FEET), cfg=jk)
@@ -115,7 +114,8 @@ def main():
     # pairs are SITE indices; the IMU sites lead `sites`, so they coincide with PAIRS here.
     model = MjxModel.from_xml_string(spec.mjcf, site_names=sites, pairs=list(PAIRS),
                                      joint_names=build.joint_names)
-    session_model = MjxSessionModel(model, build, body_site="pelvis_imu", contact_sites=FEET)
+    # body_site is the pelvis LINK, so the filter estimates the frame the study compares against.
+    session_model = MjxSessionModel(model, build, body_site="pelvis", contact_sites=FEET)
 
     channels = alex_channel_map_from_log(
         LOG, session_model.joint_names, build.imu_names, FEET, base_imu="pelvis_imu")
@@ -151,7 +151,9 @@ def main():
         # base IMU site and the body site to share a body id, and they are separate bodies
         # joined by a fixed joint. Loosening that check to "rigidly attached" is the fix, and
         # it is a deliberate decision rather than something to slip in here.
-        imu_to_body=np.eye(3), world_frame="registered_zup",
+        # Read from the robot's own description rather than assumed. prepare_session cross-checks
+        # it against the model's measurement frames, so a wrong value fails loudly here.
+        imu_to_body=imu_to_body(mj_model), world_frame="registered_zup",
         stationary_window=(0, 200),
         # The joint-velocity limit is raised from 0.05 because it is checked over ALL 49 model
         # joints, and NECK_Y is panning at 0.070 rad/s while the legs and pelvis are still.

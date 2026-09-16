@@ -51,11 +51,23 @@ class MjxSessionModel:
         if not np.array_equal(pairs, model.pair_sites):
             raise ValueError("MJX/build IMU pair order mismatch")
         mj = model.mj_model
-        if (
-            mj.site_bodyid[model.site_ids[self.base]]
-            != mj.site_bodyid[model.site_ids[self.body]]
-        ):
-            raise ValueError("base IMU and pelvis body site must be rigidly attached")
+        # Rigidly attached, by MuJoCo's own weld groups rather than by body identity. imu_to_body is
+        # computed once below at qpos0, so it is only valid for all time if the two sites cannot move
+        # relative to each other -- which is what a shared weld id means: bodies joined by fixed
+        # joints share one, and any joint between them breaks it.
+        #
+        # Same-body-id was too strict and ruled out the configuration the study actually wants. On
+        # Alex the pelvis IMU lives on its own PELVIS_IMU_LINK, fixed-jointed to PELVIS_LINK and
+        # yawed 90 degrees from it, so requiring one body forced body_site onto the IMU itself --
+        # making the filter estimate the IMU frame rather than the pelvis that mocap registers and
+        # the Java estimator reports.
+        base_weld = int(mj.body_weldid[mj.site_bodyid[model.site_ids[self.base]]])
+        body_weld = int(mj.body_weldid[mj.site_bodyid[model.site_ids[self.body]]])
+        if base_weld != body_weld:
+            raise ValueError(
+                "base IMU and pelvis body site must be rigidly attached; "
+                f"{body_site!r} and the base IMU are separated by a joint"
+            )
         if any(int(t) not in (0, 3) for t in mj.jnt_type):
             raise ValueError("v1 supports free-base and hinge joints only")
         hinge = [i for i, t in enumerate(mj.jnt_type) if int(t) == 3]
