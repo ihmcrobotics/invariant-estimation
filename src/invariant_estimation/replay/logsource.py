@@ -122,16 +122,48 @@ class LogWindow:
         return all(n in self.channels for n in names)
 
 
-def joint_channel(reader, joint: str, chan: str) -> str:
-    """Resolve the variable the *estimator* saw for ``<chan>`` of ``<joint>``.
+def handshake_names(log_dir: str | Path) -> frozenset[str]:
+    """Every YoVariable simple name in a log, read from ``handshake.yaml`` ALONE.
+
+    The decoder is **not** needed for this: the handshake is plain YAML, and only
+    ``robotData.bsz`` (the per-tick sample values) is the binary format
+    `ihmclog` exists to parse. So a channel map can be resolved and verified
+    against a real robot log on a machine that cannot yet decode one.
+
+    Extracted by line regex rather than a full YAML parse -- these files run to
+    8 MB and the whole document is not wanted, only the ``name:`` entries.
+    """
+    path = Path(log_dir) / "handshake.yaml"
+    if not path.exists():
+        raise FileNotFoundError(f"no handshake.yaml in {log_dir}")
+    pattern = re.compile(r'^\s*name:\s*"(?P<name>[^"]*)"\s*$')
+    names = set()
+    with path.open("r", encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            m = pattern.match(line)
+            if m and m.group("name"):
+                names.add(m.group("name"))
+    if not names:
+        raise ValueError(f"{path}: no variable names found; unexpected handshake format")
+    return frozenset(names)
+
+
+def resolve_joint_channel(names, joint: str, chan: str) -> str:
+    """The variable the *estimator* saw for ``<chan>`` of ``<joint>``, given a NAME SET.
 
     Returns the highest-numbered ``_spN`` stage published for that joint/channel,
     falling back to ``raw_<chan>_<joint>`` when the log has no processing chain
     (older builds, or a channel `SensorProcessing` passes through untouched).
 
+    Resolving per joint, rather than applying one stage suffix to all of them, is
+    load-bearing on real Alex logs: the leg joints carry an elasticity stage
+    (``stiff_q_LEFT_KNEE_Y_sp1``) that ``SPINE_Z`` does not (``filt_q_SPINE_Z_sp0``),
+    and no joint has a ``stiff`` *velocity* at all. A uniform rule is wrong for
+    some joint on every real log.
+
     ``chan`` is one of ``q``, ``qd``, ``tau``.
     """
-    names = frozenset(reader.hs.names)
+    names = frozenset(names)
     best_idx, best_name = -1, None
     for name in names:
         m = _STAGE_RE.match(name)
@@ -146,6 +178,11 @@ def joint_channel(reader, joint: str, chan: str) -> str:
     if raw in names:
         return raw
     raise KeyError(f"log has no '{chan}' channel for joint '{joint}'")
+
+
+def joint_channel(reader, joint: str, chan: str) -> str:
+    """`resolve_joint_channel` against a live reader's handshake."""
+    return resolve_joint_channel(reader.hs.names, joint, chan)
 
 
 def imu_channels(imu: str) -> dict[str, list[str]]:
