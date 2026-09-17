@@ -252,6 +252,7 @@ def build_stacked(
     J_rel: Array | None = None,
     R_rel: Array | None = None,
     anchor: AnchorBlock | None = None,
+    pair_r_extra: Array | None = None,
 ) -> StackedMeasurement:
     r"""Java `buildStackedMeasurementForTest` -- the pair rows plus the anchors.
 
@@ -383,6 +384,18 @@ def build_stacked(
     # keeps it structurally decoupled for `update.py`'s condition proxy.
     R = L @ Sigma @ L.T
     R = R.at[build.anchor_row0:, build.anchor_row0:].add(R_anchor)
+
+    # Optional per-tick adaptive inflation of each pair's OWN diagonal block.
+    # `L Sigma L^T` can only express per-IMU noise; a pair-specific term (e.g.
+    # driven by that pair's off-axis residual, which is a property of the pair's
+    # joint, not of either gyro) has no representation in Sigma and must be added
+    # here. Nonnegative and isotropic, so R stays PSD and the added term commutes
+    # with any frame choice. `None` leaves R untouched (invariant I7: the shape
+    # is the same either way, and the branch is on a Python-level argument, not
+    # on a traced value).
+    if pair_r_extra is not None:
+        extra = jnp.repeat(jnp.asarray(pair_r_extra, dtype=jnp.float64), 3)   # (3P,)
+        R = R.at[jnp.arange(3 * P), jnp.arange(3 * P)].add(extra)
 
     return StackedMeasurement(H=H, z=z, R=R, L=L)
 

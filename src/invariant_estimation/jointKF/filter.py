@@ -72,12 +72,21 @@ class SensorInputs(NamedTuple):
     contact : (K,)
         This tick's contact/trust signal per anchor slot. Consumed on the NEXT
         tick — see the module docstring on phase ordering.
+    pair_r_extra : (n_pairs,), optional
+        Per-tick ADDITIVE isotropic variance added to each pair's own 3x3
+        diagonal block of the stacked `R`, for adaptive/time-varying measurement
+        noise. `None` (the default) is the frozen-R path and is bit-identical to
+        the code before this field existed. Additive rather than a multiplier on
+        the block because `R = L Sigma L^T` is correlated across pairs that share
+        an IMU: scaling one diagonal block of a correlated PSD matrix can destroy
+        positive-definiteness, adding a nonnegative diagonal cannot.
     """
 
     encoders: Array
     gyros: Array
     qd_unfiltered: Array
     contact: Array
+    pair_r_extra: Array | None = None
 
 
 class ModelInputs(NamedTuple):
@@ -184,6 +193,7 @@ def step(
         build, params, gyros=sensors.gyros,
         trusted_feet=carry.trusted_feet,
         J_rel=model.J_rel, R_rel=model.R_rel, anchor=anchor,
+        pair_r_extra=sensors.pair_r_extra,
     )
     state, stk_info = update_channel(state, stacked.H, stacked.z, stacked.R, params)
 
