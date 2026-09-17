@@ -237,8 +237,18 @@ def urdf_to_mjcf(
         lowercase, with the suffix stripped and ``_imu`` appended -- the log's
         sensor naming.
     extra_sites
-        ``site name -> link name`` for anything else the estimator needs a frame
-        on (foot soles for the InEKF contact update).
+        ``site name -> link name``, or ``site name -> (link name, (x, y, z))`` to
+        place the site at an offset in that link's frame. IMU sites need no offset
+        because each sits at the origin of its own ``*_IMU_LINK``; a contact frame
+        does, since the foot link's origin is the ankle, not the sole.
+
+        Alex's sole offset is ``(0.053, 0.0, -0.055)`` -- from
+        ``AlexV2PhysicalProperties.soleToAnkleFrameTransforms``, and independently
+        the bottom face of ``model.sdf``'s foot collision box. Note that the InEKF
+        does not need it: the contact anchor is a state variable, so a constant
+        offset is absorbed and only its *time derivative* (foot rotation in stance)
+        reaches the estimate. The offset is supported here so that can be measured
+        rather than assumed.
     """
     rotor_inertia = {} if rotor_inertia is None else dict(rotor_inertia)
     extra_sites = {} if extra_sites is None else dict(extra_sites)
@@ -282,10 +292,19 @@ def urdf_to_mjcf(
             sensor = link_name[: -len(imu_link_suffix)].lower() + "_imu"
             site_of_link.setdefault(link_name, []).append(sensor)
             imu_sites[sensor] = sensor
-    for site_name, link_name in extra_sites.items():
+    site_offset: dict[str, tuple[float, float, float]] = {}
+    for site_name, spec in extra_sites.items():
+        if isinstance(spec, str):
+            link_name, offset = spec, (0.0, 0.0, 0.0)
+        else:
+            link_name, offset = spec
+            offset = tuple(float(v) for v in offset)
+            if len(offset) != 3:
+                raise ValueError(f"extra site '{site_name}' offset must be (x, y, z), got {offset!r}")
         if link_name not in links:
             raise ValueError(f"extra site '{site_name}' names unknown link '{link_name}'")
         site_of_link.setdefault(link_name, []).append(site_name)
+        site_offset[site_name] = offset
 
     out: list[str] = [
         f'<mujoco model="{model_name}">',
@@ -352,7 +371,8 @@ def urdf_to_mjcf(
             out.append(f'{pad}  <inertial pos="0 0 0" mass="{_MASSLESS!r}" diaginertia="0 0 0"/>')
 
         for site_name in site_of_link.get(link_name, []):
-            out.append(f'{pad}  <site name="{site_name}" pos="0 0 0"/>')
+            x, y, z = site_offset.get(site_name, (0.0, 0.0, 0.0))
+            out.append(f'{pad}  <site name="{site_name}" pos="{x!r} {y!r} {z!r}"/>')
 
         for child_joint in children[link_name]:
             emit_link(child_joint.find("child").get("link"), child_joint, depth + 1)

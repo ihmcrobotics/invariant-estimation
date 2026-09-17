@@ -218,3 +218,71 @@ def test_rpy_conversion_is_fixed_axis():
     d = mujoco.MjData(R_from_quat)
     mujoco.mj_kinematics(R_from_quat, d)
     assert np.abs(d.xmat[1].reshape(3, 3) - _rot(rpy)).max() < 1e-12
+
+
+# --------------------------------------------------------------------------
+# extra sites: contact frames need an offset, IMU frames do not
+# --------------------------------------------------------------------------
+
+_SOLE_OFFSET = (0.053, 0.0, -0.055)
+
+
+def _sites(urdf_text, extra_sites):
+    spec = urdf_to_mjcf(urdf_text, extra_sites=extra_sites)
+    return mujoco.MjModel.from_xml_string(spec.mjcf)
+
+
+def test_a_bare_link_name_still_places_the_site_at_the_link_origin(urdf_text):
+    """The existing call shape must keep meaning exactly what it meant."""
+    m = _sites(urdf_text, {"anchor": "LEFT_FOOT"})
+    sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "anchor")
+    assert np.abs(m.site_pos[sid]).max() == 0.0
+
+
+def test_an_offset_reaches_the_site(urdf_text):
+    m = _sites(urdf_text, {"sole": ("LEFT_FOOT", _SOLE_OFFSET)})
+    sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "sole")
+    np.testing.assert_allclose(m.site_pos[sid], _SOLE_OFFSET, atol=1e-12)
+
+
+def test_the_offset_rides_the_link_rather_than_being_a_world_coordinate(urdf_text):
+    """The distinction that matters. Placed in the link's own frame, the two sites stay separated
+    by the offset *rotated by the link's orientation*; a world-frame offset would not."""
+    m = _sites(urdf_text, {"sole": ("LEFT_FOOT", _SOLE_OFFSET), "ankle": "LEFT_FOOT"})
+    sole = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "sole")
+    ankle = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "ankle")
+
+    d = mujoco.MjData(m)
+    rng = np.random.default_rng(7)
+    d.qpos[7:] = rng.uniform(-0.4, 0.4, size=m.nq - 7)  # a non-zero pose, so orientation matters
+    mujoco.mj_kinematics(m, d)
+
+    rotation = d.xmat[m.site_bodyid[sole]].reshape(3, 3)
+    np.testing.assert_allclose(d.site_xpos[sole] - d.site_xpos[ankle],
+                               rotation @ np.array(_SOLE_OFFSET), atol=1e-9)
+
+
+def test_the_sole_offset_lands_on_the_foot_collision_boxs_bottom_face(urdf_text):
+    """Cross-check against the robot description itself rather than against this module.
+
+    ``model.sdf`` gives LEFT_FOOT a collision box centred at z=-0.045 with a 0.02 thickness, so its
+    contact face sits at -0.055 -- the same number AlexV2PhysicalProperties derives as
+    ``-ankleHeight``. Two independently maintained sources; if they ever disagree, this fails."""
+    root = ET.fromstring(urdf_text)
+    link = next(l for l in root.findall("link") if l.get("name") == "LEFT_FOOT")
+    collision = link.find("collision")
+    centre = [float(v) for v in collision.find("origin").get("xyz").split()]
+    size = [float(v) for v in collision.find("geometry").find("box").get("size").split()]
+
+    assert centre[0] == pytest.approx(_SOLE_OFFSET[0], abs=1e-9)
+    assert centre[2] - size[2] / 2.0 == pytest.approx(_SOLE_OFFSET[2], abs=1e-9)
+
+
+def test_a_malformed_offset_is_rejected_rather_than_silently_truncated(urdf_text):
+    with pytest.raises((ValueError, TypeError)):
+        _sites(urdf_text, {"sole": ("LEFT_FOOT", (0.1, 0.2))})
+
+
+def test_an_unknown_link_is_named_in_the_error_for_an_offset_site_too(urdf_text):
+    with pytest.raises(ValueError, match="NOPE"):
+        _sites(urdf_text, {"sole": ("NOPE", _SOLE_OFFSET)})
