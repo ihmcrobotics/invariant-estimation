@@ -1,0 +1,640 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Covariance as an Observed Quantity</title>
+<style>
+  @page {
+    size: a4;
+    margin: 2cm;
+    @bottom-center {
+      content: counter(page);
+      font-family: "DejaVu Serif", "Liberation Serif", Georgia, serif;
+      font-size: 8.5pt;
+      color: #444;
+    }
+  }
+
+  html { font-size: 10pt; }
+
+  body {
+    font-family: "DejaVu Serif", "Liberation Serif", Georgia, serif;
+    font-size: 9.4pt;
+    line-height: 1.38;
+    color: #111;
+    background: #fff;
+    text-align: justify;
+    hyphens: auto;
+  }
+
+  /* ---------- front matter (spans both columns) ---------- */
+  .front { margin-bottom: 1.1em; }
+
+  h1.title {
+    font-size: 17pt;
+    line-height: 1.22;
+    font-weight: bold;
+    text-align: center;
+    margin: 0 0 0.5em 0;
+    letter-spacing: 0.1px;
+  }
+  .subtitle {
+    text-align: center;
+    font-size: 10.5pt;
+    font-style: italic;
+    color: #333;
+    margin: 0 0 1.1em 0;
+  }
+  .authors {
+    text-align: center;
+    font-size: 10pt;
+    margin: 0 0 0.25em 0;
+  }
+  .affil {
+    text-align: center;
+    font-size: 8.6pt;
+    color: #444;
+    margin: 0 0 0.35em 0;
+    font-style: italic;
+  }
+  .datenote {
+    text-align: center;
+    font-size: 8.2pt;
+    color: #555;
+    margin: 0 0 1.2em 0;
+  }
+
+  .abstract {
+    margin: 0 auto 0.5em auto;
+    width: 88%;
+    font-size: 9pt;
+    line-height: 1.4;
+  }
+  .abstract h2, .keywords h2 {
+    font-size: 9pt;
+    font-weight: bold;
+    text-align: center;
+    margin: 0 0 0.4em 0;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+  }
+  .keywords {
+    width: 88%;
+    margin: 0.6em auto 0 auto;
+    font-size: 8.8pt;
+  }
+  .keywords p { text-indent: 0; }
+
+  .rule { border: none; border-top: 0.6pt solid #999; margin: 1.2em 0 1.1em 0; }
+
+  /* ---------- body columns ---------- */
+  .body2col {
+    column-count: 2;
+    column-gap: 7mm;
+    column-fill: auto;
+  }
+
+  h2.sec {
+    font-size: 10pt;
+    font-weight: bold;
+    margin: 1.15em 0 0.4em 0;
+    break-after: avoid;
+    text-align: left;
+  }
+  h2.sec:first-child { margin-top: 0; }
+  h3.sub {
+    font-size: 9.4pt;
+    font-weight: bold;
+    font-style: italic;
+    margin: 0.85em 0 0.3em 0;
+    break-after: avoid;
+    text-align: left;
+  }
+
+  p { margin: 0 0 0.45em 0; text-indent: 1.1em; }
+  p.noind, h2 + p, h3 + p, .eq + p { text-indent: 0; }
+
+  em.v { font-style: italic; }
+  .mono { font-family: "DejaVu Sans Mono", monospace; font-size: 8.4pt; }
+
+  /* ---------- equations ---------- */
+  .eq {
+    display: table;
+    width: 100%;
+    margin: 0.6em 0 0.65em 0;
+    break-inside: avoid;
+  }
+  .eq > .body-cell {
+    display: table-cell;
+    text-align: center;
+    vertical-align: middle;
+    font-size: 9.6pt;
+  }
+  .eq > .num {
+    display: table-cell;
+    width: 2.6em;
+    text-align: right;
+    vertical-align: middle;
+    font-size: 9pt;
+    white-space: nowrap;
+  }
+  .eq i { font-style: italic; }
+
+  /* ---------- tables ---------- */
+  figure.tbl {
+    margin: 0.8em 0 0.9em 0;
+    break-inside: avoid;
+  }
+  figure.wide {
+    column-span: all;
+    margin: 0.9em 0 1.0em 0;
+  }
+  figcaption {
+    font-size: 8.3pt;
+    line-height: 1.35;
+    margin-bottom: 0.4em;
+    text-align: left;
+  }
+  figcaption .lbl { font-variant: small-caps; letter-spacing: 0.4px; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 8.4pt;
+  }
+  th, td {
+    padding: 2.2pt 3.5pt;
+    text-align: right;
+    border: none;
+  }
+  th:first-child, td:first-child { text-align: left; }
+  thead th {
+    border-top: 0.9pt solid #222;
+    border-bottom: 0.5pt solid #555;
+    font-weight: bold;
+  }
+  tbody tr:last-child td { border-bottom: 0.9pt solid #222; }
+  tbody tr.grp td { border-top: 0.4pt solid #bbb; }
+  td.note, th.note { font-size: 8pt; color: #333; }
+  #t3 td:nth-child(2), #t3 th:nth-child(2) { text-align: left; }
+  .tbl-foot { font-size: 7.9pt; color: #333; margin-top: 0.35em; line-height: 1.3; }
+
+  /* ---------- callout ---------- */
+  .claimbox {
+    border-left: 2.2pt solid #555;
+    padding: 0.45em 0 0.45em 0.7em;
+    margin: 0.7em 0;
+    font-size: 9pt;
+    break-inside: avoid;
+  }
+  .claimbox p { text-indent: 0; margin: 0; }
+
+  .pending {
+    border: 0.7pt solid #777;
+    padding: 0.5em 0.65em;
+    margin: 0.75em 0;
+    font-size: 8.8pt;
+    break-inside: avoid;
+  }
+  .pending p { text-indent: 0; margin: 0; }
+  .pending strong { letter-spacing: 0.2px; }
+
+  ol.refs { padding-left: 1.4em; margin: 0.2em 0 0 0; font-size: 8.2pt; line-height: 1.26; }
+  ol.refs li { margin-bottom: 0.26em; text-align: left; }
+
+  ul.tight { margin: 0.3em 0 0.5em 0; padding-left: 1.1em; }
+  ul.tight li { margin-bottom: 0.25em; }
+  ol.tight { margin: 0.3em 0 0.5em 0; padding-left: 1.3em; }
+  ol.tight li { margin-bottom: 0.25em; }
+</style>
+</head>
+<body>
+
+<div class="front">
+  <h1 class="title">Covariance as an Observed Quantity:<br>Sensor Redundancy Replaces Motion-Capture Supervision<br>in a Two-Stage Legged State Estimator</h1>
+
+  <p class="authors">Author One, Author Two, Author Three</p>
+  <p class="affil">[Author block placeholder &mdash; affiliations and contact details to be supplied]</p>
+  <p class="datenote">Preprint draft. Closed-loop validation in Section 9; limitations in Section 10.</p>
+
+  <div class="abstract">
+    <h2>Abstract</h2>
+    <p class="noind">Legged state estimators are routinely tuned with a single, hand-chosen measurement covariance per channel, and a recent line of work replaces that constant with a covariance learned by backpropagation through a differentiable filter, supervised by motion capture. We report a measurement, on a real humanoid treadmill-walking log, that makes the constant untenable: the average normalised innovation squared (ANIS) of the joint-level IMU-pair channel moves from a ratio of 0.56 of its degrees of freedom at rest to 266 during walking, a spread of 475&times; within a single log under a single filter configuration. No scalar can serve both regimes.</p>
+    <p>We then argue that on a robot carrying a <em>distributed</em> IMU array this covariance need not be learned at all, because it is directly observable. An IMU pair spanning a <i>k</i>-DoF chain produces a differential angular rate &Omega; that, under the rigid-link assumption the pair measurement rests on, is confined to a <i>k</i>-dimensional subspace. The remaining 3 &minus; <i>k</i> directions carry no joint information and are therefore a per-tick, online observation of exactly the model violation that corrupts the informative component. We propose driving the pair measurement noise from this off-axis residual, <i>R</i><sub>pair</sub>(<i>t</i>) = <i>R</i><sub>0</sub>&middot;<i>g</i>(&#8214;<i>P</i><sub>&perp;</sub>&Omega;(<i>t</i>)&#8214;), and present correlational evidence: splitting the walking window by off-axis residual separates the on-axis channel's own NIS by 9&times;&ndash;49&times; on every 1-DoF pair. The decisive signature is dimensional. The two 2-DoF pairs, which retain only one redundant direction instead of two, show by far the weakest effect (3.4&times; and 5.7&times;) &mdash; an ordering the redundancy mechanism predicts <i>a priori</i> from a dimension count and that a generic &ldquo;noise rises with activity&rdquo; account does not produce.</p>
+    <p>We position this against CoCo-InEKF, which learns a contact covariance from motion-capture-derived ground truth on a platform with a single base IMU. The distinction is structural rather than methodological: where there is no redundancy the disturbance is latent and a learned predictor is the only route; where there is redundancy the disturbance is measured, and no training set is required. Closing the loop, we drive <i>R</i><sub>pair</sub> from the off-axis residual and evaluate on held-out windows never used for fitting. Against a <em>matched constant-inflation control</em> &mdash; refitted honestly to the same target on the same window &mdash; the constant makes the cross-regime spread <em>worse</em> than the untouched baseline (1206&times; against 475&times;), while the adaptive form collapses it to 14.7&times;. The result is portability across regimes, not a smaller number: inflation alone lowers ANIS trivially, and on one held-out window the control is in fact closer to unity. The adaptive form does not reach its target either (92.7 against dof 27 on the most violent window), and a circularity in driving <i>R</i> from the current tick's own measurement remains a live threat to the interpretation.</p>
+  </div>
+
+  <div class="keywords">
+    <h2>Keywords</h2>
+    <p class="noind">State estimation &middot; invariant EKF &middot; legged robots &middot; distributed IMU arrays &middot; adaptive measurement covariance &middot; filter consistency &middot; NIS</p>
+  </div>
+
+  <hr class="rule">
+</div>
+
+<div class="body2col">
+
+<h2 class="sec">1. Introduction</h2>
+
+<p class="noind">A Kalman filter is only as good as the covariances it is given. In legged state estimation the process noise is usually defensible on physical grounds, but the measurement noise <i>R</i> is almost always a hand-tuned constant per channel, chosen once, on a bench or in a benign regime, and then held fixed across everything the robot subsequently does. The practice survives because the consequences are diffuse: an overconfident <i>R</i> does not make the filter diverge visibly so much as make it stiff, and a conservative <i>R</i> merely wastes information. Both are invisible without a consistency check.</p>
+
+<p>Recent work has attacked this directly by making the filter differentiable and <em>learning</em> the covariance. CoCo-InEKF [1] trains a contact-velocity covariance by backpropagation through time through an invariant EKF, supervised by ground truth obtained from motion capture fused through a separate classical estimator. The result is a covariance that varies with the situation rather than a constant &mdash; a clear improvement over a tuned scalar, and the approach is not in dispute here.</p>
+
+<p>This paper makes a different observation. On a robot whose sensing is <em>redundant</em> &mdash; specifically, a humanoid carrying a distributed array of IMUs placed across the kinematic tree rather than a single unit on the base &mdash; the quantity a learned predictor is trying to recover is not latent at all. It is measured, every tick, by the redundant degrees of freedom of the array itself. Covariance becomes an observed quantity rather than a predicted one, and the motion-capture training set that supervises the predictor becomes unnecessary for <em>obtaining</em> the covariance.</p>
+
+<p>The argument proceeds in three movements. First (Sections 3&ndash;4) we establish by measurement that the problem is real and is not small: a consistency audit of our estimator on a real walking log finds the joint-level IMU-pair channel spanning a 475&times; range between rest and walking, with a diagnostic signature that rules out the obvious explanations. Second (Section 5) we show that the disturbance responsible is geometrically observable, and give the projector that extracts it. Third (Sections 6&ndash;8) we present the correlational evidence already in hand, including a dimensional signature that we did not predict in advance, and set out precisely what does and does not follow for motion-capture supervision.</p>
+
+<p>Section 9 closes the loop and Section 10 is a limitations section in earnest. We demonstrate that the disturbance is measurable, that the measurement tracks the error it is meant to explain, and that driving the covariance from it makes the channel <em>portable across regimes</em> in a way a refitted constant is not. What we do not demonstrate is a filter that reaches its consistency target: the adaptive form ends 3.4&times; overconfident on the most violent held-out window, and the strongest objection to the result &mdash; that <i>R</i> is correlated with the very innovation it weights &mdash; is not fully answered by our control.</p>
+
+<h2 class="sec">2. The Estimator</h2>
+
+<p class="noind">The estimator under study is two-stage. Stage 1 is a joint-level Kalman filter; stage 2 is a contact-aided right-invariant EKF on a matrix Lie group. The staging matters to the argument, because the redundancy that this paper exploits lives entirely in stage 1, while the consistency symptoms are read at both stages.</p>
+
+<h3 class="sub">2.1 Stage 1: the joint-level filter</h3>
+
+<p class="noind">The robot carries IMUs distributed across its links. Each ordered pair of IMUs spanning one or more joints, together with the encoders of the joints between them, is fused into a filtered estimate of those joints' positions and rates, with an associated covariance &Sigma;<sub><i>q</i></sub>. The mechanism of the pair measurement is the differential angular rate. Writing &omega;<sub>p</sub> and &omega;<sub>c</sub> for the parent- and child-side gyro readings expressed in a common frame,</p>
+
+<div class="eq">
+  <span class="body-cell">&Omega; = &omega;<sub>c</sub> &minus; &omega;<sub>p</sub>,</span>
+  <span class="num">(1)</span>
+</div>
+
+<p class="noind">and for a chain of revolute joints with axes <i>a</i><sub>1</sub>, &hellip;, <i>a</i><sub><i>k</i></sub> connecting the two mounting links, a rigid connection implies</p>
+
+<div class="eq">
+  <span class="body-cell">&Omega; = &sum;<sub><i>j</i></sub> <i>q̇</i><sub><i>j</i></sub> <i>a</i><sub><i>j</i></sub> &nbsp;&isin;&nbsp; span{<i>a</i><sub>1</sub>, &hellip;, <i>a</i><sub><i>k</i></sub>}.</span>
+  <span class="num">(2)</span>
+</div>
+
+<p class="noind">In the single-joint case this collapses to &Omega; = <i>q̇a</i>: the differential rate must lie <em>along the joint axis</em>. Equation (2) is the entire content of the pair measurement, and it is also, as Section 5 develops, the entire content of the proposal.</p>
+
+<h3 class="sub">2.2 Stage 2: the contact-aided invariant EKF</h3>
+
+<p class="noind">Stage 2 is a right-invariant EKF on SE<sub><i>k</i></sub>(3). The state <i>X</i> carries the base attitude <i>R</i>, velocity <i>v</i>, position <i>p</i>, and the world positions <i>d</i><sub><i>i</i></sub> of a fixed set of contact anchors. The estimation error is defined <em>on the group</em>,</p>
+
+<div class="eq">
+  <span class="body-cell"><i>X̂</i> = exp(&xi;) &middot; <i>X</i>,<br>&xi; = [&delta;&phi;; &delta;<i>v</i>; &delta;<i>p</i>; &delta;<i>p</i><sub><i>c</i>0</sub>; &hellip;],</span>
+  <span class="num">(3)</span>
+</div>
+
+<p class="noind">with the tangent ordering as shown. The payoff of the invariant formulation is the standard one and is worth stating precisely because it bears on what a covariance means in this filter: the Jacobians do not depend on the state estimate [2], [3]. The linearisation is therefore not a function of how wrong the filter currently is, and a consistency failure cannot be blamed on a state-dependent Jacobian drifting with the estimate. Whatever inconsistency we measure is attributable to the noise models, not to the geometry of the update.</p>
+
+<p>The contact measurement compares forward kinematics against the anchor held in the state. With <i>y</i> the body-frame vector from the base to the contact point, supplied by forward kinematics from the stage-1 joint estimates,</p>
+
+<div class="eq">
+  <span class="body-cell"><i>r</i> = <i>R̂y</i> &minus; (<i>d̂</i><sub><i>i</i></sub> &minus; <i>p̂</i>).</span>
+  <span class="num">(4)</span>
+</div>
+
+<p class="noind">A design choice of this estimator that matters for interpreting the diagnostics below: <em>contacts are never added to or removed from the state</em>. All candidate contact points live in the state permanently, and contact is expressed purely through the magnitude and anisotropy of each anchor's process noise &Sigma;<sub><i>Ci</i></sub> &mdash; a foot in firm contact gets a small, near-isotropic anchor noise; a swinging foot gets a large one. This avoids the state-dimension bookkeeping of add/remove schemes and, more importantly here, means there are no discrete structural events to confound a consistency audit across a gait cycle.</p>
+
+<p>The usual observability structure holds: global position and yaw are unobservable, while velocity, roll and pitch are observable. Consistency claims in this paper concern the innovation statistics of the measurement channels, which are well defined regardless.</p>
+
+<h3 class="sub">2.3 The coupling between the stages</h3>
+
+<p class="noind">Stage 1 enters stage 2 through the contact measurement noise. The joint covariance is mapped through the contact Jacobian <i>J</i>:</p>
+
+<div class="eq">
+  <span class="body-cell"><i>N</i> = <i>J</i> &Sigma;<sub><i>q</i></sub> <i>J</i><sup>ᵀ</sup>.</span>
+  <span class="num">(5)</span>
+</div>
+
+<p class="noind">This is the load-bearing link for the whole paper. &Sigma;<sub><i>q</i></sub> is not an internal quantity of a preprocessing step; it is the thing that tells the invariant filter how much to trust its kinematic contact constraint. An error in the pair noise model propagates through (5) into the pose filter directly. Consequently, getting the pair noise right is not a matter of tidiness in stage 1 &mdash; it sets the credibility of stage 2's contact update.</p>
+
+<h2 class="sec">3. Consistency Methodology</h2>
+
+<p class="noind">We audit the filter with the normalised innovation squared,</p>
+
+<div class="eq">
+  <span class="body-cell">NIS = &nu;<sup>ᵀ</sup> <i>S</i><sup>&minus;1</sup> &nu;,&nbsp;&nbsp; <i>S</i> = <i>HPH</i><sup>ᵀ</sup> + <i>R</i>,</span>
+  <span class="num">(6)</span>
+</div>
+
+<p class="noind">where &nu; is the innovation of a channel. For a consistent filter the expectation of (6) equals the channel's degrees of freedom [4]. We therefore report the <em>average</em> NIS (ANIS) over a window and, alongside it, the ratio ANIS / dof. A ratio near 1 is consistent; a ratio much greater than 1 means the filter is <em>overconfident</em> &mdash; its innovations are far larger than the covariance it advertises; a ratio much below 1 means it is <em>conservative</em>, discarding information it could have used.</p>
+
+<p>The virtue of this instrument for the present argument is that it requires no ground truth whatsoever. It is computed entirely from quantities internal to the filter. This becomes the point again in Section 8, when we ask what residual calibration the proposed method still needs.</p>
+
+<p>All figures below come from a single real log recorded on 2026-07-17 during treadmill walking on a humanoid carrying a distributed IMU array. Two windows of 3600 ticks each were extracted: one standing, one walking. Both were processed by the <em>same</em> filter, with the <em>same</em> hand-tuned noise parameters and the <em>same</em> supplied accelerometer bias. Nothing about the filter differs between the two columns of Table 1; only the robot's behaviour does.</p>
+
+<h2 class="sec">4. The Measured Problem</h2>
+
+<p class="noind">Table 1 gives the audit.</p>
+
+<figure class="tbl wide">
+  <figcaption><span class="lbl">Table 1.</span> Average NIS by channel, standing versus walking, on the 2026-07-17 treadmill log. Same filter, same tuned noise, same supplied accelerometer bias in both windows; 3600 ticks each. Ratio is ANIS / dof, where 1.0 is consistent. The standing entries marked &dagger; are degenerate (Section 4.1).</figcaption>
+  <table>
+    <thead>
+      <tr>
+        <th>Channel</th>
+        <th>dof</th>
+        <th>ANIS standing</th>
+        <th>ANIS walking</th>
+        <th>Walking ratio</th>
+        <th class="note">Reading</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>encoder</td><td>9</td><td>0.004 &dagger;</td><td>38.7</td><td>4.30</td><td class="note">overconfident</td></tr>
+      <tr><td>contact</td><td>6</td><td>0.000 &dagger;</td><td>0.479</td><td>0.08</td><td class="note">conservative</td></tr>
+      <tr><td>gravity</td><td>3</td><td>0.000 &dagger;</td><td>0.527</td><td>0.18</td><td class="note">conservative</td></tr>
+      <tr class="grp"><td><strong>stacked</strong> (IMU pairs)</td><td><strong>27</strong></td><td><strong>15.2</strong> (ratio 0.56)</td><td><strong>7183</strong></td><td><strong>266</strong></td><td class="note"><strong>overconfident</strong></td></tr>
+    </tbody>
+  </table>
+  <p class="tbl-foot">&dagger; Degenerate at rest: with no contact transitions and no motion, these channels carry essentially no innovation signal, so their standing ratios are uninformative and no rest-to-walk spread should be inferred from them. The <span class="mono">stacked</span> row is the exception &mdash; both of its readings are informative &mdash; and it alone supports a measured spread: 0.56 &rarr; 266, a factor of <strong>475&times;</strong>.</p>
+</figure>
+
+<h3 class="sub">4.1 What the table does and does not show</h3>
+
+<p class="noind">We are deliberate about the caveat, because it is the kind of thing that turns a measurement into an artifact if left unstated. Three of the four channels read essentially zero while the robot stands. That is not a filter achievement. It is an absence of events: no contact transitions occur, nothing moves, the encoder innovations are quiescent, and the gravity channel sees an unchanging vector. Their standing ratios are therefore degenerate and carry no information about how much the noise model would have to stretch to cover both regimes. Any rest-to-walk ratio computed from those rows would be an artifact of the denominator.</p>
+
+<p>The <span class="mono">stacked</span> channel &mdash; the 27-dimensional stack of the built IMU-pair measurements &mdash; is qualitatively different. At rest it reads 15.2 against 27 degrees of freedom, a ratio of 0.56: not zero, not degenerate, an informative and in fact mildly conservative reading. That is a plausible standing tune. In the walking window the same channel with the same <i>R</i> reads 7183, a ratio of 266.</p>
+
+<div class="claimbox">
+  <p>A single tuned constant is being asked to serve a regime in which the correct value differs by a factor of roughly <strong>475</strong>. It cannot, and no choice of constant can. Tuned for standing, it is 266&times; overconfident in walking; tuned for walking, it throws away almost all of the pair information at rest.</p>
+</div>
+
+<p>We stress that this is not a claim that the filter was badly tuned. It is a claim that the <em>form</em> of the model &mdash; one number per channel &mdash; is inadequate to the measured dynamic range.</p>
+
+<h3 class="sub">4.2 Diagnostics: what is driving it</h3>
+
+<p class="noind">Four diagnostics narrow the cause. Together they eliminate the readings a reader would reasonably reach for first.</p>
+
+<p><em>It is not one bad sensor.</em> Every one of the seven built pairs degrades in the walking window, by factors ranging from 71&times; to 744&times;. Each is individually well behaved at rest, with per-row standing ANIS between 0.1 and 3.7. There is no single failing IMU, no single mis-mounted pair; the effect is distributed across the array, which points at a mechanism common to all of them.</p>
+
+<p><em>It is not simply joint speed.</em> This is the explanation the measurement's own structure suggests &mdash; the pair measurement is a rate measurement, so faster joints ought to mean larger errors &mdash; and it is wrong. Partitioning the walking window by joint speed, the <em>slow</em> quartile carries the higher NIS (10014) and the <em>fast</em> quartile the lower (1759). The correlation of NIS with joint speed is &minus;0.21: weakly <em>negative</em>. Whatever is corrupting the measurement is not proportional to how fast the joint is turning.</p>
+
+<p><em>Contact transitions concentrate it but do not account for it.</em> Windows of &plusmn;80 ms around a contact transition make up 13% of ticks but carry 44% of the total NIS mass &mdash; an elevation of 5.3&times;, confirming that impacts matter. But excising those windows entirely leaves the channel still roughly 170&times; overconfident. Impact is a strong contributor and not the explanation.</p>
+
+<p><em>It tracks linear acceleration and shock, not rotation rate.</em> Table 2 gives the correlation of per-tick NIS against candidate features on the walking window, computed on the right shin IMU. The ranking is unambiguous.</p>
+
+<figure class="tbl">
+  <figcaption><span class="lbl">Table 2.</span> Correlation of <span class="mono">stacked</span> NIS with candidate features, walking window, right shin IMU.</figcaption>
+  <table>
+    <thead>
+      <tr><th>Feature</th><th>Correlation</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>&#8214;<i>a</i>&#8214; &minus; <i>g</i> (specific force excess)</td><td><strong>0.688</strong></td></tr>
+      <tr><td>&#8214;<i>a</i>&#8214; jerk</td><td>0.614</td></tr>
+      <tr><td>&#8214;gyro&#8214; rate of change</td><td>0.589</td></tr>
+      <tr><td>&#8214;gyro&#8214;</td><td>&minus;0.103</td></tr>
+      <tr><td>joint speed</td><td>&minus;0.208</td></tr>
+    </tbody>
+  </table>
+  <p class="tbl-foot">Quartile split on the leading feature &#8214;<i>a</i>&#8214; &minus; <i>g</i>: low quartile NIS 1195, high quartile 20601, a separation of 17.2&times;.</p>
+</figure>
+
+<p>The three leading features are all measures of linear acceleration or of abrupt change &mdash; specific force excess, jerk, and angular acceleration. The two features that describe how much the robot is <em>rotating</em>, gyro magnitude and joint speed, are essentially uncorrelated or slightly negative. Splitting the window on the leading feature separates NIS by 17.2&times;.</p>
+
+<h3 class="sub">4.3 The physical reading</h3>
+
+<p class="noind">Acceleration and shock, not rotation rate, drive the noise. The natural physical account is structural: impacts and high specific force flex the link and excite vibration in it, and a flexing link is precisely a link on which two IMUs are no longer rigidly connected. The pair measurement (2) rests entirely on that rigid connection. When the link deforms, &Omega; acquires a component that no joint rate produced, and the measurement is corrupted in exactly the way the data shows &mdash; strongly at impact, strongly under high specific force, indifferent to how fast the joint is turning.</p>
+
+<p>This reading has a consequence that is not obvious, and it is the pivot of the paper: <em>if the corruption is a rigidity violation, then the array can see it.</em></p>
+
+<h2 class="sec">5. Redundancy Observes the Model Violation</h2>
+
+<h3 class="sub">5.1 The off-axis projector</h3>
+
+<p class="noind">Take the simplest and most common case, a pair spanning a single revolute joint with unit axis <i>a</i>. Equation (2) says that under a rigid connection the differential rate satisfies &Omega; = <i>q̇a</i>: a three-dimensional measured vector constrained to a one-dimensional subspace. Two dimensions are left over.</p>
+
+<p>Define the orthogonal projector onto that leftover subspace,</p>
+
+<div class="eq">
+  <span class="body-cell"><i>P</i><sub>&perp;</sub> = <i>I</i> &minus; <i>aa</i><sup>ᵀ</sup>,</span>
+  <span class="num">(7)</span>
+</div>
+
+<p class="noind">and consider the two components of the measurement separately:</p>
+
+<div class="eq">
+  <span class="body-cell"><i>a</i><sup>ᵀ</sup>&Omega; &nbsp;(on-axis),<br><i>P</i><sub>&perp;</sub>&Omega; &nbsp;(off-axis).</span>
+  <span class="num">(8)</span>
+</div>
+
+<p class="noind">The on-axis component is the joint rate; it is what the filter consumes. The off-axis component, under the model, is identically zero. It carries <em>no joint information whatsoever</em>. Anything that appears there is, by construction, model violation &mdash; link flex, vibration, mount compliance, and the other departures from rigidity that Section 4.3 identified as the driver.</p>
+
+<p>The critical point is that this is not merely <em>a</em> diagnostic of model violation. It is a diagnostic of <em>the same</em> model violation that corrupts the on-axis component. A deformation of the link perturbs &Omega; as a vector; the filter sees its projection onto <i>a</i> and is fooled, while its projection onto the orthogonal complement sits unused and visible. The redundant directions are a free, per-tick, online observation of the disturbance that is contaminating the directions being used.</p>
+
+<h3 class="sub">5.2 The proposed noise model</h3>
+
+<p class="noind">This suggests a measurement noise that is read off the sensors rather than tuned or trained:</p>
+
+<div class="eq">
+  <span class="body-cell"><i>R</i><sub>pair</sub>(<i>t</i>) = <i>R</i><sub>0</sub> &middot; <i>g</i>(&#8214;<i>P</i><sub>&perp;</sub>&Omega;<sub>fast</sub>(<i>t</i>)&#8214;),</span>
+  <span class="num">(9)</span>
+</div>
+
+<p class="noind">with <i>g</i> monotonically increasing and <i>g</i> &rarr; 1 as the off-axis residual vanishes, so that a perfectly rigid instant recovers the nominal tuned noise <i>R</i><sub>0</sub>. The subscript &ldquo;fast&rdquo; denotes a high-pass-filtered off-axis residual, for reasons taken up in Section 9: the raw residual also contains slowly varying terms that are <em>not</em> noise signals.</p>
+
+<p>What makes (9) different in kind from a tuned or a trained <i>R</i> is that its argument is a measurement taken at time <i>t</i>. There is no predictor mapping context to a covariance; there is a sensor reading of the disturbance itself.</p>
+
+<h3 class="sub">5.3 The dimension count, and where the method runs out</h3>
+
+<p class="noind">The construction generalises immediately and, in generalising, predicts its own failure mode. For a pair spanning a <i>k</i>-DoF chain, (2) confines &Omega; to a <i>k</i>-dimensional subspace, leaving</p>
+
+<div class="eq">
+  <span class="body-cell">dim(redundant subspace) = 3 &minus; <i>k</i></span>
+  <span class="num">(10)</span>
+</div>
+
+<p class="noind">directions of observable model violation. At <i>k</i> = 1 there are two; at <i>k</i> = 2 there is one; at <i>k</i> = 3 there are none, the measurement is dimensionally saturated, and the disturbance becomes completely latent &mdash; indistinguishable from a legitimate joint rate.</p>
+
+<p>Two things follow. Practically: the method is strong across 1-DoF spans, weaker across 2-DoF spans, and simply unavailable across 3-DoF spans such as a ball joint or an unsegmented spherical hip. Sensor placement is therefore a design variable, and placing IMUs so that pairs span few joints is not merely convenient but is what makes the disturbance observable at all.</p>
+
+<p>Scientifically, and more usefully: (10) is a falsifiable prediction. If the mechanism is real, the strength of the relationship between off-axis residual and on-axis error must be <em>ordered by chain DoF</em>, with 1-DoF pairs clearly stronger than 2-DoF pairs. A generic account &mdash; &ldquo;the noise goes up when the robot is active, and the off-axis residual also goes up when the robot is active&rdquo; &mdash; makes no such prediction, because activity does not know about the dimension of a joint chain. Section 6 tests exactly this.</p>
+
+<h2 class="sec">6. Correlational Validation</h2>
+
+<p class="noind">We test the mechanism without yet closing the loop. On the walking window, for each pair, we split the ticks by the magnitude of the off-axis residual &#8214;<i>P</i><sub>&perp;</sub>&Omega;&#8214; into quartiles, and report the ANIS of the <em>on-axis</em> row &mdash; the row the filter actually uses &mdash; in the bottom and top quartiles. If the off-axis residual observes the disturbance corrupting the on-axis row, these must separate. Table 3 gives the result.</p>
+
+<figure class="tbl wide" id="t3">
+  <figcaption><span class="lbl">Table 3.</span> On-axis row ANIS in the bottom versus top quartile of off-axis residual magnitude, walking window. Rows are grouped by the DoF of the chain the pair spans. The grouping was <em>not</em> imposed in advance; it emerged when the per-pair breakdown was computed.</figcaption>
+  <table>
+    <thead>
+      <tr>
+        <th>Pair</th>
+        <th class="note">Chain spanned</th>
+        <th>Chain DoF</th>
+        <th>Redundant dim (3&minus;<i>k</i>)</th>
+        <th>On-axis ANIS, low off-axis</th>
+        <th>On-axis ANIS, high off-axis</th>
+        <th>Separation</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>0</td><td class="note">pelvis &rarr; torso</td><td>1</td><td>2</td><td>15.8</td><td>171.4</td><td><strong>10.9&times;</strong></td></tr>
+      <tr><td>1</td><td class="note">pelvis &rarr; left_hip_x</td><td>1</td><td>2</td><td>63.0</td><td>570.0</td><td><strong>9.1&times;</strong></td></tr>
+      <tr><td>3</td><td class="note">left_thigh &rarr; left_shin</td><td>1</td><td>2</td><td>13.7</td><td>399.3</td><td><strong>29.1&times;</strong></td></tr>
+      <tr><td>4</td><td class="note">pelvis &rarr; right_hip_x</td><td>1</td><td>2</td><td>25.3</td><td>808.0</td><td><strong>32.0&times;</strong></td></tr>
+      <tr><td>6</td><td class="note">right_thigh &rarr; right_shin</td><td>1</td><td>2</td><td>45.8</td><td>2224.5</td><td><strong>48.5&times;</strong></td></tr>
+      <tr class="grp"><td>2</td><td class="note">left_hip_x &rarr; left_thigh</td><td>2</td><td>1</td><td>1.0</td><td>5.9</td><td>5.7&times;</td></tr>
+      <tr><td>5</td><td class="note">right_hip_x &rarr; right_thigh</td><td>2</td><td>1</td><td>0.7</td><td>2.3</td><td>3.4&times;</td></tr>
+    </tbody>
+  </table>
+  <p class="tbl-foot">Log-log correlation between off-axis residual and on-axis NIS ranges from 0.19 to 0.62 across pairs, with most falling between 0.4 and 0.6.</p>
+</figure>
+
+<h3 class="sub">6.1 The separation is present on every pair</h3>
+
+<p class="noind">Every pair separates in the predicted direction: high off-axis residual coincides with high on-axis innovation. The effect is not marginal on the 1-DoF pairs &mdash; the smallest is 9.1&times; and the largest 48.5&times; &mdash; and the log-log correlations, 0.19 to 0.62 with most in the 0.4&ndash;0.6 band, are substantial for a single online scalar predicting a per-tick squared error.</p>
+
+<p>Taken alone, however, this would be weak evidence. A sceptic's reading is available and is entirely reasonable: the robot is more violently active at some moments than others; both the off-axis residual and the on-axis error rise when it is, and the correlation is an artifact of a common activity driver rather than evidence of any specific geometric mechanism. Nothing in the seven separation factors, considered as a set of seven numbers, refutes that.</p>
+
+<h3 class="sub">6.2 The dimensional signature</h3>
+
+<p class="noind">What refutes it is the grouping. The five 1-DoF pairs, which retain two redundant directions each, land between 9.1&times; and 48.5&times;. The two 2-DoF pairs, which retain one redundant direction, land at 5.7&times; and 3.4&times; &mdash; below every 1-DoF pair, and by a clear margin rather than a marginal one. The ordering predicted by the dimension count (10) is exactly the ordering observed, with no overlap between the groups.</p>
+
+<div class="claimbox">
+  <p>The common-activity account does not predict this. Activity is a property of the robot's motion, not of the dimension of a joint chain; a hip and a knee experience the same gait. Only an explanation in which the off-axis subspace is <em>doing the observing</em> predicts that halving the dimension of that subspace should weaken the observation.</p>
+</div>
+
+<p>We report one further point of methodological honesty. This separation was not predicted before the per-pair breakdown was computed. The dimensional argument of Section 5.3 is the natural reading of the geometry and could have been written down in advance, but it was not; the grouping emerged from the data when the pairs were listed with their chains. We consider this to strengthen rather than weaken the result, for the ordinary reason: a pattern that falls out of the data and turns out to match what the mechanism requires is evidence, whereas a pattern constructed after choosing the story it should tell is not. We flag it explicitly so that readers can weigh it as they see fit, and note that it is the kind of prediction that a second robot or a second gait would test cleanly.</p>
+
+<h2 class="sec">7. Relation to CoCo-InEKF</h2>
+
+<p class="noind">The nearest prior work is CoCo-InEKF [1], a differentiable invariant EKF whose contact covariance is learned by backpropagation through time. Its ground truth comes from motion capture fused through a separate classical InEKF; the platform is Lima, a 16.2 kg, 0.84 m legged robot; the learned quantity is the contact velocity covariance; and the sensing is a single base IMU plus joint encoders, with no distributed IMU array and no joint-level filtering stage.</p>
+
+<h3 class="sub">7.1 What is not claimed</h3>
+
+<p class="noind">We do not claim novelty for learning a covariance, for differentiable filtering, or for backpropagation through time through a filter. Those contributions belong to [1] and to the differentiable-filtering literature it sits in, and the present work does not improve on them or compete with them on their own terms. Nor do we claim a comparison: no head-to-head experiment has been run, the platforms differ, and the estimated quantities differ.</p>
+
+<h3 class="sub">7.2 The distinction is structural</h3>
+
+<p class="noind">The difference is in where the covariance comes from, and it follows from the sensing hardware rather than from an algorithmic preference.</p>
+
+<p>CoCo-InEKF computes a covariance as a learned function of features: &Sigma; = <i>f</i><sub>&theta;</sub>(features), with &theta; fitted offline against motion-capture-derived truth. On a platform with a single base IMU this is not a choice among alternatives &mdash; it is the only route available. There is no redundant measurement of the disturbance, because a single IMU produces no over-determined quantity to compare against a model. The disturbance is latent, and a predictor trained on external truth is the correct response to a latent quantity.</p>
+
+<p>The method proposed here computes &Sigma; = <i>h</i>(<i>P</i><sub>&perp;</sub>&Omega;), where <i>P</i><sub>&perp;</sub>&Omega; is a reading taken from the sensors at the current tick. There is no predictor, no parameter vector &theta; fitted to data, and no training set. The reason this option exists is the array: redundancy makes the disturbance manifest.</p>
+
+<p>Three consequences follow:</p>
+
+<ul class="tight">
+  <li><em>No motion capture is required to obtain the covariance.</em> The quantity that supervision would have supplied is read directly.</li>
+  <li><em>Adaptation to unseen conditions is automatic.</em> A new gait, a new speed, or a different terrain changes the disturbance, and the off-axis residual changes with it, because it is a measurement of the present instant rather than an interpolation over a training distribution. A learned <i>f</i><sub>&theta;</sub> must extrapolate; a measurement has nothing to extrapolate from.</li>
+  <li><em>A redundant array is required.</em> This is the cost, and it is a real one: it is hardware, calibration and wiring that a single-IMU platform does not carry, and it is unavailable wherever (10) gives zero redundant directions.</li>
+</ul>
+
+<h3 class="sub">7.3 Complementary, not competing</h3>
+
+<p class="noind">The honest framing is that the two occupy different regimes of the same problem. CoCo-InEKF learns a <em>contact</em> covariance on a platform where no redundancy exists; the present method measures a <em>joint</em> covariance where redundancy does. On a robot with both a distributed array and a single-IMU contact channel, both would apply, to different channels. Nothing here argues that learned covariance is the wrong tool; the argument is narrower and more specific &mdash; that where redundancy is present, learning is solving a problem that the geometry has already solved.</p>
+
+<h2 class="sec">8. Why Mocap-Supervised Matrices Become Unnecessary</h2>
+
+<p class="noind">We set this out as an argument in steps rather than as an assertion, because it is the paper's main claim and the steps are separable.</p>
+
+<ol class="tight">
+  <li><em>What a learned predictor is recovering.</em> A covariance predictor trained against ground truth is, functionally, estimating the magnitude of the disturbance that the nominal model fails to account for. That is what makes the innovations larger than <i>R</i><sub>0</sub> predicts, and reproducing it is what the training loss rewards.</li>
+  <li><em>On a redundant array, that quantity is directly observable.</em> Section 5 gives the construction: the off-axis component of &Omega; is, by the measurement model's own algebra, pure model violation, and Section 6 shows it tracks the on-axis error it is supposed to track.</li>
+  <li><em>Therefore the predictor is estimating something already measured.</em> Its training set is needed only to learn a map from exogenous features to a quantity that the geometry hands over for free. Where redundancy exists, mocap supervision buys an indirect estimate of an available measurement.</li>
+</ol>
+
+<p>Two practical arguments reinforce the structural one.</p>
+
+<p><em>A constant cannot span the measured range.</em> Whatever value is chosen for a fixed <i>R</i>, the 475&times; spread of Section 4 defeats it. This is not an argument against learned covariance &mdash; a learned <i>function</i> is precisely the response to it &mdash; but it does close off the option of tuning harder.</p>
+
+<p><em>Generalisation is asymmetric.</em> A learned <i>f</i><sub>&theta;</sub>(features) must generalise from a training distribution to whatever the robot encounters, and that is a genuine burden: a gait, speed or surface outside the training set can place the predictor anywhere. A measurement carries no such burden, because it does not interpolate. Whatever the surface does to the link, the off-axis residual reports it.</p>
+
+<h3 class="sub">8.1 The residual calibration, stated honestly</h3>
+
+<p class="noind">The method does not eliminate free parameters. Equation (9) contains a map <i>g</i> from a residual magnitude to a noise multiplier, and that map has scale parameters that must be set: how much off-axis residual corresponds to how much inflation, the cut-off of the high-pass, the shape of <i>g</i>. To claim otherwise would be false.</p>
+
+<p>The point is what those parameters can be fitted <em>against</em>. They can be fitted on NIS, which by (6) is computed entirely from quantities internal to the filter and requires no ground truth. Fitting a small number of scalars against a self-contained consistency criterion is a materially weaker requirement than assembling a mocap-supervised training set that must cover the gaits and terrains one intends to deploy on &mdash; weaker in instrumentation, in cost, and in the breadth of data it must span. That reduction, not the elimination of all tuning, is the claim.</p>
+
+<h2 class="sec">9. Closing the Loop</h2>
+
+<p class="noind">We now drive <i>R</i><sub>pair</sub> from the off-axis residual and ask whether held-out consistency improves. The answer requires a control, because inflating <i>R</i> lowers NIS trivially and a bare improvement would establish nothing.</p>
+
+<h3 class="sub">9.1 Separating flex from bias</h3>
+
+<p class="noind">The off-axis residual is not purely flex: it also carries relative gyro bias and mount misalignment, which are slow, while impact flex is impulsive. We subtract a <em>causal trailing</em> 500-tick (&asymp;0.43&nbsp;s) moving <em>median</em>. The median rather than the mean is deliberate &mdash; an impulse drags a moving mean into the slow estimate, which is precisely the leakage the split exists to prevent &mdash; and the window is trailing so that nothing looks ahead.</p>
+
+<p>The split behaves as the physical reading predicts. On a walking window the off-axis component is 0.1&ndash;38% of &#8214;<i>z</i>&#8214;, and 70&ndash;98% of that off-axis energy is fast (per pair: 98.5, 97.4, 87.4, 70.0, 93.3, 96.7, 93.2%). At rest the fast part is 5&ndash;10&times; smaller and the slow part dominates on most pairs, consistent with it being bias and misalignment rather than flex.</p>
+
+<h3 class="sub">9.2 The inflation law and what was fitted</h3>
+
+<p class="noind">We take <i>g</i><sub>e</sub>(<i>t</i>) = 1 + (&#8214;fast<sub>e</sub>(<i>t</i>)&#8214; / <i>s</i><sub>e</sub>)<sup>2</sup> with <i>s</i><sub>e</sub> = &alpha;&middot;median(&#8214;fast<sub>e</sub>&#8214;), applied additively as (<i>g</i>&minus;1)&middot;&sigma;<sub>0,e</sub><sup>2</sup><i>I</i><sub>3</sub> on the pair block's diagonal. Additively rather than as a block multiplier because <i>R</i> = <i>L</i>&Sigma;<i>L</i><sup>&#7488;</sup> is correlated across pairs sharing an IMU, and rescaling one diagonal block of a correlated positive-definite matrix can destroy that property.</p>
+
+<p>Eight numbers are fitted in total: one global &alpha; = 0.366 and seven per-pair medians. <em>All eight come from the fit window alone</em> (110.0&ndash;113.6). Every number reported below is from windows that played no part in fitting.</p>
+
+<h3 class="sub">9.3 The control</h3>
+
+<p class="noind">Against the adaptive form we run a <em>matched constant-inflation control</em>: a constant <i>R</i> inflation set to the fit-window time-average of the adaptive one, then refitted (&beta; = 1.797) to the same ANIS&nbsp;=&nbsp;27 target on the same fit window. The control is what separates &ldquo;the covariance now tracks the disturbance&rdquo; from &ldquo;we made <i>R</i> bigger&rdquo;.</p>
+
+<figure class="tbl wide">
+  <figcaption><span class="lbl">Table 4.</span> Held-out <span class="mono">stacked</span> ANIS against dof 27. Fitting used window 110.0&ndash;113.6 only; none of the windows below contributed to it. Cross-regime spread is the ratio of the largest to the smallest ANIS/dof across the three windows &mdash; the quantity a single tuned constant cannot control.</figcaption>
+  <table>
+    <thead>
+      <tr><th>Held-out window</th><th>Baseline (frozen <i>R</i>)</th><th>Constant-<i>R</i> control</th><th>Adaptive (proposed)</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>standing 70.0&ndash;73.6</td><td>0.56</td><td>0.0056</td><td><strong>0.234</strong></td></tr>
+      <tr><td>walking 102.4&ndash;106.0</td><td>266.05</td><td>6.79</td><td><strong>3.43</strong></td></tr>
+      <tr><td>walking 118.0&ndash;121.6</td><td>17.37</td><td>0.686</td><td><strong>1.16</strong></td></tr>
+      <tr class="grp"><td><strong>cross-regime spread</strong></td><td><strong>475&times;</strong></td><td><strong>1206&times;</strong></td><td><strong>14.7&times;</strong></td></tr>
+    </tbody>
+  </table>
+</figure>
+
+<h3 class="sub">9.4 What the numbers say, and what they do not</h3>
+
+<p class="noind">The headline is <em>not</em> that ANIS fell. It did &mdash; raw ANIS on the most violent window moves 7183.4 &rarr; 92.7 &mdash; but the control reaches 183.4 by doing nothing more interesting than scaling a constant, and on window 118.0&ndash;121.6 the control (0.686) is in fact <em>closer to unity</em> than the adaptive form (1.16). Per-window accuracy is not the result.</p>
+
+<p>The result is portability. The constant control, fitted honestly to the same target on the same window, makes the cross-regime spread <em>worse than the untouched baseline</em> &mdash; 1206&times; against 475&times; &mdash; because it is calibrated on walking and then annihilates the standing channel, driving it to 0.0056 of its degrees of freedom. The adaptive form collapses 475&times; to 14.7&times;. A covariance that tracks a measured disturbance transfers between regimes; a covariance tuned for one regime does not, and tuning it harder makes the transfer worse. This is the prediction of the redundancy hypothesis, and it is the one thing the control cannot reproduce.</p>
+
+<p>The improvement is not confined to the mean. On the most violent held-out window the adaptive form also beats the control in the tails: p90 168 against 480, p99 937 against 1849, and the fraction of ticks exceeding three times the degrees of freedom 0.269 against 0.371.</p>
+
+<h3 class="sub">9.5 Collateral effects</h3>
+
+<p class="noind">A change that repairs one channel's consistency at the cost of the estimate would not be a gain. On window 102.4&ndash;106.0 the other channels are essentially untouched (encoder 38.69&nbsp;&rarr;&nbsp;38.80, contact 0.479&nbsp;&rarr;&nbsp;0.546, gravity 0.527&nbsp;&rarr;&nbsp;0.519), and base velocity moves from 0.1851 to 0.1761&nbsp;m/s in mean magnitude, a change of &minus;4.9%, with the vertical component unchanged at 0.0810&nbsp;m/s rms. On window 118.0&ndash;121.6 velocity moves &minus;0.8%, and the standing window is identical to four decimals. Without ground truth we can claim only that the estimate was not disturbed; whether the 4.9% is an improvement is not something these data can decide.</p>
+
+<p>The implementation is additive and defaulted &mdash; an optional per-pair term whose absence reproduces the previous computation exactly &mdash; and the joint-filter test suite passes unchanged with it in place.</p>
+
+<h2 class="sec">10. Limitations</h2>
+
+<div class="pending">
+  <p><strong>The strongest objection: circularity.</strong> <i>g</i>(<i>t</i>) is built from the current tick's own measurement, so <i>R</i> is correlated with the innovation it weights, and the law systematically down-weights exactly those ticks whose innovations are large. This is standard practice for adaptive <i>R</i> and it is also the most economical alternative explanation of our result. The constant-inflation control rules out the trivial version &mdash; that any inflation would do &mdash; but it does not rule out this one. Distinguishing the two requires driving <i>R</i> from a residual the innovation does not share, for example a one-tick delay or a pair's residual applied to a neighbouring pair, and we have not done it.</p>
+</div>
+
+<p class="noind"><em>The target is not reached.</em> On held-out window 102.4&ndash;106.0 the adaptive form ends at ANIS 92.7 against dof 27, still 3.4&times; overconfident. The fit window is less violent than that one, and a quadratic law under-inflates the extremes; a saturating or higher-order <i>g</i>, or a per-pair &alpha;, is untested. The two walking windows also bracket unity from opposite sides (3.43 and 1.16), so a single global &alpha; is a compromise rather than a solution.</p>
+
+<p><em>Only one channel is addressed.</em> The encoder channel is untouched and remains 4.3&times; overconfident during walking. Nothing here speaks to it.</p>
+
+<p><em>The velocity claim is weak by construction.</em> With no motion capture on this log, &ldquo;the estimate was not wrecked&rdquo; is the strongest available statement; the 4.9% change in mean speed is unvalidated in either direction.</p>
+
+<p><em>The slow estimate ramps in.</em> The trailing median needs 500 ticks of history, so the first &asymp;0.4&nbsp;s of any window runs with a degraded slow component and therefore an inflated fast one.</p>
+
+<p class="noind"><em>The off-axis residual is not purely flex.</em> <i>P</i><sub>&perp;</sub>&Omega; also contains relative gyro bias between the two units and any error in the mount alignment used to express both readings in a common frame. Both are slowly varying, while flex and vibration are fast, so a slow/fast separation &mdash; the &ldquo;fast&rdquo; subscript in (9) &mdash; is required before the residual can be read as a noise signal. Section&nbsp;9.1 implements one and reports that it behaves as the physical reading predicts, with 70&ndash;98% of walking off-axis energy in the fast component against a 5&ndash;10&times; smaller fast part at rest. That is consistency with the hypothesis, not a validation of the split: we have no independent measurement of link flex to check it against, and a trailing median is a crude separator. Some fraction of the residual we attribute to rigidity violation may still be calibration error.</p>
+
+<p><em>Correlations of 0.4&ndash;0.6 describe a good estimate, not a deterministic one.</em> The off-axis residual explains a substantial share of the variation in on-axis error and is more than adequate as an online indicator, but it does not determine the instantaneous noise. Any <i>g</i> built on it should be understood as inflating an expected noise level, not as reconstructing a true per-tick variance.</p>
+
+<p><em>The method degrades with chain DoF and disappears at three.</em> This is built into (10), is visible in the data (Table 3, the 2-DoF rows), and is a genuine restriction on where the approach applies. Robots with spherical joints, or with IMU placements that leave pairs spanning three or more degrees of freedom, gain nothing here.</p>
+
+<p><em>The evidential base is narrow.</em> One robot, one log, one gait (treadmill walking), and four windows &mdash; one for fitting and three held out &mdash; all drawn from the same treadmill bout minutes apart, so they are not independent sessions. The claim that the method adapts across gaits, speeds and terrains is an argument from the structure of a measurement versus an interpolation (Section 8), not a demonstration over a range of conditions. It is the argument we can support; it is not yet supported by breadth of data, and we do not present it as if it were.</p>
+
+<p><em>The hand-tuned baseline is itself a caveat for future comparisons.</em> Table 1 shows the baseline to be badly miscalibrated in the walking regime, for which it was never tuned. Any subsequent result showing an adaptive or learned scheme beating it must be read with that in mind: part of any such margin will reflect the baseline's unsuitability for the regime rather than the merit of the alternative. A fair comparison needs a baseline retuned for walking, or a comparison conducted per regime.</p>
+
+<h2 class="sec">11. Conclusion</h2>
+
+<p class="noind">We measured, on a real humanoid walking log, a 475&times; spread in the consistency of a joint-level IMU-pair channel between standing and walking under an unchanged filter &mdash; a range no constant measurement covariance can cover. Diagnostics locate the driver in linear acceleration and shock rather than rotation rate, consistent with impacts flexing and vibrating the links and thereby violating the rigid-connection assumption on which the pair measurement rests.</p>
+
+<p>We then observed that on a distributed IMU array this violation need not be inferred. An IMU pair spanning a <i>k</i>-DoF chain leaves 3 &minus; <i>k</i> directions in which a rigid link must produce nothing, and whatever appears there is a per-tick measurement of the disturbance that is simultaneously corrupting the informative direction. Splitting the walking window by this off-axis residual separates the on-axis channel's own NIS by 9&times;&ndash;49&times; on every 1-DoF pair, and &mdash; the signature that distinguishes the mechanism from a generic activity effect &mdash; by only 3.4&times; and 5.7&times; on the two 2-DoF pairs, which have half the redundancy, exactly as the dimension count requires.</p>
+
+<p>The consequence for supervision is structural rather than methodological. A learned covariance predictor exists to recover a latent disturbance magnitude; where the array measures that magnitude, the predictor is estimating something already in hand, and its motion-capture training set is needed only to learn a map the geometry supplies. What remains is a small calibration of the residual-to-multiplier map, fittable against NIS alone with no ground truth &mdash; a materially weaker requirement than mocap supervision, though not the elimination of tuning.</p>
+
+<p>Closing the loop supports the mechanism without vindicating it completely. Driving <i>R</i><sub>pair</sub> from the off-axis residual reduces the cross-regime spread of held-out consistency from 475&times; to 14.7&times;, while a constant refitted to the same target on the same data makes that spread <em>worse</em> than the untouched baseline. That asymmetry is the evidence: a covariance that tracks a measured disturbance transfers between regimes, and a tuned constant does not. It is also the limit of what we have shown. The adaptive form does not reach its target on the most violent window, it addresses one channel of four, and the objection that <i>R</i> is correlated with the innovation it weights is not answered by our control. We regard the mechanism as supported and the implementation as a first draft of it.</p>
+
+<h2 class="sec">References</h2>
+
+<ol class="refs">
+  <li>T. Baumgartner et al., &ldquo;CoCo-InEKF: Learned contact covariance for a differentiable invariant extended Kalman filter,&rdquo; arXiv:2605.15122, 14 May 2026.</li>
+  <li>A. Barrau and S. Bonnabel, &ldquo;The invariant extended Kalman filter as a stable observer,&rdquo; <em>IEEE Transactions on Automatic Control</em>, vol. 62, no. 4, pp. 1797&ndash;1812, 2017.</li>
+  <li>R. Hartley, M. Ghaffari, R. M. Eustice, and J. W. Grizzle, &ldquo;Contact-aided invariant extended Kalman filtering for robot state estimation,&rdquo; <em>The International Journal of Robotics Research</em>, vol. 39, no. 4, pp. 402&ndash;430, 2020.</li>
+  <li>Y. Bar-Shalom, X.-R. Li, and T. Kirubarajan, <em>Estimation with Applications to Tracking and Navigation: Theory, Algorithms and Software</em>. New York: Wiley, 2001.</li>
+  <li>M. Bloesch, M. Hutter, M. A. Hoepflinger, S. Leutenegger, C. Gehring, C. D. Remy, and R. Siegwart, &ldquo;State estimation for legged robots &mdash; consistent fusion of leg kinematics and IMU,&rdquo; in <em>Proc. Robotics: Science and Systems</em>, 2012.</li>
+  <li>N. Rotella, M. Bloesch, L. Righetti, and S. Schaal, &ldquo;State estimation for a humanoid robot,&rdquo; in <em>Proc. IEEE/RSJ Int. Conf. on Intelligent Robots and Systems (IROS)</em>, 2014, pp. 952&ndash;958.</li>
+</ol>
+
+</div>
+
+</body>
+</html>
