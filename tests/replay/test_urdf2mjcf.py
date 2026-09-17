@@ -193,11 +193,24 @@ def test_armature_carries_the_rotor_table(urdf_text):
     assert np.all(m.dof_armature[:6] == 0.0)
 
 
-def test_effort_limits_are_carried_out_of_the_urdf(model_spec):
+def test_effort_limits_are_carried_out_of_the_urdf(urdf_text, model_spec):
     """``sigma_tau,i = alpha_i * tau_max,i`` needs these, and MJCF has nowhere
-    to put them -- so the converter returns them as data."""
-    assert model_spec.effort_limits["LEFT_KNEE_Y"] == pytest.approx(217.2)
-    assert len(model_spec.effort_limits) == 29
+    to put them -- so the converter returns them as data.
+
+    Counted against the description rather than against a fixed number: the conftest exists to let
+    this suite be pointed at any log, and different Alex builds declare different numbers of
+    effort-limited joints (29 on the 2026-07-17 model, 49 on the 2026-09-16 one). A hardcoded count
+    turns "a different robot build" into a test failure that looks like a converter regression."""
+    declared = {j.get("name") for j in ET.fromstring(urdf_text).findall("joint")
+                if j.find("limit") is not None and j.find("limit").get("effort") is not None}
+    assert set(model_spec.effort_limits) == declared
+    assert declared, "the description declares no effort limits at all"
+
+    knee = model_spec.effort_limits.get("LEFT_KNEE_Y")
+    if knee is not None:  # every Alex build has it; guard so the check reads on any robot
+        limit = next(j.find("limit").get("effort") for j in ET.fromstring(urdf_text).findall("joint")
+                     if j.get("name") == "LEFT_KNEE_Y")
+        assert knee == pytest.approx(float(limit))
 
 
 def test_rpy_conversion_is_fixed_axis():
@@ -224,6 +237,8 @@ def test_rpy_conversion_is_fixed_axis():
 # extra sites: contact frames need an offset, IMU frames do not
 # --------------------------------------------------------------------------
 
+# A placement to test the mechanism with; the real value is derived per build, see
+# sole_offset_from_description below.
 _SOLE_OFFSET = (0.053, 0.0, -0.055)
 
 
@@ -262,20 +277,47 @@ def test_the_offset_rides_the_link_rather_than_being_a_world_coordinate(urdf_tex
                                rotation @ np.array(_SOLE_OFFSET), atol=1e-9)
 
 
-def test_the_sole_offset_lands_on_the_foot_collision_boxs_bottom_face(urdf_text):
-    """Cross-check against the robot description itself rather than against this module.
+def sole_offset_from_description(urdf_text, link="LEFT_FOOT"):
+    """The sole, read out of the robot's own description: the bottom face of the foot's contact box.
 
-    ``model.sdf`` gives LEFT_FOOT a collision box centred at z=-0.045 with a 0.02 thickness, so its
-    contact face sits at -0.055 -- the same number AlexV2PhysicalProperties derives as
-    ``-ankleHeight``. Two independently maintained sources; if they ever disagree, this fails."""
+    Derived, never hardcoded. The offset is BUILD-DEPENDENT -- the 2026-07-17 Alex001 model gives
+    (0.050, 0, -0.070) and the 2026-09-16 one (0.053, 0, -0.055), a 15 mm difference in z on the
+    same robot -- so a constant baked into this repo would be silently wrong for every log but the
+    one it was read from.
+    """
     root = ET.fromstring(urdf_text)
-    link = next(l for l in root.findall("link") if l.get("name") == "LEFT_FOOT")
-    collision = link.find("collision")
+    foot = next(l for l in root.findall("link") if l.get("name") == link)
+    collision = foot.find("collision")
     centre = [float(v) for v in collision.find("origin").get("xyz").split()]
     size = [float(v) for v in collision.find("geometry").find("box").get("size").split()]
+    return (centre[0], centre[1], centre[2] - size[2] / 2.0)
 
-    assert centre[0] == pytest.approx(_SOLE_OFFSET[0], abs=1e-9)
-    assert centre[2] - size[2] / 2.0 == pytest.approx(_SOLE_OFFSET[2], abs=1e-9)
+
+def test_the_sole_sits_below_the_ankle_and_forward_of_it(urdf_text):
+    """A sanity envelope on the derived value rather than an exact number, since the exact number
+    is per-build. The sole must be below the foot link origin (which is the ankle roll axis) and
+    ahead of it, by centimetres rather than millimetres or metres."""
+    x, y, z = sole_offset_from_description(urdf_text)
+    assert -0.12 < z < -0.03, f"sole z={z} is not a plausible ankle height"
+    assert 0.0 < x < 0.12, f"sole x={x} is not a plausible ankle-to-sole-centre offset"
+    assert abs(y) < 0.01, f"sole y={y} should be near the foot's midline"
+
+
+def test_both_feet_agree(urdf_text):
+    """A left/right mismatch would put one anchor somewhere the other is not, which reads as a
+    persistent limp in the estimate rather than as a model error."""
+    left = sole_offset_from_description(urdf_text, "LEFT_FOOT")
+    right = sole_offset_from_description(urdf_text, "RIGHT_FOOT")
+    np.testing.assert_allclose(left, right, atol=1e-9)
+
+
+def test_the_derived_offset_is_what_actually_reaches_the_site(urdf_text):
+    """The point of deriving it: the value read from the description is the value the converter
+    places, so a session built this way anchors on the description's own sole."""
+    offset = sole_offset_from_description(urdf_text)
+    m = _sites(urdf_text, {"sole": ("LEFT_FOOT", offset)})
+    sid = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_SITE, "sole")
+    np.testing.assert_allclose(m.site_pos[sid], offset, atol=1e-12)
 
 
 def test_a_malformed_offset_is_rejected_rather_than_silently_truncated(urdf_text):
