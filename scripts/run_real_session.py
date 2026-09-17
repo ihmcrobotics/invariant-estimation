@@ -14,9 +14,6 @@ list of things a real study has to settle properly:
 
 * the IMU-pair topology (mirrored from AlexStateEstimatorParameters, not read
   from anywhere machine-readable);
-* the sole sites, which the URDF does not carry -- placed at the foot link
-  origin here, which is not the real sole offset;
-* the sole sites, whose true offset the URDF does not carry (above);
 * the window, chosen to begin on a genuinely stationary stretch and to stop
   before a logged controller stall;
 * the nominal specific force at rest, which assumes a level pelvis -- see the
@@ -88,9 +85,19 @@ def main():
     jk = cfg["joint_kf"]
 
     print(f"log: {LOG}")
-    # The converter emits IMU sites automatically but not contact frames, so the sole sites
-    # the InEKF anchors on have to be requested explicitly. Placed at the foot link origin
-    # here -- a real study needs the actual sole offset, which the URDF does not carry.
+    # The converter emits IMU sites automatically but not contact frames, so the anchor sites
+    # have to be requested explicitly. They sit at the foot link origin (the ANKLE_X frame),
+    # not at the sole, and that is FINE -- the contact residual is r = R.y - (d_i - p) with the
+    # anchor d_i a state variable that is never re-declared, so a constant offset is absorbed:
+    # the filter simply anchors a different point on the same rigid foot. The offset enters only
+    # through its time derivative, i.e. foot rotation during stance -- and there the sole is also
+    # the wrong point, since the instantaneous axis is the toe or heel edge. That residual is
+    # what contact_q models.
+    #
+    # (For the record, since an earlier version of this comment claimed otherwise: the sole offset
+    # IS in the robot description. AlexV2PhysicalProperties gives (0.053, 0, -0.055) relative to
+    # this same frame, and model.sdf's foot collision box agrees exactly. It would be needed to
+    # report an absolute height against a measured floor, which is not a number this study claims.)
     spec = convert_log_model(LOG, rotor_inertia=jk["rotor_inertia"],
                              rotor_inertia_default=jk["rotor_inertia_default"],
                              extra_sites={"LEFT_FOOT": "LEFT_FOOT", "RIGHT_FOOT": "RIGHT_FOOT",
