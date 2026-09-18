@@ -153,6 +153,16 @@ def fit_floor():
     chosen from a small grid to minimise the JOINT miscalibration |log(contact ratio)| +
     |log(gravity ratio)| -- the probe showed this single constant dominates both channels, and a
     knob serving two channels should be scored on both.
+
+    WHY THE RESULT IS NOT PROMOTED (measured 2026-09-18, on window 102.4-106.0):
+    the retune improves held-out consistency everywhere but raises mean |v| by 79%, and the
+    increase is VARIANCE, not drift -- mean body-frame forward velocity barely moves (+0.060 ->
+    +0.044 m/s) while std(v_y) goes 0.149 -> 0.368 and |dv/dt| 2.7 -> 3.4 m/s^2. Tightening the
+    floor makes the filter trust contact FK more, and contact FK is exactly what the `stacked`
+    finding shows to be corrupted during walking, so the corruption lands in the state. The slack
+    floor was absorbing it. This orders the work: the contact floor is not honestly tunable until
+    the IMU-pair noise model is right, and NIS alone would have promoted a jerkier filter --
+    "necessary, not sufficient" in the flesh.
     """
     session = Session(FIT_WINDOW)
     print(f"{'s_floor':>9s} {'contact/6':>10s} {'gravity/3':>10s} {'joint cost':>11s}")
