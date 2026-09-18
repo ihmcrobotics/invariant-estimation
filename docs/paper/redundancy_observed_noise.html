@@ -220,7 +220,7 @@
     <h2>Abstract</h2>
     <p class="noind">Legged state estimators are routinely tuned with a single, hand-chosen measurement covariance per channel, and a recent line of work replaces that constant with a covariance learned by backpropagation through a differentiable filter, supervised by motion capture. We report a measurement, on a real humanoid treadmill-walking log, that makes the constant untenable: the average normalised innovation squared (ANIS) of the joint-level IMU-pair channel moves from a ratio of 0.56 of its degrees of freedom at rest to 266 during walking, a spread of 475&times; within a single log under a single filter configuration. No scalar can serve both regimes.</p>
     <p>We then argue that on a robot carrying a <em>distributed</em> IMU array this covariance need not be learned at all, because it is directly observable. An IMU pair spanning a <i>k</i>-DoF chain produces a differential angular rate &Omega; that, under the rigid-link assumption the pair measurement rests on, is confined to a <i>k</i>-dimensional subspace. The remaining 3 &minus; <i>k</i> directions carry no joint information and are therefore a per-tick, online observation of exactly the model violation that corrupts the informative component. We propose driving the pair measurement noise from this off-axis residual, <i>R</i><sub>pair</sub>(<i>t</i>) = <i>R</i><sub>0</sub>&middot;<i>g</i>(&#8214;<i>P</i><sub>&perp;</sub>&Omega;(<i>t</i>)&#8214;), and present correlational evidence: splitting the walking window by off-axis residual separates the on-axis channel's own NIS by 9&times;&ndash;49&times; on every 1-DoF pair. The decisive signature is dimensional. The two 2-DoF pairs, which retain only one redundant direction instead of two, show by far the weakest effect (3.4&times; and 5.7&times;) &mdash; an ordering the redundancy mechanism predicts <i>a priori</i> from a dimension count and that a generic &ldquo;noise rises with activity&rdquo; account does not produce.</p>
-    <p>We position this against CoCo-InEKF, which learns a contact covariance from motion-capture-derived ground truth on a platform with a single base IMU. The distinction is structural rather than methodological: where there is no redundancy the disturbance is latent and a learned predictor is the only route; where there is redundancy the disturbance is measured, and no training set is required. Closing the loop, we drive <i>R</i><sub>pair</sub> from the off-axis residual and evaluate on held-out windows never used for fitting. Against a <em>matched constant-inflation control</em> &mdash; refitted honestly to the same target on the same window &mdash; the constant makes the cross-regime spread <em>worse</em> than the untouched baseline (1206&times; against 475&times;), while the adaptive form collapses it to 14.7&times;. The result is portability across regimes, not a smaller number: inflation alone lowers ANIS trivially, and on one held-out window the control is in fact closer to unity. The adaptive form does not reach its target either (92.7 against dof 27 on the most violent window), and a circularity in driving <i>R</i> from the current tick's own measurement remains a live threat to the interpretation.</p>
+    <p>We position this against CoCo-InEKF, which learns a contact covariance from motion-capture-derived ground truth on a platform with a single base IMU. The distinction is structural rather than methodological: where there is no redundancy the disturbance is latent and a learned predictor is the only route; where there is redundancy the disturbance is measured, and no training set is required. Closing the loop, we drive <i>R</i><sub>pair</sub> from the off-axis residual and evaluate on held-out windows never used for fitting. Against a <em>matched constant-inflation control</em> &mdash; refitted honestly to the same target on the same window &mdash; the constant makes the cross-regime spread <em>worse</em> than the untouched baseline (1206&times; against 475&times;), while the adaptive form collapses it to 14.7&times;. The result is portability across regimes, not a smaller number: inflation alone lowers ANIS trivially, and on one held-out window the control is in fact closer to unity. The adaptive form does not reach its target either (92.7 against dof 27 on the most violent window). The obvious objection &mdash; that <i>R</i>, built from the current tick's own measurement, is merely correlated with the innovation it weights &mdash; is tested rather than conceded: a strictly causal variant that never reads the current tick does not merely retain the result but improves it, taking the spread to 10.7&times;.</p>
   </div>
 
   <div class="keywords">
@@ -243,7 +243,7 @@
 
 <p>The argument proceeds in three movements. First (Sections 3&ndash;4) we establish by measurement that the problem is real and is not small: a consistency audit of our estimator on a real walking log finds the joint-level IMU-pair channel spanning a 475&times; range between rest and walking, with a diagnostic signature that rules out the obvious explanations. Second (Section 5) we show that the disturbance responsible is geometrically observable, and give the projector that extracts it. Third (Sections 6&ndash;8) we present the correlational evidence already in hand, including a dimensional signature that we did not predict in advance, and set out precisely what does and does not follow for motion-capture supervision.</p>
 
-<p>Section 9 closes the loop and Section 10 is a limitations section in earnest. We demonstrate that the disturbance is measurable, that the measurement tracks the error it is meant to explain, and that driving the covariance from it makes the channel <em>portable across regimes</em> in a way a refitted constant is not. What we do not demonstrate is a filter that reaches its consistency target: the adaptive form ends 3.4&times; overconfident on the most violent held-out window, and the strongest objection to the result &mdash; that <i>R</i> is correlated with the very innovation it weights &mdash; is not fully answered by our control.</p>
+<p>Section 9 closes the loop and Section 10 is a limitations section in earnest. We demonstrate that the disturbance is measurable, that the measurement tracks the error it is meant to explain, and that driving the covariance from it makes the channel <em>portable across regimes</em> in a way a refitted constant is not. Section&nbsp;9.6 then removes the current tick from the law entirely and finds the result strengthened rather than lost, which answers the correlation objection our control could not. What we do not demonstrate is a filter that reaches its consistency target: the adaptive form ends 3.4&times; overconfident on the most violent held-out window.</p>
 
 <h2 class="sec">2. The Estimator</h2>
 
@@ -597,10 +597,64 @@
 
 <p>The implementation is additive and defaulted &mdash; an optional per-pair term whose absence reproduces the previous computation exactly &mdash; and the joint-filter test suite passes unchanged with it in place.</p>
 
+<h3 class="sub">9.6 The circularity objection, tested</h3>
+
+<p class="noind">The most economical alternative explanation of Section&nbsp;9.4 is not that any
+inflation would do &mdash; the control rules that out &mdash; but that <i>g</i>(<i>t</i>) is built
+from the current tick's own measurement. <i>R</i> is then correlated with the innovation it weights,
+and the law systematically down-weights exactly those ticks whose innovations are large. If that
+correlation were doing the work, the result would be an artefact of the construction rather than a
+statement about the robot.</p>
+
+<p>The test is to take the current tick away. We re-evaluate the identical fitted constants under
+two families of variant: <em>delayed</em>, where <i>g</i>(<i>t</i>) is driven by the residual at
+<i>t</i>&minus;<i>k</i>, and <em>strictly causal</em>, where it is driven by the trailing maximum
+over a window that <em>excludes</em> tick <i>t</i> entirely. Nothing is refitted.</p>
+
+<figure class="tbl wide">
+  <figcaption><span class="lbl">Table 5.</span> <span class="mono">stacked</span> ANIS / dof 27 under variants that progressively deny <i>R</i> access to the innovation it weights. Same fitted constants throughout (&alpha;&nbsp;=&nbsp;0.366, &beta;&nbsp;=&nbsp;1.797, window 110.0&ndash;113.6); all three evaluation windows held out.</figcaption>
+  <table>
+    <thead>
+      <tr><th>Variant</th><th>standing</th><th>walking A</th><th>walking B</th><th>cross-regime spread</th><th>walking-only</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>baseline (frozen <i>R</i>)</td><td>0.563</td><td>266.05</td><td>17.374</td><td>472.6&times;</td><td>15.31&times;</td></tr>
+      <tr><td>constant control</td><td>0.006</td><td>6.794</td><td>0.686</td><td>1132&times;</td><td>9.90&times;</td></tr>
+      <tr><td>adaptive, same tick</td><td>0.234</td><td>3.433</td><td>1.161</td><td>14.7&times;</td><td>2.96&times;</td></tr>
+      <tr><td>delayed 1 tick</td><td>0.276</td><td>4.120</td><td>1.313</td><td>14.9&times;</td><td>3.14&times;</td></tr>
+      <tr><td>delayed 20 ticks</td><td>0.331</td><td>13.787</td><td>3.166</td><td>41.7&times;</td><td>4.35&times;</td></tr>
+      <tr><td>delayed 200 ticks</td><td>0.345</td><td>57.105</td><td>7.211</td><td>165.5&times;</td><td>7.92&times;</td></tr>
+      <tr><td><strong>strictly causal, past 20 only</strong></td><td>0.159</td><td>1.888</td><td>0.779</td><td><strong>11.9&times;</strong></td><td><strong>2.42&times;</strong></td></tr>
+      <tr class="grp"><td><strong>strictly causal, past 100 only</strong></td><td><strong>0.117</strong></td><td><strong>1.251</strong></td><td><strong>0.583</strong></td><td><strong>10.7&times;</strong></td><td><strong>2.15&times;</strong></td></tr>
+    </tbody>
+  </table>
+</figure>
+
+<p class="noind">The objection does not survive. A variant that never reads tick <i>t</i> does not
+merely retain the result, it <em>improves</em> on it: the strictly causal form takes the
+cross-regime spread to 10.7&times; against the same-tick form's 14.7&times;, and improves every
+individual window. Whatever produces the effect, it is not <i>R</i> seeing its own innovation.</p>
+
+<p>The delay family is informative in its own right. Degradation is monotone &mdash; 14.9&times; at
+one tick, 41.7&times; at twenty, 165.5&times; at two hundred &mdash; which puts the residual's
+predictive horizon at a few tens of milliseconds, the timescale an impulsive disturbance implies.
+Yet the strictly causal variants, which are denied far more than a 20-tick delay is, beat every
+delayed one. The difference is what they retain: a delay hands the filter a single stale sample,
+while the causal window holds the recent worst case. What <i>R</i> needs is therefore not this
+tick's disturbance but <em>whether the link has recently been struck</em> &mdash; a quantity an
+online implementation can maintain, which removes the offline-only caveat this variant might
+otherwise have carried.</p>
+
+<p>Across every variant and all three windows the base velocity is unmoved (mean
+&#8214;<i>v</i>&#8214; within 0.174&ndash;0.180&nbsp;m/s and std(<i>v<sub>y</sub></i>) within
+0.144&ndash;0.147 on walking&nbsp;A, identical to four decimals at rest). Repairing this channel's
+consistency does not perturb the estimate &mdash; which is not automatic, and Section&nbsp;10
+contrasts it with a nearby retune that does.</p>
+
 <h2 class="sec">10. Limitations</h2>
 
 <div class="pending">
-  <p><strong>The strongest objection: circularity.</strong> <i>g</i>(<i>t</i>) is built from the current tick's own measurement, so <i>R</i> is correlated with the innovation it weights, and the law systematically down-weights exactly those ticks whose innovations are large. This is standard practice for adaptive <i>R</i> and it is also the most economical alternative explanation of our result. The constant-inflation control rules out the trivial version &mdash; that any inflation would do &mdash; but it does not rule out this one. Distinguishing the two requires driving <i>R</i> from a residual the innovation does not share, for example a one-tick delay or a pair's residual applied to a neighbouring pair, and we have not done it.</p>
+  <p><strong>Consistency is necessary, not sufficient &mdash; and a nearby retune shows what that costs.</strong> The same ANIS machinery, pointed at the InEKF's fixed contact-variance floor, produces a retune that improves held-out consistency on every window and simultaneously makes the estimate materially worse: mean &#8214;<i>v</i>&#8214; rises 79%, std(<i>v<sub>y</sub></i>) goes 0.149 &rarr; 0.368 and &#8214;d<i>v</i>/d<i>t</i>&#8214; 2.7 &rarr; 3.4&nbsp;m/s&sup2;, the increase being variance rather than drift. Tightening that floor makes the filter trust contact forward kinematics more, and contact FK during walking is exactly what Section&nbsp;4 shows to be corrupted, so the corruption reaches the state. ANIS alone would have promoted a jerkier filter. We report that our own channel leaves the velocity unmoved (Section&nbsp;9.6) precisely because the counterexample sits one knob away, and we do not claim ANIS as a sufficient criterion for either.</p>
 </div>
 
 <p class="noind"><em>The target is not reached.</em> On held-out window 102.4&ndash;106.0 the adaptive form ends at ANIS 92.7 against dof 27, still 3.4&times; overconfident. The fit window is less violent than that one, and a quadratic law under-inflates the extremes; a saturating or higher-order <i>g</i>, or a per-pair &alpha;, is untested. The two walking windows also bracket unity from opposite sides (3.43 and 1.16), so a single global &alpha; is a compromise rather than a solution.</p>
@@ -629,7 +683,7 @@
 
 <p>The consequence for supervision is structural rather than methodological. A learned covariance predictor exists to recover a latent disturbance magnitude; where the array measures that magnitude, the predictor is estimating something already in hand, and its motion-capture training set is needed only to learn a map the geometry supplies. What remains is a small calibration of the residual-to-multiplier map, fittable against NIS alone with no ground truth &mdash; a materially weaker requirement than mocap supervision, though not the elimination of tuning.</p>
 
-<p>Closing the loop supports the mechanism without vindicating it completely. Driving <i>R</i><sub>pair</sub> from the off-axis residual reduces the cross-regime spread of held-out consistency from 475&times; to 14.7&times;, while a constant refitted to the same target on the same data makes that spread <em>worse</em> than the untouched baseline. That asymmetry is the evidence: a covariance that tracks a measured disturbance transfers between regimes, and a tuned constant does not. It is also the limit of what we have shown. The adaptive form does not reach its target on the most violent window, it addresses one channel of four, and the objection that <i>R</i> is correlated with the innovation it weights is not answered by our control. We regard the mechanism as supported and the implementation as a first draft of it.</p>
+<p>Closing the loop supports the mechanism without vindicating it completely. Driving <i>R</i><sub>pair</sub> from the off-axis residual reduces the cross-regime spread of held-out consistency from 475&times; to 14.7&times;, while a constant refitted to the same target on the same data makes that spread <em>worse</em> than the untouched baseline. That asymmetry is the evidence: a covariance that tracks a measured disturbance transfers between regimes, and a tuned constant does not. It is also the limit of what we have shown. The adaptive form does not reach its target on the most violent window and it addresses one channel of four. The objection that <i>R</i> is correlated with the innovation it weights we did test, by denying the law the current tick altogether; the result improved, and the variant that improved it &mdash; a trailing worst case rather than an instantaneous reading &mdash; is one an online implementation can maintain. We regard the mechanism as supported and the implementation as a first draft of it.</p>
 
 <h2 class="sec">References</h2>
 

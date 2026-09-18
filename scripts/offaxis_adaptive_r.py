@@ -345,6 +345,79 @@ def cmd_eval(fit_w, test_w, alpha, beta=1.0):
               f"v_z rms={np.sqrt((v[:,2]**2).mean()):.4f}")
 
 
+def delay_extra(extra, k):
+    """`extra` shifted k ticks later: R(t) is driven by the residual at t-k.
+
+    The head holds the first available value rather than zero, so the filter never starts from a
+    fabricated "no disturbance" tick -- the same edge policy the contact-timing shift uses, and for
+    the same reason.
+    """
+    if k <= 0:
+        return extra
+    out = np.empty_like(extra)
+    out[k:] = extra[:-k]
+    out[:k] = extra[0]
+    return out
+
+
+def causal_extra(extra, window):
+    """R(t) from a trailing window of PAST residual only -- the current tick is never read.
+
+    Uses the trailing max rather than the mean: the disturbance is impulsive, and a mean over a
+    window long enough to exclude the present tick would smear a heel strike into nothing. The max
+    holds the recent worst case, which is the conservative reading and also what an online
+    implementation would do.
+    """
+    T = extra.shape[0]
+    out = np.empty_like(extra)
+    for t in range(T):
+        lo = max(0, t - window)
+        hi = max(lo + 1, t)          # strictly excludes t
+        out[t] = extra[lo:hi].max(axis=0)
+    return out
+
+
+def cmd_circularity(fit_w, test_w, alpha, beta=1.0):
+    """Does the result survive when R can no longer see the innovation it weights?
+
+    The objection this answers: g(t) is built from the current tick's own measurement, so R is
+    correlated with the innovation it multiplies and systematically down-weights exactly the ticks
+    whose innovations are large. The constant control rules out "any inflation would do"; it does
+    not rule out this. If a strictly causal variant -- one that never reads tick t -- keeps the
+    cross-regime behaviour, the objection is answered and the method is also online-implementable.
+    """
+    fit_ctx = make_session(fit_w)
+    scale, s0, const = fit_constants(fit_ctx, alpha)
+    const = const * beta
+    print(f"FIT ({fit_w[0]}, {fit_w[1]}): alpha={alpha} beta={beta}  "
+          f"-- every variant below reuses THESE constants, nothing is refitted\n")
+
+    ctx = make_session(test_w)
+    _, _, off_t, _, _ = offaxis(ctx)
+    _, fast_t = split(off_t)
+    extra = inflation(fast_t, scale) * s0[None, :]
+
+    variants = [("baseline frozen R", None),
+                ("constant control", np.broadcast_to(const[None, :], extra.shape).copy()),
+                ("adaptive (same tick)", extra)]
+    for k in (1, 5, 20, 50, 200):
+        variants.append((f"adaptive delayed {k} ticks", delay_extra(extra, k)))
+    for w in (20, 100):
+        variants.append((f"adaptive causal (past {w} only)", causal_extra(extra, w)))
+
+    print(f"{'variant':34s} {'stacked/27':>11s} {'contact/6':>10s} {'|v| mean':>9s} {'std v_y':>8s}")
+    for label, e in variants:
+        out = rollout(ctx, e)
+        reports = {r.channel: (float(r.anis), float(r.dof))
+                   for r in two_stage_consistency(out.joint_diagnostics, out.base,
+                                                  n_contacts=2, n_joints=9)}
+        R = np.asarray(out.base.state.R)
+        v = np.asarray(out.base.state.v)
+        vb = np.einsum('tji,tj->ti', R, v)
+        print(f"{label:34s} {reports['stacked'][0]/27:>11.3f} {reports['contact'][0]/6:>10.3f} "
+              f"{np.linalg.norm(v, axis=-1).mean():>9.4f} {vb[:, 1].std():>8.3f}", flush=True)
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "decompose":
@@ -353,9 +426,18 @@ if __name__ == "__main__":
         mode = "constant" if "--constant" in sys.argv else "adaptive"
         alphas = [float(a) for a in sys.argv[4:] if not a.startswith("--")] or [1.0]
         cmd_fit(float(sys.argv[2]), float(sys.argv[3]), alphas, mode)
+    elif cmd == "circ":
+        cmd_circularity((float(sys.argv[2]), float(sys.argv[3])),
+                        (float(sys.argv[4]), float(sys.argv[5])), float(sys.argv[6]),
+                        float(sys.argv[7]) if len(sys.argv) > 7 else 1.0)
     elif cmd == "eval":
         cmd_eval((float(sys.argv[2]), float(sys.argv[3])),
                  (float(sys.argv[4]), float(sys.argv[5])), float(sys.argv[6]),
                  float(sys.argv[7]) if len(sys.argv) > 7 else 1.0)
     else:
         raise SystemExit(__doc__)
+
+
+# ---------------------------------------------------------------------------
+# circularity test (task 2)
+# ---------------------------------------------------------------------------
