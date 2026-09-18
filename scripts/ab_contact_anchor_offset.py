@@ -17,8 +17,10 @@ between them needs mocap.
 
 Separately worth noting: contact NIS ~0.5 against a dof of 3-6 means the filter is markedly
 CONSERVATIVE about its contact updates -- its assumed measurement noise is far larger than the
-innovations it actually sees (0.24 mm). That is a pre-registered target for the learned
-contact_fk_r channel.
+innovations it actually sees (0.24 mm). An earlier version of this note pre-registered the learned
+contact_fk_r channel as the fix; the leverage probe in scripts/retune_constant_noise.py REFUTED
+that: contact ANIS is insensitive to contact_fk_r (and to contact_q) across their whole range.
+The dominating constant is ekf.params.contact_floor, which no learned channel touches.
 
 
 The prediction, from the contact residual r = R.y - (d_i - p) with the anchor d_i a STATE
