@@ -1,6 +1,6 @@
 """A/B: does moving the contact anchor from the foot link origin to the sole change anything?
 
-RESULT (2026-09-17, on the recovered 2026-07-17 Alex001 treadmill log):
+RESULT (2026-09-17, on the recovered 2026-07-17 Alex001 overground-walking log):
 
               |dv| A vs B, mean      contact NIS  A / B
     standing   0.000148 m/s           0.000 / 0.000

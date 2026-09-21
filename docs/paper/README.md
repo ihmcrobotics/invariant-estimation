@@ -10,7 +10,7 @@ styled HTML with Unicode glyphs rather than MathML, which WeasyPrint renders poo
 Latin-1 and every math glyph becomes mojibake.
 
 Every number in the paper comes from `scripts/offaxis_adaptive_r.py` and the consistency harness in
-`invariant_estimation/eval/consistency.py`, run on the recovered 2026-07-17 Alex001 treadmill log.
+`invariant_estimation/eval/consistency.py`, run on the recovered 2026-07-17 Alex001 overground-walking log.
 Reproduce the held-out table with, for each window,
 
     python scripts/offaxis_adaptive_r.py eval 110.0 113.6 <start> <end> 0.366 1.797
