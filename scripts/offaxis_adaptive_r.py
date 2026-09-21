@@ -119,8 +119,11 @@ def make_session(window_s):
     session = prepare_session(window, channels, clock, session_model, build, joint_params,
                               ekf, initial, imu_to_body=imu_to_body(mj_model),
                               world_frame="registered_zup", accel_bias_body=BIAS)
+    # `window` is carried so callers can reconstruct the log's tick axis. run_comparison_arms.py
+    # needs it to write Java's timestamp convention (tick_index * dt), which neither the session
+    # nor LogWindow.time preserves.
     return dict(cfg=cfg, build=build, model=session_model, ekf=ekf,
-                joint_params=joint_params, session=session)
+                joint_params=joint_params, session=session, window=window)
 
 
 def rollout(ctx, pair_r_extra=None):
