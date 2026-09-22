@@ -112,16 +112,58 @@ def ihmclog() -> ModuleType:
 
 @dataclass(frozen=True)
 class LogWindow:
-    """A tick-aligned slice of one log: ``time`` plus one array per channel."""
+    """A tick-aligned slice of one log: ``time`` plus one array per channel.
+
+    **Two time axes, and they do not agree.** This is not a defect in any one log; on
+    every Alex log checked so far the controller's real cadence differs from the ``dt``
+    the handshake declares -- by +8% on one 2026-09 log and -14% on a 2026-07 one. Both
+    axes are legitimate and they answer different questions, so the window carries both
+    rather than picking one and leaving the caller to discover the difference:
+
+    * :attr:`time` -- **wall clock**, from the logged timestamps, measured from this
+      window's first sample. Use it for anything that must line up with something
+      outside the robot, and for spotting dropped or repeated ticks, which a
+      tick-derived axis cannot show by construction.
+    * :attr:`nominal_time` -- **tick index x declared dt**, measured from the start of
+      the LOG. This is the axis ``AlexEstimatorLogReplay`` writes into its comparison
+      CSVs, so it is the one to use when a Python-produced arm has to be interchangeable
+      with a Java-produced one.
+
+    Note that ``read_window``'s own ``start``/``end`` are in the **nominal** axis, so a
+    window requested at ``start=110.0`` begins at tick 110000 -- whose wall-clock
+    timestamp is something else entirely on a log whose cadence is off.
+    """
 
     log_dir: Path
     time: np.ndarray
-    """(T,) seconds from the start of the log."""
+    """(T,) WALL-CLOCK seconds from this window's first sample, from the logged
+    timestamps. Not ``tick * dt`` -- see :attr:`nominal_time`."""
     tick: np.ndarray
     """(T,) global tick index -- the join key back into the raw log."""
     channels: dict[str, np.ndarray]
     """``variable name -> (T,) float64``."""
     dt: float
+    """The handshake's declared controller period. Nominal: see :attr:`measured_dt`."""
+
+    @property
+    def nominal_time(self) -> np.ndarray:
+        """(T,) ``tick * dt`` seconds from the start of the LOG -- the axis Java writes."""
+        return self.tick.astype(np.float64) * self.dt
+
+    @property
+    def measured_dt(self) -> float:
+        """The cadence the timestamps actually show, per tick. NaN for a single sample.
+
+        Divided by the stride, so it is comparable to :attr:`dt` regardless of how the
+        window was sampled. Compare the two before trusting either axis for something
+        that has to match an external clock.
+        """
+        if self.time.size < 2:
+            return float("nan")
+        spans = np.diff(self.tick)
+        if not np.any(spans):
+            return float("nan")
+        return float(np.median(np.diff(self.time) / spans))
 
     def __getitem__(self, name: str) -> np.ndarray:
         return self.channels[name]

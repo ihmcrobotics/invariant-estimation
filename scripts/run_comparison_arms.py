@@ -53,13 +53,14 @@ ARM6_CAUSAL_WINDOW = 100
 
 
 def timestamps_ns(window):
-    """Java's clock: the GLOBAL tick index times the handshake dt, in nanoseconds.
+    """Java's clock, in nanoseconds: `LogWindow.nominal_time`, which is tick index x declared dt.
 
-    `LogWindow.tick` is the global index, so this is independent of where the window starts and of
-    the log's own (irregular) timestamps -- which is the point, since the Java arms use the same
-    construction and the two must be interchangeable.
+    Deliberately NOT `window.time`, which is wall clock from the logged timestamps and starts at
+    zero for each window. The two disagree on every real Alex log -- see LogWindow's own docstring
+    -- and the Java arms are built on the nominal axis, so a Python arm must be too or the two can
+    never align against the same capture.
     """
-    return np.rint(np.asarray(window.tick, dtype=np.float64) * window.dt * 1.0e9).astype(np.int64)
+    return np.rint(np.asarray(window.nominal_time) * 1.0e9).astype(np.int64)
 
 
 def base_omega_body(ctx, out):

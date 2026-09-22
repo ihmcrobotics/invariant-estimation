@@ -259,11 +259,24 @@ def _interpret(column: np.ndarray, kind: str) -> np.ndarray:
 
 def gather(reader: LogReader, names, stride: int = 1, start: float = 0.0,
            end: float | None = None, _unused: int = 0):
-    """Decode ``names`` over ``[start, end)`` seconds at ``stride`` ticks.
+    """Decode ``names`` over ``[start, end)`` at ``stride`` ticks.
 
     Returns ``(ticks, time, data, var_indices, var_types)`` with ``data`` shaped
     ``(n_ticks, len(names))`` in the order ``names`` was given -- the contract
     `logsource.read_window` consumes.
+
+    **``start``/``end`` and ``time`` are in DIFFERENT units, deliberately.** The window
+    is sliced by tick index: ``start`` and ``end`` are divided by the handshake's
+    declared ``dt``, so ``start=110.0`` means tick 110000 regardless of what the clock
+    says. ``time``, however, is built from the logged timestamps, because a dropped or
+    repeated controller tick has to be visible and a tick-derived axis cannot show one.
+
+    On a log whose real cadence matches its declared ``dt`` the two coincide and nobody
+    notices. No Alex log checked so far does: one 2026-09 log runs 8% slow against its
+    declaration and a 2026-07 one 14% fast, so tick 110000 there carries a timestamp
+    near 94.5 s, not 110 s. Neither number is wrong; they answer different questions.
+    `LogWindow` exposes both (`time` and `nominal_time`) plus `measured_dt` so the
+    discrepancy can be seen rather than discovered.
     """
     names = list(names)
     missing = [n for n in names if n not in reader.hs.index]
